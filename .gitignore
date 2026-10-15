@@ -63,6 +63,7 @@ venv.bak/
 *.db
 *.sqlite
 *.sqlite3
+data/
 
 # Logs and runtime data
 logs/
