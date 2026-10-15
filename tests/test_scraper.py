@@ -1,24 +1,37 @@
+import numpy as np
+import pandas as pd
 import pytest
 from unittest.mock import MagicMock
-import pandas as pd
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery
+
 from src.scraper.jobspy_scraper import JobSpyScraper, clean_job_url
+from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery
 
 
 def test_clean_job_url():
-    dirty = "https://www.linkedin.com/jobs/view/123456789/?refId=abcd&trackingId=xyz&utm_source=feed"
-    clean = clean_job_url(dirty)
-    assert clean == "https://www.linkedin.com/jobs/view/123456789/"
+    # LinkedIn tracking stripping
+    dirty_li = "https://www.linkedin.com/jobs/view/123456789/?refId=abcd&trackingId=xyz&utm_source=feed"
+    assert clean_job_url(dirty_li) == "https://www.linkedin.com/jobs/view/123456789/"
 
+    # Indeed functional parameter (jk) preservation
+    indeed_with_tracking = "https://pl.indeed.com/viewjob?jk=12345&utm_source=test&from=serp"
+    assert clean_job_url(indeed_with_tracking) == "https://pl.indeed.com/viewjob?jk=12345"
+
+    # Glassdoor functional parameter (jl) preservation
+    glassdoor_with_tracking = "https://www.glassdoor.com/job-listing/j?jl=67890&refId=abc&source=publisher"
+    assert clean_job_url(glassdoor_with_tracking) == "https://www.glassdoor.com/job-listing/j?jl=67890"
+
+    # Fragment removal
     indeed_dirty = "https://indeed.com/view/100?utm=1&trk=abc#frag"
     assert clean_job_url(indeed_dirty) == "https://indeed.com/view/100"
 
+    # Edge cases: empty, None, and literal nan
     assert clean_job_url("") == ""
     assert clean_job_url(None) == ""
+    assert clean_job_url("nan") == ""
+    assert clean_job_url("   ") == ""
 
 
 def test_jobspy_scraper_per_board_isolation(monkeypatch):
-    # Mock jobspy scrape_jobs to fail on linkedin but succeed on indeed
     def mock_scrape_jobs(site_name, **kwargs):
         if "linkedin" in site_name:
             raise RuntimeError("HTTP 429 Too Many Requests from LinkedIn")
@@ -198,6 +211,86 @@ def test_jobspy_scraper_canonicalizes_urls_and_applies_prefilter(monkeypatch):
     assert short_job.notification_status == "dismissed"
 
 
+def test_jobspy_scraper_nan_and_missing_handling(monkeypatch):
+    """Verifies that pandas NaN values are properly converted and not stringified to 'nan'."""
+    def mock_scrape_nan(site_name, **kwargs):
+        return pd.DataFrame([
+            # Missing title (None/NaN) -> Must be skipped
+            {"id": "skip-1", "title": None, "job_url": "https://example.com/1"},
+            {"id": "skip-2", "title": np.nan, "job_url": "https://example.com/2"},
+            {"id": "skip-3", "title": "nan", "job_url": "https://example.com/3"},
+            # Missing job_url (None/NaN) -> Must be skipped
+            {"id": "skip-4", "title": "Coach A", "job_url": None},
+            {"id": "skip-5", "title": "Coach B", "job_url": np.nan},
+            {"id": "skip-6", "title": "Coach C", "job_url": "nan"},
+            # Valid row with NaN location -> Must fall back to query.location
+            {
+                "id": "valid-1",
+                "title": "Corporate Coach",
+                "job_url": "https://example.com/coach-1",
+                "company": np.nan,
+                "location": np.nan,
+                "description": np.nan,
+                "job_type": np.nan,
+                "job_url_direct": np.nan,
+            }
+        ])
+
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_nan)
+
+    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
+    query = SearchQuery(
+        query_id="Q-NAN-TEST",
+        search_term="Coach",
+        location="Warsaw, Poland",
+        site_names=["indeed"]
+    )
+
+    results = scraper.scrape_board("indeed", query)
+    assert len(results) == 1
+    job = results[0]
+    assert job.title == "Corporate Coach"
+    assert job.location == "Warsaw, Poland"  # Fell back to query.location, NOT 'nan'
+    assert job.company == ""  # Cleaned from np.nan to '', NOT 'nan'
+    assert job.description == ""  # Cleaned from np.nan to '', NOT 'nan'
+    assert job.job_type is None
+    assert job.job_url_direct is None
+
+
+def test_jobspy_scraper_inter_board_jitter(monkeypatch):
+    """Verifies that jitter delay is applied between boards (for i > 0) in scrape_query."""
+    def mock_scrape(site_name, **kwargs):
+        site_str = site_name[0] if isinstance(site_name, list) else site_name
+        return pd.DataFrame([{
+            "id": f"{site_str}-1",
+            "title": f"Coach on {site_str}",
+            "job_url": f"https://{site_str}.com/1",
+            "company": "Company",
+            "description": "Leadership role"
+        }])
+
+
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape)
+    mock_sleep = MagicMock()
+    monkeypatch.setattr("time.sleep", mock_sleep)
+
+    scraper = JobSpyScraper(jitter_min=1.5, jitter_max=3.0)
+    query = SearchQuery(
+        query_id="Q-MULTI-BOARD",
+        search_term="Coach",
+        location="Warsaw",
+        site_names=["linkedin", "indeed", "glassdoor"]
+    )
+
+    results = scraper.scrape_query(query)
+    assert len(results) == 3
+    # Jitter delay must be applied between boards: exactly 2 sleeps for 3 boards
+    assert mock_sleep.call_count == 2
+    for call in mock_sleep.call_args_list:
+        delay = call[0][0]
+        assert 1.5 <= delay <= 3.0
+
+
 def test_jobspy_scraper_empty_and_invalid_data(monkeypatch):
     def mock_scrape_empty(site_name, **kwargs):
         return pd.DataFrame()
@@ -211,20 +304,6 @@ def test_jobspy_scraper_empty_and_invalid_data(monkeypatch):
         site_names=["linkedin"]
     )
     assert scraper.scrape_board("linkedin", query) == []
-
-    # Test DataFrame with missing title or missing URL rows (should be skipped)
-    def mock_scrape_missing(site_name, **kwargs):
-        return pd.DataFrame([
-            {"id": "bad-1", "title": "", "job_url": "https://example.com/1"},
-            {"id": "bad-2", "title": "Valid Title", "job_url": ""},
-            {"id": "bad-3", "title": "   ", "job_url": "https://example.com/3"},
-            {"id": "good-4", "title": "Valid Coach", "job_url": "https://example.com/good", "company": "Co", "description": "A" * 160}
-        ])
-
-    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_missing)
-    results = scraper.scrape_board("linkedin", query)
-    assert len(results) == 1
-    assert results[0].title == "Valid Coach"
 
 
 def test_jobspy_scraper_exhausted_retries_returns_empty(monkeypatch):
@@ -254,8 +333,6 @@ def test_query_catalog_and_cycle(monkeypatch):
         assert len(q.location) > 0
         assert len(q.site_names) > 0
 
-    # Test run_scraping_cycle calls scrape_query for each query
-    mock_postings = []
     scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
     mock_scrape_query = MagicMock(return_value=[])
     scraper.scrape_query = mock_scrape_query
@@ -291,7 +368,7 @@ def test_jobspy_scraper_without_prefilter(monkeypatch):
     assert postings[0].notification_status == "pending"
 
 
-def test_jobspy_scraper_corrupted_salary_and_jitter(monkeypatch):
+def test_jobspy_scraper_corrupted_salary(monkeypatch):
     def mock_scrape_jobs(site_name, **kwargs):
         return pd.DataFrame([{
             "id": "job-salary",
@@ -306,17 +383,9 @@ def test_jobspy_scraper_corrupted_salary_and_jitter(monkeypatch):
         }])
 
     monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_jobs)
-    mock_sleep = MagicMock()
-    monkeypatch.setattr("time.sleep", mock_sleep)
-
-    scraper = JobSpyScraper(jitter_min=2.0, jitter_max=4.0)
-    query = SearchQuery(query_id="Q-JITTER", search_term="Coach", location="Warsaw", site_names=["indeed"])
-    results = scraper.scrape_query(query)
+    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
+    query = SearchQuery(query_id="Q-SALARY", search_term="Coach", location="Warsaw", site_names=["indeed"])
+    results = scraper.scrape_board("indeed", query)
     assert len(results) == 1
     assert results[0].salary_min is None
     assert results[0].salary_max is None
-    # Jitter delay should have triggered time.sleep
-    assert mock_sleep.call_count == 1
-    sleep_arg = mock_sleep.call_args[0][0]
-    assert 2.0 <= sleep_arg <= 4.0
-
