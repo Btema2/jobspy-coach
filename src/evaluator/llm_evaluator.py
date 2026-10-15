@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def extract_json_payload(raw_text: str) -> Dict[str, Any]:
+    if not raw_text or not isinstance(raw_text, str):
+        raise ValueError("Empty or non-string response payload")
+
     text = raw_text.strip()
 
     # 1. Direct JSON parse
@@ -114,6 +117,8 @@ class OpenRouterEvaluator:
                         json=payload,
                     )
                     if resp.status_code == 429:
+                        if attempt == 3:
+                            raise RuntimeError("OpenRouter rate limit (429) exceeded after 3 attempts")
                         wait_sec = attempt * 5.0
                         logger.warning(
                             "OpenRouter 429 Rate Limited. Sleeping %ss (attempt %d/3)...",
