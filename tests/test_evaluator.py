@@ -96,6 +96,17 @@ def test_extract_json_payload_malformed_raises_value_error():
         extract_json_payload("{score: 9.0, missing_closing_bracket")
 
 
+def test_extract_json_payload_none_raises_value_error():
+    with pytest.raises(ValueError, match="Empty or non-string response payload"):
+        extract_json_payload(None)
+
+    with pytest.raises(ValueError, match="Empty or non-string response payload"):
+        extract_json_payload("")
+
+    with pytest.raises(ValueError, match="Empty or non-string response payload"):
+        extract_json_payload(123)  # type: ignore[arg-type]
+
+
 def test_openrouter_evaluator_successful_evaluation(monkeypatch):
     mock_post = MagicMock()
     mock_response = MagicMock()
@@ -152,6 +163,7 @@ def test_openrouter_evaluator_successful_evaluation(monkeypatch):
     assert call_args[0] == "https://openrouter.ai/api/v1/chat/completions"
     assert call_kwargs["headers"]["Authorization"] == "Bearer fake-key"
     assert call_kwargs["headers"]["HTTP-Referer"] == "https://github.com/jobspy-coach"
+    assert call_kwargs["headers"]["X-Title"] == "JobSpy Coach Evaluator"
     assert call_kwargs["json"]["model"] == "openrouter/free"
     assert call_kwargs["json"]["temperature"] == 0.2
     assert len(call_kwargs["json"]["messages"]) == 2
@@ -258,7 +270,8 @@ def test_openrouter_evaluator_all_attempts_429_raises_runtime_error(monkeypatch)
     resp_429.status_code = 429
     mock_post.return_value = resp_429
     monkeypatch.setattr("httpx.Client.post", mock_post)
-    monkeypatch.setattr("time.sleep", MagicMock())
+    mock_sleep = MagicMock()
+    monkeypatch.setattr("time.sleep", mock_sleep)
 
     evaluator = OpenRouterEvaluator(api_key="fake-key", rpm_limit=100)
     job = JobPosting(
@@ -270,9 +283,13 @@ def test_openrouter_evaluator_all_attempts_429_raises_runtime_error(monkeypatch)
         location="Remote",
         description="Career coaching role.",
     )
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="OpenRouter rate limit \\(429\\) exceeded after 3 attempts"):
         evaluator.evaluate_job(job)
     assert mock_post.call_count == 3
+    # Slept on attempt 1 (5.0s) and attempt 2 (10.0s), but raised immediately on attempt 3 without sleeping
+    assert mock_sleep.call_count == 2
+    mock_sleep.assert_any_call(5.0)
+    mock_sleep.assert_any_call(10.0)
 
 
 def test_openrouter_evaluator_http_error_retries_and_raises(monkeypatch):
