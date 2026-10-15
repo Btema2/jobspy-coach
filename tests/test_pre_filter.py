@@ -15,12 +15,17 @@ VALID_DESC = (
     "Head Tennis Coach",
     "Fitness Instructor / Personal Trainer",
     "CrossFit Coach & Gym Trainer",
+    "Cross-Fit Instructor",
     "Vocal & Drama Coach",
     "Esports Valorant Coach",
+    "E-sports Coach",
     "Dog Agility Coach / Puppy Trainer",
     "Martial Arts Boxing & Karate Coach",
     "Ski & Snowboard Instructor",
     "Yoga & Pilates Teacher",
+    "Sports Coach",
+    "Athletic Coach",
+    "Animal Coach",
     # Polish athletic / sports / vocal / pet
     "Trener pływania dla dzieci",
     "Trener piłki nożnej (UEFA A)",
@@ -30,6 +35,7 @@ VALID_DESC = (
     "Instruktor tańca i choreografii",
     "Instruktor jeździectwa",
     "Trener wspinaczki sportowej",
+    "Trener sportowy",
     # Ukrainian athletic / sports / vocal / pet
     "Тренер з плавання для підлітків",
     "Тренер з тенісу",
@@ -39,6 +45,7 @@ VALID_DESC = (
     "Тренер з гімнастики",
     "Тренер з боксу та карате",
     "Тренер собак / Кінолог",
+    "Спортивний тренер",
 ])
 def test_pre_filter_rejects_sports_and_vocal_titles(title: str):
     res = pre_filter_job(title, VALID_DESC)
@@ -62,11 +69,27 @@ def test_pre_filter_rejects_sports_and_vocal_titles(title: str):
     "Senior Talent Development Coach",
     "Бізнес-коуч",
     "Коуч з лідерства та розвитку команд",
+    # Corporate interim roles & corporate acronyms
+    "Acting Executive Coach",
+    "Acting Agile Coach",
+    "Trener Biznesu - FinTech PSA",
 ])
 def test_pre_filter_allows_valid_coaching_titles(title: str):
     res = pre_filter_job(title, VALID_DESC)
     assert res.passed is True
     assert res.reason is None
+
+
+@pytest.mark.parametrize("empty_title", [
+    "",
+    "   ",
+    "\n\t  \r",
+    None,
+])
+def test_pre_filter_rejects_empty_titles(empty_title):
+    res = pre_filter_job(empty_title, VALID_DESC)
+    assert res.passed is False
+    assert res.reason == "TITLE_EMPTY"
 
 
 def test_pre_filter_rejects_stub_descriptions():
