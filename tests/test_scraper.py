@@ -267,3 +267,56 @@ def test_query_catalog_and_cycle(monkeypatch):
     res = scraper.run_scraping_cycle(queries)
     assert res == []
     assert mock_scrape_query.call_count == 2
+
+
+def test_jobspy_scraper_without_prefilter(monkeypatch):
+    def mock_scrape_jobs(site_name, **kwargs):
+        return pd.DataFrame([{
+            "id": "job-1",
+            "site": "linkedin",
+            "job_url": "https://linkedin.com/jobs/view/9999",
+            "title": "Football Coach",
+            "company": "FC Club",
+            "location": "Warsaw",
+            "description": "Short"
+        }])
+
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_jobs)
+    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0, apply_prefilter=False)
+    query = SearchQuery(query_id="Q-NO-PF", search_term="Coach", location="Warsaw", site_names=["linkedin"])
+    postings = scraper.scrape_board("linkedin", query)
+    assert len(postings) == 1
+    assert postings[0].pre_filtered is False
+    assert postings[0].pre_filter_reason is None
+    assert postings[0].notification_status == "pending"
+
+
+def test_jobspy_scraper_corrupted_salary_and_jitter(monkeypatch):
+    def mock_scrape_jobs(site_name, **kwargs):
+        return pd.DataFrame([{
+            "id": "job-salary",
+            "site": "indeed",
+            "job_url": "https://indeed.com/view/777",
+            "title": "Executive Coach",
+            "company": "Corp",
+            "location": "Warsaw",
+            "description": "Leadership coaching role with executives.",
+            "min_amount": "invalid-salary-string",
+            "max_amount": "invalid-salary-string"
+        }])
+
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_jobs)
+    mock_sleep = MagicMock()
+    monkeypatch.setattr("time.sleep", mock_sleep)
+
+    scraper = JobSpyScraper(jitter_min=2.0, jitter_max=4.0)
+    query = SearchQuery(query_id="Q-JITTER", search_term="Coach", location="Warsaw", site_names=["indeed"])
+    results = scraper.scrape_query(query)
+    assert len(results) == 1
+    assert results[0].salary_min is None
+    assert results[0].salary_max is None
+    # Jitter delay should have triggered time.sleep
+    assert mock_sleep.call_count == 1
+    sleep_arg = mock_sleep.call_args[0][0]
+    assert 2.0 <= sleep_arg <= 4.0
+
