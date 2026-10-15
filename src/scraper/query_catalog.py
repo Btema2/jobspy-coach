@@ -1,0 +1,52 @@
+from dataclasses import dataclass
+from typing import List, Optional
+
+
+@dataclass(frozen=True)
+class SearchQuery:
+    query_id: str
+    search_term: str
+    location: str
+    site_names: List[str]
+    country_code: Optional[str] = None
+    is_remote: bool = False
+
+
+DEFAULT_QUERY_CATALOG: List[SearchQuery] = [
+    SearchQuery(
+        query_id="Q-PL-ENG",
+        search_term="Executive Coach OR Leadership Coach",
+        location="Poland",
+        site_names=["linkedin", "indeed", "glassdoor", "google"],
+        country_code="poland",
+    ),
+    SearchQuery(
+        query_id="Q-PL-BIZ",
+        search_term="Trener Biznesu OR Business Coach",
+        location="Poland",
+        site_names=["linkedin", "indeed", "glassdoor"],
+        country_code="poland",
+    ),
+    SearchQuery(
+        query_id="Q-PL-LD",
+        search_term="Learning and Development Specialist",
+        location="Warsaw",
+        site_names=["linkedin", "indeed", "glassdoor", "google"],
+        country_code="poland",
+    ),
+    SearchQuery(
+        query_id="Q-EU-REM",
+        search_term="Career Coach OR Life Coach",
+        location="Europe",
+        site_names=["linkedin", "indeed", "google", "zip_recruiter"],
+        is_remote=True,
+    ),
+    SearchQuery(
+        query_id="Q-GL-REM",
+        search_term="Executive Coach OR Leadership Coach",
+        location="Remote",
+        site_names=["linkedin", "indeed", "google"],
+        country_code="usa",
+        is_remote=True,
+    ),
+]
