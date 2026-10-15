@@ -296,7 +296,7 @@ Implement SQLite persistence in WAL mode with normalized deduplication key compu
 * **Consumes:** Scraped job attributes, evaluated LLM results, notification statuses.
 * **Produces:**
   * `compute_dedup_hash(company: str, title: str, location: str) -> str`: Normalizes strings, strips corporate legal suffixes, generates deterministic SHA-256 hash.
-  * `JobPosting` and `ScrapeRun` dataclasses / models.
+  * `JobPosting`, `JobEvaluationResult`, and `ScrapeRun` dataclasses / models in `src/storage/models.py`.
   * `Database`:
     * `__init__(db_path: Path | str)`
     * `init_db() -> None`
@@ -308,7 +308,8 @@ Implement SQLite persistence in WAL mode with normalized deduplication key compu
     * `get_pending_digest_jobs(min_score: float = 6.0, limit: int = 10) -> list[JobPosting]`
     * `mark_instant_sent(job_id: int) -> None`
     * `mark_digest_sent(job_ids: list[int]) -> None`
-    * `record_scrape_run(...) -> int`
+    * `record_scrape_run(board: str, query: str, jobs_found: int, new_jobs_saved: int, duration_sec: float, status: str, error_message: Optional[str] = None) -> int`
+    * `expire_stale_pending_jobs(days: int = 7) -> int`
     * `get_stats() -> dict[str, int]`
 
 ### TDD Execution Steps
@@ -320,7 +321,7 @@ import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 from src.storage.db import Database, compute_dedup_hash
-from src.storage.models import JobPosting
+from src.storage.models import JobPosting, JobEvaluationResult
 
 
 def test_compute_dedup_hash_normalization():
@@ -333,6 +334,17 @@ def test_compute_dedup_hash_normalization():
     # Different title should produce different hash
     h_other = compute_dedup_hash("Allegro", "Career Coach", "Warsaw")
     assert h1 != h_other
+
+
+def test_database_wal_and_busy_timeout_pragmas(tmp_path: Path):
+    db_file = tmp_path / "pragma_test.db"
+    db = Database(db_file)
+    db.init_db()
+    with db._get_connection() as conn:
+        journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        busy_timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+        assert journal_mode.lower() == "wal"
+        assert busy_timeout == 5000
 
 
 def test_database_init_and_job_lifecycle(tmp_path: Path):
@@ -368,16 +380,16 @@ def test_database_init_and_job_lifecycle(tmp_path: Path):
     assert unprocessed[0].eval_status == "unprocessed"
 
     # 4. Update LLM Evaluation
-    db.update_evaluation(
-        job_id=job_id,
+    eval_res = JobEvaluationResult(
         score=9.2,
         is_wow=True,
         summary_uk="Чудова вакансія для лідерського коучингу.",
         reasoning="Strong match for executive coach persona",
-        languages=["English", "Polish"],
+        language_requirements=["English", "Polish"],
         pros=["High autonomy"],
         cons=["Strict timezone"]
     )
+    db.update_evaluation(job_id=job_id, eval_result=eval_res)
 
     evaluated_job = db.get_job_by_hash(job.dedup_hash)
     assert evaluated_job is not None
@@ -416,7 +428,18 @@ def test_database_pending_digest_jobs(tmp_path: Path):
         is_remote=False
     )
     id1, _ = db.save_job(j1)
-    db.update_evaluation(id1, score=8.0, is_wow=False, summary_uk="Робота в Варшаві.", reasoning="Good", languages=["Polish"], pros=[], cons=[])
+    db.update_evaluation(
+        id1,
+        eval_result=JobEvaluationResult(
+            score=8.0,
+            is_wow=False,
+            summary_uk="Робота в Варшаві.",
+            reasoning="Good",
+            language_requirements=["Polish"],
+            pros=[],
+            cons=[]
+        )
+    )
 
     # Job 2: Score 4.5, pending -> should NOT appear (below 6.0)
     j2 = JobPosting(
@@ -430,7 +453,18 @@ def test_database_pending_digest_jobs(tmp_path: Path):
         is_remote=True
     )
     id2, _ = db.save_job(j2)
-    db.update_evaluation(id2, score=4.5, is_wow=False, summary_uk="Низький бал.", reasoning="Poor fit", languages=[], pros=[], cons=[])
+    db.update_evaluation(
+        id2,
+        eval_result=JobEvaluationResult(
+            score=4.5,
+            is_wow=False,
+            summary_uk="Низький бал.",
+            reasoning="Poor fit",
+            language_requirements=[],
+            pros=[],
+            cons=[]
+        )
+    )
 
     pending_digest = db.get_pending_digest_jobs(min_score=6.0, limit=10)
     assert len(pending_digest) == 1
@@ -438,6 +472,66 @@ def test_database_pending_digest_jobs(tmp_path: Path):
 
     db.mark_digest_sent([id1])
     assert len(db.get_pending_digest_jobs(min_score=6.0, limit=10)) == 0
+
+
+def test_database_expire_stale_pending_jobs(tmp_path: Path):
+    db_file = tmp_path / "test_expire.db"
+    db = Database(db_file)
+    db.init_db()
+
+    job = JobPosting(
+        dedup_hash=compute_dedup_hash("Old Co", "Coach", "Warsaw"),
+        site="indeed",
+        job_url="https://indeed.com/old",
+        title="Coach",
+        company="Old Co",
+        location="Warsaw",
+        description="Old vacancy description for testing expiration.",
+        eval_status="evaluated",
+        notification_status="pending"
+    )
+    job_id, _ = db.save_job(job)
+
+    # Artificially age the job record past 7 days (10 days old)
+    with db._get_connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET created_at = DATETIME('now', '-10 days'), eval_status = 'evaluated', notification_status = 'pending' WHERE id = ?",
+            (job_id,)
+        )
+        conn.commit()
+
+    expired_count = db.expire_stale_pending_jobs(days=7)
+    assert expired_count == 1
+
+    expired_job = db.get_job_by_hash(job.dedup_hash)
+    assert expired_job is not None
+    assert expired_job.notification_status == "expired_dismissed"
+
+
+def test_database_record_scrape_run(tmp_path: Path):
+    db_file = tmp_path / "test_scrape_runs.db"
+    db = Database(db_file)
+    db.init_db()
+
+    run_id = db.record_scrape_run(
+        board="linkedin",
+        query="Executive Coach",
+        jobs_found=12,
+        new_jobs_saved=4,
+        duration_sec=3.45,
+        status="completed"
+    )
+    assert run_id > 0
+
+    with db._get_connection() as conn:
+        row = conn.execute("SELECT * FROM scrape_runs WHERE id = ?", (run_id,)).fetchone()
+        assert row["board"] == "linkedin"
+        assert row["query"] == "Executive Coach"
+        assert row["jobs_found"] == 12
+        assert row["new_jobs_saved"] == 4
+        assert row["duration_sec"] == 3.45
+        assert row["status"] == "completed"
+        assert row["error_message"] is None
 ```
 
 #### Step 2: Run test to verify it fails
@@ -454,6 +548,17 @@ Expected output:
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List
+
+
+@dataclass
+class JobEvaluationResult:
+    score: float
+    is_wow: bool
+    summary_uk: str
+    reasoning: str
+    language_requirements: List[str] = field(default_factory=list)
+    pros: List[str] = field(default_factory=list)
+    cons: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -503,15 +608,15 @@ class JobPosting:
 
 @dataclass
 class ScrapeRun:
-    started_at: datetime
+    board: str
+    query: str
+    jobs_found: int
+    new_jobs_saved: int
+    duration_sec: float
+    status: str
     id: Optional[int] = None
-    completed_at: Optional[datetime] = None
-    query_count: int = 0
-    jobs_found: int = 0
-    jobs_new: int = 0
-    jobs_prefiltered: int = 0
-    errors_count: int = 0
-    status: str = "running"
+    error_message: Optional[str] = None
+    run_time: Optional[datetime] = None
 ```
 
 2. Create `src/storage/db.py`:
@@ -523,7 +628,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
-from src.storage.models import JobPosting, ScrapeRun
+from src.storage.models import JobPosting, ScrapeRun, JobEvaluationResult
 
 
 def compute_dedup_hash(company: str, title: str, location: str) -> str:
@@ -611,14 +716,14 @@ class Database:
             conn.execute("""
             CREATE TABLE IF NOT EXISTS scrape_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT NOT NULL,
-                completed_at TEXT,
-                query_count INTEGER NOT NULL DEFAULT 0,
+                run_time TEXT NOT NULL DEFAULT (DATETIME('now')),
+                board TEXT NOT NULL,
+                query TEXT NOT NULL,
                 jobs_found INTEGER NOT NULL DEFAULT 0,
-                jobs_new INTEGER NOT NULL DEFAULT 0,
-                jobs_prefiltered INTEGER NOT NULL DEFAULT 0,
-                errors_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL
+                new_jobs_saved INTEGER NOT NULL DEFAULT 0,
+                duration_sec REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL,
+                error_message TEXT
             );
             """)
             conn.commit()
@@ -667,17 +772,7 @@ class Database:
             )
             return [self._row_to_job(r) for r in cursor.fetchall()]
 
-    def update_evaluation(
-        self,
-        job_id: int,
-        score: float,
-        is_wow: bool,
-        summary_uk: str,
-        reasoning: str,
-        languages: List[str],
-        pros: List[str],
-        cons: List[str]
-    ) -> None:
+    def update_evaluation(self, job_id: int, eval_result: JobEvaluationResult) -> None:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
             conn.execute("""
@@ -694,10 +789,10 @@ class Database:
                 updated_at = ?
             WHERE id = ?
             """, (
-                score, int(is_wow), summary_uk, reasoning,
-                json.dumps(languages, ensure_ascii=False),
-                json.dumps(pros, ensure_ascii=False),
-                json.dumps(cons, ensure_ascii=False),
+                eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
+                json.dumps(eval_result.language_requirements, ensure_ascii=False),
+                json.dumps(eval_result.pros, ensure_ascii=False),
+                json.dumps(eval_result.cons, ensure_ascii=False),
                 now_str, now_str, job_id
             ))
             conn.commit()
@@ -753,6 +848,46 @@ class Database:
             WHERE id IN ({placeholders})
             """, [now_str, now_str] + job_ids)
             conn.commit()
+
+    def record_scrape_run(
+        self,
+        board: str,
+        query: str,
+        jobs_found: int,
+        new_jobs_saved: int,
+        duration_sec: float,
+        status: str,
+        error_message: Optional[str] = None
+    ) -> int:
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO scrape_runs (
+                run_time, board, query, jobs_found, new_jobs_saved,
+                duration_sec, status, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                now_str, board, query, jobs_found, new_jobs_saved,
+                duration_sec, status, error_message
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def expire_stale_pending_jobs(self, days: int = 7) -> int:
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            UPDATE jobs SET
+                notification_status = 'expired_dismissed',
+                updated_at = ?
+            WHERE notification_status = 'pending'
+              AND eval_status = 'evaluated'
+              AND datetime(created_at) < datetime('now', '-' || ? || ' days')
+            """, (now_str, days))
+            conn.commit()
+            return cursor.rowcount
 
     def get_stats(self) -> Dict[str, int]:
         with self._get_connection() as conn:
@@ -814,7 +949,7 @@ Run command:
 .venv/bin/pytest tests/test_storage.py
 ```
 Expected output:
-`2 passed in 0.08s`
+`6 passed in 0.12s`
 
 #### Step 5: Commit
 ```bash
@@ -951,7 +1086,7 @@ EXCLUSION_TITLE_REGEX = re.compile(
 )
 
 MIN_DESCRIPTION_CHARS = 150
-MIN_DESCRIPTION_WORDS = 25
+MIN_DESCRIPTION_WORDS = 30
 
 
 def pre_filter_job(title: str, description: str) -> PreFilterResult:
@@ -1054,6 +1189,60 @@ def test_extract_json_payload_markdown_and_noise():
     assert parsed["score"] == 8.5
     assert parsed["is_wow"] is False
     assert parsed["summary_uk"] == "Відмінна вакансія бізнес-тренера."
+
+
+def test_extract_json_payload_malformed_raises_value_error():
+    # Completely non-JSON text
+    with pytest.raises(ValueError, match="Could not extract valid JSON"):
+        extract_json_payload("Here is an answer with no JSON object at all.")
+
+    # Broken/unparseable JSON syntax
+    with pytest.raises(ValueError):
+        extract_json_payload("{score: 9.0, missing_closing_bracket")
+
+
+def test_openrouter_evaluator_rate_limit_backoff(monkeypatch):
+    mock_post = MagicMock()
+    resp_429 = MagicMock()
+    resp_429.status_code = 429
+
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "choices": [{
+            "message": {
+                "content": json.dumps({
+                    "score": 8.0,
+                    "is_wow": False,
+                    "summary_uk": "Відмінна вакансія коуча.",
+                    "reasoning": "Good fit",
+                    "language_requirements": ["English"],
+                    "pros": [],
+                    "cons": []
+                })
+            }
+        }]
+    }
+    mock_post.side_effect = [resp_429, resp_200]
+    monkeypatch.setattr("httpx.Client.post", mock_post)
+    monkeypatch.setattr("time.sleep", MagicMock())
+
+    evaluator = OpenRouterEvaluator(
+        api_key="fake-key",
+        rpm_limit=100
+    )
+    job = JobPosting(
+        dedup_hash="abc",
+        site="linkedin",
+        job_url="https://example.com/job",
+        title="Career Coach",
+        company="Company",
+        location="Remote",
+        description="Career coaching role."
+    )
+    res = evaluator.evaluate_job(job)
+    assert res.score == 8.0
+    assert mock_post.call_count == 2
 
 
 def test_openrouter_evaluator_success(monkeypatch):
@@ -1285,7 +1474,7 @@ Run command:
 .venv/bin/pytest tests/test_evaluator.py
 ```
 Expected output:
-`3 passed in 0.08s`
+`5 passed in 0.10s`
 
 #### Step 5: Commit
 ```bash
@@ -1314,7 +1503,7 @@ Implement HTML-formatted Telegram notifications for instant WOW alerts ($\ge 9.0
   * `format_digest_chunks(jobs: list[JobPosting], date_str: str) -> list[str]`
   * `TelegramNotifier.send_message(html_text: str, reply_markup: dict | None = None) -> bool`
   * `TelegramNotifier.send_wow_alert(job: JobPosting) -> bool`
-  * `TelegramNotifier.send_daily_digest(jobs: list[JobPosting]) -> int`
+  * `TelegramNotifier.send_daily_digest(jobs: list[JobPosting], date_str: str) -> int`
 
 ### TDD Execution Steps
 
@@ -1582,12 +1771,12 @@ Implement multi-board scraping through `python-jobspy` wrapping LinkedIn, Indeed
   * `tests/test_scraper.py`
 
 ### Interfaces
-* **Consumes:** `SearchQueryConfig` instances, `python-jobspy` library.
+* **Consumes:** `SearchQuery` instances, `python-jobspy` library.
 * **Produces:**
   * `clean_job_url(raw_url: str) -> str`: Strips ephemeral tracking tokens (`refId`, `utm_*`, `trackingId`).
   * `DEFAULT_QUERY_CATALOG`: list of targeted queries (Poland Executive, Poland Business Coach, Warsaw L&D, EU Remote Coach, Global Remote Coach).
   * `JobSpyScraper`:
-    * `scrape_board(...) -> list[JobPosting]` (isolated per board)
+    * `scrape_board(...) -> list[JobPosting]` (isolated per board with 3-attempt exponential backoff)
     * `scrape_query(query: SearchQuery) -> list[JobPosting]`
     * `run_scraping_cycle() -> list[JobPosting]`
 
@@ -1629,6 +1818,7 @@ def test_jobspy_scraper_per_board_isolation(monkeypatch):
         return pd.DataFrame()
 
     monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_jobs)
+    monkeypatch.setattr("time.sleep", MagicMock())
 
     scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
     query = SearchQuery(
@@ -1645,6 +1835,43 @@ def test_jobspy_scraper_per_board_isolation(monkeypatch):
     assert results[0].site == "indeed"
     assert results[0].title == "Executive Coach"
     assert results[0].job_url == "https://indeed.com/view/100"
+
+
+def test_jobspy_scraper_retries_transient_failures(monkeypatch):
+    attempts = 0
+
+    def mock_scrape_jobs(site_name, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("503 Service Unavailable")
+        return pd.DataFrame([{
+            "id": "ind-retry",
+            "site": "indeed",
+            "job_url": "https://indeed.com/view/200",
+            "title": "Corporate Coach",
+            "company": "Leadership Lab",
+            "location": "Warsaw, Poland",
+            "description": "Corporate coaching role in Warsaw.",
+            "is_remote": False,
+            "date_posted": "2026-10-15"
+        }])
+
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_jobs)
+    monkeypatch.setattr("time.sleep", MagicMock())
+
+    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
+    query = SearchQuery(
+        query_id="Q-TEST",
+        search_term="Corporate Coach",
+        location="Warsaw",
+        site_names=["indeed"],
+        country_code="poland"
+    )
+
+    results = scraper.scrape_board("indeed", query)
+    assert len(results) == 1
+    assert attempts == 3
 ```
 
 #### Step 2: Run test to verify it fails
@@ -1750,48 +1977,60 @@ class JobSpyScraper:
         self.hours_old = hours_old
 
     def scrape_board(self, site_name: str, query: SearchQuery) -> List[JobPosting]:
-        try:
-            df: pd.DataFrame = scrape_jobs(
-                site_name=[site_name],
-                search_term=query.search_term,
-                location=query.location,
-                results_wanted=self.results_per_query,
-                hours_old=self.hours_old,
-                country_indeed=query.country_code or "poland",
-                is_remote=query.is_remote
-            )
-            if df is None or df.empty:
-                return []
+        for attempt in range(1, 4):
+            try:
+                df: pd.DataFrame = scrape_jobs(
+                    site_name=[site_name],
+                    search_term=query.search_term,
+                    location=query.location,
+                    results_wanted=self.results_per_query,
+                    hours_old=self.hours_old,
+                    country_indeed=query.country_code or "poland",
+                    is_remote=query.is_remote
+                )
+                if df is None or df.empty:
+                    return []
 
-            postings: List[JobPosting] = []
-            for _, row in df.iterrows():
-                title = str(row.get("title") or "").strip()
-                company = str(row.get("company") or "").strip()
-                location = str(row.get("location") or query.location).strip()
-                raw_url = str(row.get("job_url") or "").strip()
-                clean_url = clean_job_url(raw_url)
-                desc = str(row.get("description") or "").strip()
+                postings: List[JobPosting] = []
+                for _, row in df.iterrows():
+                    title = str(row.get("title") or "").strip()
+                    company = str(row.get("company") or "").strip()
+                    location = str(row.get("location") or query.location).strip()
+                    raw_url = str(row.get("job_url") or "").strip()
+                    clean_url = clean_job_url(raw_url)
+                    desc = str(row.get("description") or "").strip()
 
-                if not title or not clean_url:
-                    continue
+                    if not title or not clean_url:
+                        continue
 
-                dedup_hash = compute_dedup_hash(company, title, location)
-                postings.append(JobPosting(
-                    dedup_hash=dedup_hash,
-                    site=site_name,
-                    job_url=clean_url,
-                    external_id=str(row.get("id") or ""),
-                    title=title,
-                    company=company,
-                    location=location,
-                    description=desc,
-                    is_remote=bool(row.get("is_remote", query.is_remote)),
-                    date_posted=str(row.get("date_posted") or "")
-                ))
-            return postings
-        except Exception as e:
-            logger.warning(f"Error scraping board '{site_name}' for query '{query.query_id}': {e}")
-            return []
+                    dedup_hash = compute_dedup_hash(company, title, location)
+                    postings.append(JobPosting(
+                        dedup_hash=dedup_hash,
+                        site=site_name,
+                        job_url=clean_url,
+                        external_id=str(row.get("id") or ""),
+                        title=title,
+                        company=company,
+                        location=location,
+                        description=desc,
+                        is_remote=bool(row.get("is_remote", query.is_remote)),
+                        date_posted=str(row.get("date_posted") or "")
+                    ))
+                return postings
+            except Exception as e:
+                if attempt < 3:
+                    backoff = (2 ** attempt) * 3
+                    logger.warning(
+                        f"Attempt {attempt}/3 failed scraping '{site_name}' for query '{query.query_id}': {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.warning(
+                        f"Error scraping board '{site_name}' for query '{query.query_id}' after 3 attempts: {e}"
+                    )
+                    return []
+        return []
 
     def scrape_query(self, query: SearchQuery) -> List[JobPosting]:
         all_postings: List[JobPosting] = []
@@ -1821,7 +2060,7 @@ Run command:
 .venv/bin/pytest tests/test_scraper.py
 ```
 Expected output:
-`2 passed in 0.08s`
+`3 passed in 0.10s`
 
 #### Step 5: Commit
 ```bash
@@ -1896,6 +2135,16 @@ def test_cli_test_telegram_command(monkeypatch):
     result = runner.invoke(app, ["test-telegram"])
     assert result.exit_code == 0
     assert "Telegram test message sent successfully" in result.stdout
+
+
+def test_cli_evaluate_command(monkeypatch):
+    mock_eval = MagicMock(return_value=(5, 1))
+    monkeypatch.setattr("src.scheduler.daemon.DaemonService.evaluate_unprocessed", mock_eval)
+
+    result = runner.invoke(app, ["evaluate", "--limit", "10"])
+    assert result.exit_code == 0
+    assert "Evaluated: 5" in result.stdout
+    assert "Instant WOW alerts: 1" in result.stdout
 ```
 
 Create `tests/test_daemon.py`:
@@ -1904,6 +2153,7 @@ import pytest
 from unittest.mock import MagicMock
 from src.scheduler.daemon import DaemonService
 from src.storage.models import JobPosting
+from src.scraper.query_catalog import SearchQuery
 
 
 def test_daemon_pipeline_cycle(monkeypatch, tmp_path):
@@ -1918,7 +2168,7 @@ def test_daemon_pipeline_cycle(monkeypatch, tmp_path):
         description="A corporate leadership coaching opportunity with senior executives.",
         is_remote=True
     )
-    mock_scraper.run_scraping_cycle.return_value = [mock_job]
+    mock_scraper.scrape_board.return_value = [mock_job]
 
     mock_evaluator = MagicMock()
     mock_eval_result = MagicMock()
@@ -1941,10 +2191,84 @@ def test_daemon_pipeline_cycle(monkeypatch, tmp_path):
         notifier=mock_notifier
     )
 
-    new_jobs, wow_sent = daemon.run_pipeline_cycle(dry_run=False)
+    test_query = SearchQuery(
+        query_id="Q-TEST",
+        search_term="Executive Coach",
+        location="Remote Poland",
+        site_names=["indeed"]
+    )
+    new_jobs, wow_sent = daemon.run_pipeline_cycle(queries=[test_query], dry_run=False)
     assert new_jobs == 1
     assert wow_sent == 1
     assert mock_notifier.send_wow_alert.called
+
+    with daemon.db._get_connection() as conn:
+        runs = conn.execute("SELECT * FROM scrape_runs").fetchall()
+        assert len(runs) == 1
+        assert runs[0]["board"] == "indeed"
+        assert runs[0]["jobs_found"] == 1
+        assert runs[0]["new_jobs_saved"] == 1
+        assert runs[0]["status"] == "completed"
+
+
+def test_daemon_evaluate_transient_error_leaves_unprocessed(tmp_path):
+    db_file = tmp_path / "daemon_transient.db"
+    mock_evaluator = MagicMock()
+    mock_evaluator.evaluate_job.side_effect = RuntimeError("HTTP 503 Service Unavailable")
+
+    daemon = DaemonService(
+        db_path=db_file,
+        evaluator=mock_evaluator
+    )
+
+    job = JobPosting(
+        dedup_hash="hash_transient",
+        site="indeed",
+        job_url="https://indeed.com/transient",
+        title="Career Coach",
+        company="Company",
+        location="Warsaw",
+        description="Career coaching role in Warsaw."
+    )
+    job_id, _ = daemon.db.save_job(job)
+
+    # Evaluate unprocessed
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    assert evaluated_count == 0
+    assert wow_sent == 0
+
+    # Job must remain 'unprocessed' to retry next cycle
+    reloaded = daemon.db.get_job_by_hash("hash_transient")
+    assert reloaded is not None
+    assert reloaded.eval_status == "unprocessed"
+
+
+def test_daemon_daily_digest_expires_stale_jobs(tmp_path):
+    db_file = tmp_path / "daemon_digest_expire.db"
+    daemon = DaemonService(db_path=db_file)
+
+    job = JobPosting(
+        dedup_hash="hash_stale",
+        site="indeed",
+        job_url="https://indeed.com/stale",
+        title="Stale Coach",
+        company="Old Corp",
+        location="Warsaw",
+        description="Stale coaching vacancy in Warsaw.",
+        eval_status="evaluated",
+        eval_score=7.5,
+        notification_status="pending"
+    )
+    job_id, _ = daemon.db.save_job(job)
+    with daemon.db._get_connection() as conn:
+        conn.execute("UPDATE jobs SET created_at = DATETIME('now', '-8 days') WHERE id = ?", (job_id,))
+        conn.commit()
+
+    count = daemon.run_daily_digest_cycle(dry_run=False)
+    # The job was expired (>7 days) so it was not included in digest
+    assert count == 0
+    reloaded = daemon.db.get_job_by_hash("hash_stale")
+    assert reloaded.notification_status == "expired_dismissed"
 ```
 
 #### Step 2: Run test to verify it fails
@@ -1961,9 +2285,11 @@ Expected output:
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+import httpx
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -1972,6 +2298,7 @@ from src.filters.pre_filter import pre_filter_job
 from src.storage.db import Database
 from src.storage.models import JobPosting
 from src.scraper.jobspy_scraper import JobSpyScraper
+from src.scraper.query_catalog import SearchQuery, DEFAULT_QUERY_CATALOG
 from src.evaluator.llm_evaluator import OpenRouterEvaluator
 from src.notifier.telegram_notifier import TelegramNotifier
 
@@ -2009,51 +2336,25 @@ class DaemonService:
         )
         self.scheduler: Optional[BlockingScheduler] = None
 
-    def run_pipeline_cycle(self, dry_run: bool = False) -> Tuple[int, int]:
-        logger.info("Starting pipeline scrape cycle...")
-        raw_postings = self.scraper.run_scraping_cycle()
-        logger.info(f"Scraper returned {len(raw_postings)} candidate postings.")
-
-        new_saved = 0
-        wow_sent = 0
-
-        for posting in raw_postings:
-            pf_res = pre_filter_job(posting.title, posting.description)
-            if not pf_res.passed:
-                posting.pre_filtered = True
-                posting.pre_filter_reason = pf_res.reason
-                posting.notification_status = "dismissed"
-            else:
-                posting.pre_filtered = False
-
-            if dry_run:
-                logger.info(f"[DRY-RUN] Discovered: '{posting.title}' at '{posting.company}' (Pre-filtered: {posting.pre_filtered})")
-                continue
-
-            job_id, is_new = self.db.save_job(posting)
-            if is_new:
-                new_saved += 1
-
-        if dry_run:
-            return len(raw_postings), 0
-
-        # Process evaluations
-        unprocessed = self.db.get_unprocessed_jobs()
+    def evaluate_unprocessed(self, limit: int = 50, dry_run: bool = False) -> Tuple[int, int]:
+        unprocessed = self.db.get_unprocessed_jobs(limit=limit)
         logger.info(f"Evaluating {len(unprocessed)} unprocessed postings with LLM...")
+
+        evaluated_count = 0
+        wow_sent = 0
 
         for job in unprocessed:
             try:
                 eval_res = self.evaluator.evaluate_job(job)
-                self.db.update_evaluation(
-                    job_id=job.id,
-                    score=eval_res.score,
-                    is_wow=eval_res.is_wow,
-                    summary_uk=eval_res.summary_uk,
-                    reasoning=eval_res.reasoning,
-                    languages=eval_res.language_requirements,
-                    pros=eval_res.pros,
-                    cons=eval_res.cons
-                )
+                if dry_run:
+                    logger.info(f"[DRY-RUN] Evaluated job {job.id} ({job.title}): Score={eval_res.score}, WOW={eval_res.is_wow}")
+                    evaluated_count += 1
+                    if eval_res.score >= get_settings().wow_score_threshold or eval_res.is_wow:
+                        wow_sent += 1
+                    continue
+
+                self.db.update_evaluation(job_id=job.id, eval_result=eval_res)
+                evaluated_count += 1
 
                 settings = get_settings()
                 if eval_res.score >= settings.wow_score_threshold or eval_res.is_wow:
@@ -2066,14 +2367,103 @@ class DaemonService:
                     if sent:
                         self.db.mark_instant_sent(job.id)
                         wow_sent += 1
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                # Transient network/timeout errors leave status unprocessed to retry on next cycle
+                logger.warning(
+                    f"Transient network/timeout error evaluating job {job.id} ('{job.title}'): {e}. "
+                    "Leaving in 'unprocessed' status for subsequent cycle retry."
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (429, 500, 502, 503, 504):
+                    logger.warning(
+                        f"Transient HTTP {e.response.status_code} evaluating job {job.id} ('{job.title}'): {e}. "
+                        "Leaving in 'unprocessed' status for subsequent cycle retry."
+                    )
+                else:
+                    logger.error(f"Non-recoverable HTTP {e.response.status_code} evaluating job {job.id}: {e}")
+                    if not dry_run:
+                        self.db.update_eval_failure(job.id, str(e))
             except Exception as e:
-                logger.error(f"Error evaluating job {job.id}: {e}")
-                self.db.update_eval_failure(job.id, str(e))
+                if any(k in str(e).lower() for k in ["503", "502", "504", "429", "timeout", "connection", "network"]):
+                    logger.warning(
+                        f"Transient error evaluating job {job.id} ('{job.title}'): {e}. "
+                        "Leaving in 'unprocessed' status for subsequent cycle retry."
+                    )
+                else:
+                    logger.error(f"Permanent evaluation failure for job {job.id}: {e}")
+                    if not dry_run:
+                        self.db.update_eval_failure(job.id, str(e))
 
-        logger.info(f"Pipeline cycle completed. New: {new_saved}, WOW alerts: {wow_sent}")
-        return new_saved, wow_sent
+        return evaluated_count, wow_sent
+
+    def run_pipeline_cycle(self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False) -> Tuple[int, int]:
+        active_queries = queries or DEFAULT_QUERY_CATALOG
+        logger.info("Starting pipeline scrape cycle across queries...")
+        total_new_saved = 0
+
+        for q in active_queries:
+            for site in q.site_names:
+                t0 = time.time()
+                try:
+                    board_postings = self.scraper.scrape_board(site, q)
+                    duration = time.time() - t0
+                    board_new_saved = 0
+
+                    for posting in board_postings:
+                        pf_res = pre_filter_job(posting.title, posting.description)
+                        if not pf_res.passed:
+                            posting.pre_filtered = True
+                            posting.pre_filter_reason = pf_res.reason
+                            posting.notification_status = "dismissed"
+                        else:
+                            posting.pre_filtered = False
+
+                        if dry_run:
+                            logger.info(f"[DRY-RUN] Discovered: '{posting.title}' at '{posting.company}' (Pre-filtered: {posting.pre_filtered})")
+                            continue
+
+                        _, is_new = self.db.save_job(posting)
+                        if is_new:
+                            board_new_saved += 1
+                            total_new_saved += 1
+
+                    if not dry_run:
+                        self.db.record_scrape_run(
+                            board=site,
+                            query=q.search_term,
+                            jobs_found=len(board_postings),
+                            new_jobs_saved=board_new_saved,
+                            duration_sec=duration,
+                            status="completed"
+                        )
+                except Exception as e:
+                    duration = time.time() - t0
+                    logger.error(f"Failed scrape cycle for board '{site}' query '{q.query_id}': {e}")
+                    if not dry_run:
+                        self.db.record_scrape_run(
+                            board=site,
+                            query=q.search_term,
+                            jobs_found=0,
+                            new_jobs_saved=0,
+                            duration_sec=duration,
+                            status="failed",
+                            error_message=str(e)
+                        )
+
+        if dry_run:
+            return 0, 0
+
+        # Process evaluations
+        _, wow_sent = self.evaluate_unprocessed(limit=50, dry_run=False)
+        logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {wow_sent}")
+        return total_new_saved, wow_sent
 
     def run_daily_digest_cycle(self, dry_run: bool = False) -> int:
+        if not dry_run:
+            expired = self.db.expire_stale_pending_jobs(days=7)
+            if expired > 0:
+                logger.info(f"Transitioned {expired} stale pending jobs (>7 days) to 'expired_dismissed'.")
+
         settings = get_settings()
         pending = self.db.get_pending_digest_jobs(
             min_score=settings.digest_score_threshold,
@@ -2166,6 +2556,18 @@ def scrape(dry_run: bool = typer.Option(False, "--dry-run", help="Run scraper wi
 
 
 @app.command()
+def evaluate(
+    limit: int = typer.Option(50, "--limit", help="Max jobs to evaluate"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Evaluate without saving or notifying")
+):
+    """Evaluate queued unprocessed vacancies independently from scraping."""
+    console.print(f"[bold blue]Evaluating up to {limit} unprocessed vacancies (dry_run={dry_run})...[/bold blue]")
+    daemon = DaemonService()
+    evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run)
+    console.print(f"[bold green]Evaluation completed. Evaluated: {evaluated}, Instant WOW alerts: {wow_sent}[/bold green]")
+
+
+@app.command()
 def digest(dry_run: bool = typer.Option(False, "--dry-run", help="Render digest without sending")):
     """Dispatch the daily coaching vacancy digest."""
     console.print(f"[bold blue]Running daily digest (dry_run={dry_run})...[/bold blue]")
@@ -2224,7 +2626,7 @@ Run command:
 .venv/bin/pytest tests/test_cli.py tests/test_daemon.py
 ```
 Expected output:
-`3 passed in 0.15s`
+`6 passed in 0.18s`
 
 #### Step 5: Commit
 ```bash
@@ -2258,6 +2660,7 @@ from src.scheduler.daemon import DaemonService
 from src.storage.db import Database, compute_dedup_hash
 from src.storage.models import JobPosting
 from src.evaluator.schemas import JobEvaluationResult
+from src.scraper.query_catalog import SearchQuery
 
 
 def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
@@ -2321,8 +2724,11 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
         )
     ]
 
+    def mock_scrape_board(site, query):
+        return [j for j in raw_jobs if j.site == site]
+
     mock_scraper = MagicMock()
-    mock_scraper.run_scraping_cycle.return_value = raw_jobs
+    mock_scraper.scrape_board.side_effect = mock_scrape_board
 
     def mock_evaluate(job):
         if "Recruiter" in job.title:
@@ -2371,8 +2777,17 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
         notifier=mock_notifier
     )
 
+    test_queries = [
+        SearchQuery(
+            query_id="Q-TEST-E2E",
+            search_term="Coaching",
+            location="Remote",
+            site_names=["indeed", "glassdoor", "linkedin"]
+        )
+    ]
+
     # Execute scrape and evaluate cycle
-    new_saved, wow_sent = daemon.run_pipeline_cycle(dry_run=False)
+    new_saved, wow_sent = daemon.run_pipeline_cycle(queries=test_queries, dry_run=False)
 
     # 4 distinct jobs saved (duplicate dropped by SHA-256 dedup)
     assert new_saved == 4
@@ -2386,6 +2801,10 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     assert stats["prefiltered_jobs"] == 1  # Swimming Coach
     assert stats["evaluated_jobs"] == 3
     assert stats["instant_sent"] == 1
+
+    with db._get_connection() as conn:
+        scrape_runs_count = conn.execute("SELECT COUNT(*) FROM scrape_runs").fetchone()[0]
+        assert scrape_runs_count == 3  # indeed, glassdoor, linkedin
 
     # Execute daily digest cycle
     digest_processed = daemon.run_daily_digest_cycle(dry_run=False)
@@ -2412,7 +2831,7 @@ Run command:
 .venv/bin/pytest -v tests/
 ```
 Expected output:
-All unit and integration tests passing (`17+ passed in < 1.0s`).
+All unit and integration tests passing (`30 passed in < 1.0s`).
 
 #### Step 4: Commit
 ```bash
