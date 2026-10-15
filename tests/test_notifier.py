@@ -181,3 +181,21 @@ def test_format_digest_chunks_empty():
     assert len(chunks) == 1
     assert "Знайдено нових актуальних позицій: <b>0</b>" in chunks[0]
 
+
+def test_telegram_notifier_from_settings():
+    from src.config import Settings
+
+    custom_settings = Settings(
+        TELEGRAM_BOT_TOKEN="my-bot-token",
+        TELEGRAM_CHAT_ID="999888",
+    )
+    notifier = TelegramNotifier.from_settings(custom_settings, timeout=20.0)
+    assert notifier.token == "my-bot-token"
+    assert notifier.chat_id == "999888"
+    assert notifier.timeout == 20.0
+
+    # Default settings fallback
+    default_notifier = TelegramNotifier.from_settings()
+    assert isinstance(default_notifier, TelegramNotifier)
+
+
