@@ -16,6 +16,18 @@ class TelegramNotifier:
         self.timeout = timeout
         self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
+    @classmethod
+    def from_settings(cls, settings: Optional[Any] = None, timeout: float = 15.0) -> "TelegramNotifier":
+        if settings is None:
+            from src.config import get_settings
+
+            settings = get_settings()
+        return cls(
+            token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            timeout=timeout,
+        )
+
     def send_message(self, html_text: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
         if not self.token or not self.chat_id:
             logger.warning("Telegram Bot Token or Chat ID not configured. Skipping notification.")
