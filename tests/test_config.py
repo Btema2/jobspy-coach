@@ -8,7 +8,7 @@ def test_settings_default_values(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-bot-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "987654321")
 
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.app_env == "production"
     assert settings.log_level == "INFO"
     assert settings.timezone == "Europe/Warsaw"
@@ -36,7 +36,7 @@ def test_settings_env_override(monkeypatch):
     monkeypatch.setenv("DB_PATH", "/tmp/custom_jobs.db")
     monkeypatch.setenv("SCRAPER_RESULTS_PER_QUERY", "50")
 
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.wow_score_threshold == 8.5
     assert settings.openrouter_model == "meta-llama/llama-3.3-70b-instruct:free"
     assert str(settings.db_path) == "/tmp/custom_jobs.db"
