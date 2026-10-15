@@ -7,6 +7,19 @@ from src.cli import app
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def isolate_cli_test_db(tmp_path, monkeypatch):
+    """Isolate CLI test database to a temporary path to avoid touching data/jobs.db."""
+    test_db = tmp_path / "test_cli.db"
+    monkeypatch.setenv("DB_PATH", str(test_db))
+    monkeypatch.setenv("DATABASE_PATH", str(test_db))
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    yield test_db
+    get_settings.cache_clear()
+
+
 def test_cli_stats_command(monkeypatch):
     mock_stats = MagicMock(return_value={
         "total_jobs": 42,

@@ -183,6 +183,12 @@ def test_daemon_daily_digest_sends_and_marks_sent(tmp_path):
     assert count == 1
     assert mock_notifier.send_daily_digest.called
 
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    expected_date = datetime.now(ZoneInfo(daemon.settings.timezone)).strftime("%d.%m.%Y")
+    call_kwargs = mock_notifier.send_daily_digest.call_args[1]
+    assert call_kwargs["date_str"] == expected_date
+
     reloaded = daemon.db.get_job_by_hash("hash_digest_ok")
     assert reloaded.notification_status == "digest_sent"
 
