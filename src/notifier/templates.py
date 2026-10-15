@@ -34,15 +34,16 @@ def format_wow_alert(job: JobPosting) -> Tuple[str, Dict[str, Any]]:
 
     markup = {
         "inline_keyboard": [
-            [{"text": "🚀 Відкрити вакансію", "url": job.job_url}]
+            [{"text": "🚀 Apply / View Job", "url": job.job_url}]
         ]
     }
     return msg, markup
 
 
 def format_digest_chunks(jobs: List[JobPosting], date_str: str) -> List[str]:
+    date_esc = html.escape(date_str or "")
     header = (
-        f"☕️ <b>Ранковий Дайджест Вакансій Коучингу | {date_str}</b>\n"
+        f"☕️ <b>Ранковий Дайджест Вакансій Коучингу | {date_esc}</b>\n"
         f"Знайдено нових актуальних позицій: <b>{len(jobs)}</b>\n\n"
     )
     footer = "\n<i>Всі позиції збережено в базі. Бажаємо продуктивного дня!</i>"
@@ -57,12 +58,13 @@ def format_digest_chunks(jobs: List[JobPosting], date_str: str) -> List[str]:
         comp_esc = html.escape(job.company or "")
         loc_esc = html.escape(job.location or "")
         summary_esc = html.escape(job.eval_summary_uk or "")
+        url_esc = html.escape(job.job_url or "", quote=True)
 
         item_str = (
             f"{idx}. ⭐️ <b>{score_str}/10</b> — <b>{title_esc}</b>\n"
             f"   🏢 {comp_esc} | 📍 {loc_esc}\n"
             f"   💡 {summary_esc}\n"
-            f"   🔗 <a href=\"{job.job_url}\">Переглянути вакансію</a>\n\n"
+            f"   🔗 <a href=\"{url_esc}\">Переглянути вакансію</a>\n\n"
         )
 
         if len(current_chunk) + len(item_str) + len(footer) > 3800:
