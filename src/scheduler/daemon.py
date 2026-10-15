@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import httpx
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -32,6 +33,7 @@ class DaemonService:
         notifier: Optional[TelegramNotifier] = None,
     ):
         settings = get_settings()
+        self.settings = settings
         self.db = Database(db_path or settings.db_path)
         self.db.init_db()
 
@@ -192,16 +194,15 @@ class DaemonService:
             if expired > 0:
                 logger.info(f"Transitioned {expired} stale pending jobs (>7 days) to 'expired_dismissed'.")
 
-        settings = get_settings()
         pending = self.db.get_pending_digest_jobs(
-            min_score=settings.digest_score_threshold,
-            limit=settings.digest_max_items,
+            min_score=self.settings.digest_score_threshold,
+            limit=self.settings.digest_max_items,
         )
         if not pending:
             logger.info("No pending qualifying jobs for daily digest.")
             return 0
 
-        date_str = datetime.now().strftime("%d.%m.%Y")
+        date_str = datetime.now(ZoneInfo(self.settings.timezone)).strftime("%d.%m.%Y")
         if dry_run:
             logger.info(f"[DRY-RUN] Daily digest would contain {len(pending)} jobs.")
             return len(pending)
@@ -212,19 +213,18 @@ class DaemonService:
         return len(pending)
 
     def start(self) -> None:
-        settings = get_settings()
-        self.scheduler = BlockingScheduler(timezone=settings.timezone)
+        self.scheduler = BlockingScheduler(timezone=self.settings.timezone)
 
         # Scrape interval
         self.scheduler.add_job(
             self.run_pipeline_cycle,
-            trigger=IntervalTrigger(hours=settings.scrape_interval_hours),
+            trigger=IntervalTrigger(hours=self.settings.scrape_interval_hours),
             id="scrape_pipeline",
             name="Scrape & Evaluate Pipeline",
         )
 
         # Daily digest cron at 09:00 Europe/Warsaw
-        hour, minute = settings.digest_time_cet.split(":")
+        hour, minute = self.settings.digest_time_cet.split(":")
         self.scheduler.add_job(
             self.run_daily_digest_cycle,
             trigger=CronTrigger(hour=int(hour), minute=int(minute)),
@@ -245,7 +245,7 @@ class DaemonService:
         self.run_pipeline_cycle()
 
         logger.info(
-            f"Daemon started. Scrape every {settings.scrape_interval_hours}h, "
-            f"Digest at {settings.digest_time_cet} {settings.timezone}."
+            f"Daemon started. Scrape every {self.settings.scrape_interval_hours}h, "
+            f"Digest at {self.settings.digest_time_cet} {self.settings.timezone}."
         )
         self.scheduler.start()
