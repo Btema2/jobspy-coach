@@ -270,11 +270,67 @@ def test_format_wow_alert_with_salary_and_fallback_fields():
         eval_languages=[],
     )
     html_text, markup = format_wow_alert(job)
-    assert "💰 <b>Вилка:</b> 18000.0 - 24000.0 PLN" in html_text
+    assert "💰 <b>Вилка:</b> 18000 - 24000 PLN" in html_text
     assert "⭐️ <b>Оцінка: 9.0 / 10</b>" in html_text
     assert "Опис відсутній." in html_text
     assert "Високий рівень відповідності профілю." in html_text
     assert "🌐 <b>Мови:</b>" not in html_text
+
+
+def test_format_wow_alert_single_sided_salaries():
+    # Min only
+    job_min = JobPosting(
+        dedup_hash="hash_min",
+        site="linkedin",
+        job_url="https://linkedin.com/1",
+        title="Lead Coach",
+        company="Co",
+        location="Remote",
+        description="Desc",
+        salary_min=25000.0,
+        salary_currency="PLN",
+    )
+    html_min, _ = format_wow_alert(job_min)
+    assert "💰 <b>Вилка:</b> від 25000 PLN" in html_min
+    assert " - " not in html_min
+
+    # Max only
+    job_max = JobPosting(
+        dedup_hash="hash_max",
+        site="indeed",
+        job_url="https://indeed.com/2",
+        title="Senior Coach",
+        company="Co",
+        location="Remote",
+        description="Desc",
+        salary_max=35000.0,
+        salary_currency="PLN",
+    )
+    html_max, _ = format_wow_alert(job_max)
+    assert "💰 <b>Вилка:</b> до 35000 PLN" in html_max
+    assert " - " not in html_max
+
+
+def test_format_wow_alert_defensive_length_guard():
+    job_long = JobPosting(
+        dedup_hash="hash_long",
+        site="linkedin",
+        job_url="https://linkedin.com/long",
+        title="Executive Coach",
+        company="Global Leadership",
+        location="Remote",
+        description="Desc",
+        eval_score=9.5,
+        eval_is_wow=True,
+        eval_summary_uk="A" * 1000,
+        eval_reasoning="B" * 1200,
+    )
+    html_text, _ = format_wow_alert(job_long)
+    # The total message must stay well below 4096 chars
+    assert len(html_text) <= 2500
+    assert "A" * 650 not in html_text
+    assert "B" * 850 not in html_text
+    assert "..." in html_text
 
 
 def test_format_digest_chunks_empty():

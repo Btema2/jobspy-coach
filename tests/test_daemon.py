@@ -356,3 +356,100 @@ def test_daemon_start_lifecycle_and_shutdown(monkeypatch, tmp_path):
     assert mock_scheduler.shutdown.called
     assert mock_sys_exit.called
 
+
+def test_daemon_pipeline_cycle_jitter_delay(monkeypatch, tmp_path):
+    mock_scraper = MagicMock()
+    mock_scraper.jitter_min = 2.0
+    mock_scraper.jitter_max = 5.0
+    mock_scraper.scrape_board.return_value = []
+
+    mock_sleep = MagicMock()
+    monkeypatch.setattr("time.sleep", mock_sleep)
+
+    daemon = DaemonService(
+        db_path=tmp_path / "daemon_jitter.db",
+        scraper=mock_scraper,
+    )
+
+    q1 = SearchQuery(query_id="Q1", search_term="Coach", location="Warsaw", site_names=["indeed", "linkedin"])
+    q2 = SearchQuery(query_id="Q2", search_term="Trainer", location="Warsaw", site_names=["indeed"])
+
+    daemon.run_pipeline_cycle(queries=[q1, q2], dry_run=True)
+
+    # Boards:
+    # 1. q1, indeed: (q_idx=0, s_idx=0) -> no jitter
+    # 2. q1, linkedin: (q_idx=0, s_idx=1) -> jitter 1
+    # 3. q2, indeed: (q_idx=1, s_idx=0) -> jitter 2
+    assert mock_sleep.call_count == 2
+    for call in mock_sleep.call_args_list:
+        delay = call[0][0]
+        assert 2.0 <= delay <= 5.0
+
+
+def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
+    db_file = tmp_path / "daemon_dismissal.db"
+    mock_evaluator = MagicMock()
+
+    # Low score, not wow
+    eval_low = MagicMock()
+    eval_low.score = 4.5
+    eval_low.is_wow = False
+    eval_low.summary_uk = "Low match"
+    eval_low.reasoning = "Not relevant"
+    eval_low.language_requirements = []
+    eval_low.pros = []
+    eval_low.cons = []
+
+    # High score, not wow
+    eval_high = MagicMock()
+    eval_high.score = 7.5
+    eval_high.is_wow = False
+    eval_high.summary_uk = "High match"
+    eval_high.reasoning = "Good fit"
+    eval_high.language_requirements = []
+    eval_high.pros = []
+    eval_high.cons = []
+
+    mock_evaluator.evaluate_job.side_effect = [eval_low, eval_high]
+
+    daemon = DaemonService(db_path=db_file, evaluator=mock_evaluator)
+
+    job_low = JobPosting(
+        dedup_hash="hash_low",
+        site="indeed",
+        job_url="https://indeed.com/low",
+        title="Junior Sourcer",
+        company="Co",
+        location="Warsaw",
+        description="Coaching sourcers.",
+    )
+    job_high = JobPosting(
+        dedup_hash="hash_high",
+        site="indeed",
+        job_url="https://indeed.com/high",
+        title="Executive Coach",
+        company="Co",
+        location="Warsaw",
+        description="Executive coaching.",
+    )
+
+    daemon.db.save_job(job_low)
+    daemon.db.save_job(job_high)
+
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    assert evaluated_count == 2
+    assert wow_sent == 0
+
+    reloaded_low = daemon.db.get_job_by_hash("hash_low")
+    assert reloaded_low is not None
+    assert reloaded_low.eval_status == "evaluated"
+    assert reloaded_low.eval_score == 4.5
+    assert reloaded_low.notification_status == "dismissed"
+
+    reloaded_high = daemon.db.get_job_by_hash("hash_high")
+    assert reloaded_high is not None
+    assert reloaded_high.eval_status == "evaluated"
+    assert reloaded_high.eval_score == 7.5
+    assert reloaded_high.notification_status == "pending"
+
+

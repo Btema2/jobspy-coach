@@ -1,4 +1,5 @@
 import logging
+import random
 import signal
 import sys
 import time
@@ -14,7 +15,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from src.config import get_settings
 from src.evaluator.llm_evaluator import OpenRouterEvaluator
-from src.filters.pre_filter import pre_filter_job
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.scraper.jobspy_scraper import JobSpyScraper
 from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery
@@ -73,15 +73,22 @@ class DaemonService:
                         f"[DRY-RUN] Evaluated job {job.id} ({job.title}): Score={eval_res.score}, WOW={eval_res.is_wow}"
                     )
                     evaluated_count += 1
-                    if eval_res.score >= get_settings().wow_score_threshold or eval_res.is_wow:
+                    if eval_res.score >= self.settings.wow_score_threshold or eval_res.is_wow:
                         wow_sent += 1
                     continue
 
-                self.db.update_evaluation(job_id=job.id, eval_result=eval_res)
-                evaluated_count += 1
+                notification_status = None
+                if eval_res.score < self.settings.digest_score_threshold and not eval_res.is_wow:
+                    notification_status = "dismissed"
 
-                settings = get_settings()
-                if eval_res.score >= settings.wow_score_threshold or eval_res.is_wow:
+                self.db.update_evaluation(
+                    job_id=job.id, eval_result=eval_res, notification_status=notification_status
+                )
+                evaluated_count += 1
+                if notification_status:
+                    job.notification_status = notification_status
+
+                if eval_res.score >= self.settings.wow_score_threshold or eval_res.is_wow:
                     job.eval_score = eval_res.score
                     job.eval_is_wow = eval_res.is_wow
                     job.eval_summary_uk = eval_res.summary_uk
@@ -129,8 +136,14 @@ class DaemonService:
         logger.info("Starting pipeline scrape cycle across queries...")
         total_new_saved = 0
 
-        for q in active_queries:
-            for site in q.site_names:
+        for q_idx, q in enumerate(active_queries):
+            for s_idx, site in enumerate(q.site_names):
+                jitter_max = getattr(self.scraper, "jitter_max", 0.0)
+                if (q_idx > 0 or s_idx > 0) and isinstance(jitter_max, (int, float)) and jitter_max > 0:
+                    jitter_min = getattr(self.scraper, "jitter_min", 0.0)
+                    min_val = jitter_min if isinstance(jitter_min, (int, float)) else 0.0
+                    time.sleep(random.uniform(min_val, jitter_max))
+
                 t0 = time.time()
                 try:
                     board_postings = self.scraper.scrape_board(site, q)
@@ -138,14 +151,6 @@ class DaemonService:
                     board_new_saved = 0
 
                     for posting in board_postings:
-                        pf_res = pre_filter_job(posting.title, posting.description)
-                        if not pf_res.passed:
-                            posting.pre_filtered = True
-                            posting.pre_filter_reason = pf_res.reason
-                            posting.notification_status = "dismissed"
-                        else:
-                            posting.pre_filtered = False
-
                         if dry_run:
                             logger.info(
                                 f"[DRY-RUN] Discovered: '{posting.title}' at '{posting.company}' (Pre-filtered: {posting.pre_filtered})"
