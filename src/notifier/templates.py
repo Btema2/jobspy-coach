@@ -1,21 +1,74 @@
 import html
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from src.storage.models import JobPosting
+
+
+def _format_salary_val(val: Optional[float]) -> Optional[str]:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if f.is_integer():
+            return str(int(f))
+        return f"{f:g}"
+    except (ValueError, TypeError):
+        return str(val)
+
+
+def _format_salary_line(job: JobPosting) -> str:
+    min_val = job.salary_min if (job.salary_min is not None and job.salary_min > 0) else None
+    max_val = job.salary_max if (job.salary_max is not None and job.salary_max > 0) else None
+
+    if min_val is None and max_val is None:
+        return ""
+
+    min_str = _format_salary_val(min_val)
+    max_str = _format_salary_val(max_val)
+
+    curr = f" {html.escape(job.salary_currency.strip())}" if job.salary_currency and job.salary_currency.strip() else ""
+
+    if min_str is not None and max_str is not None:
+        sal = f"{min_str} - {max_str}{curr}"
+    elif min_str is not None:
+        sal = f"від {min_str}{curr}"
+    elif max_str is not None:
+        sal = f"до {max_str}{curr}"
+    else:
+        return ""
+
+    return f"\n💰 <b>Вилка:</b> {sal}"
+
+
+def _truncate_escaped_html(text: str, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
+    cutoff = max_length - 3
+    truncated = text[:cutoff]
+    last_amp = truncated.rfind("&")
+    last_semi = truncated.rfind(";")
+    if last_amp != -1 and last_amp > last_semi:
+        truncated = truncated[:last_amp]
+    return truncated.rstrip() + "..."
 
 
 def format_wow_alert(job: JobPosting) -> Tuple[str, Dict[str, Any]]:
     title_esc = html.escape(job.title or "")
     comp_esc = html.escape(job.company or "")
     loc_esc = html.escape(job.location or "")
-    summary_esc = html.escape(job.eval_summary_uk or "Опис відсутній.")
-    reasoning_esc = html.escape(job.eval_reasoning or "Високий рівень відповідності профілю.")
+
+    summary_raw = job.eval_summary_uk or "Опис відсутній."
+    summary_esc = html.escape(summary_raw)
+    if len(summary_esc) > 600:
+        summary_esc = _truncate_escaped_html(summary_esc, 600)
+
+    reasoning_raw = job.eval_reasoning or "Високий рівень відповідності профілю."
+    reasoning_esc = html.escape(reasoning_raw)
+    if len(reasoning_esc) > 800:
+        reasoning_esc = _truncate_escaped_html(reasoning_esc, 800)
+
     score_str = f"{job.eval_score:.1f}" if job.eval_score is not None else "9.0"
 
-    salary_line = ""
-    if job.salary_min or job.salary_max:
-        curr = html.escape(job.salary_currency or "")
-        sal = f"{job.salary_min or ''} - {job.salary_max or ''} {curr}".strip()
-        salary_line = f"\n💰 <b>Вилка:</b> {sal}"
+    salary_line = _format_salary_line(job)
 
     langs_line = ""
     if job.eval_languages:

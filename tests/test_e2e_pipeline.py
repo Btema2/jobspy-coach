@@ -1,10 +1,11 @@
 import pytest
 from unittest.mock import MagicMock
+from src.evaluator.schemas import JobEvaluationResult
+from src.filters.pre_filter import pre_filter_job
 from src.scheduler.daemon import DaemonService
+from src.scraper.query_catalog import SearchQuery
 from src.storage.db import Database, compute_dedup_hash
 from src.storage.models import JobPosting
-from src.evaluator.schemas import JobEvaluationResult
-from src.scraper.query_catalog import SearchQuery
 
 
 def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
@@ -91,7 +92,19 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     ]
 
     def mock_scrape_board(site, query):
-        return [j for j in raw_jobs if j.site == site]
+        results = []
+        for j in raw_jobs:
+            if j.site == site:
+                pf = pre_filter_job(j.title, j.description)
+                if not pf.passed:
+                    j.pre_filtered = True
+                    j.pre_filter_reason = pf.reason
+                    j.notification_status = "dismissed"
+                else:
+                    j.pre_filtered = False
+                    j.notification_status = "pending"
+                results.append(j)
+        return results
 
     mock_scraper = MagicMock()
     mock_scraper.scrape_board.side_effect = mock_scrape_board
@@ -185,6 +198,13 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     assert stub_job.pre_filtered is True
     assert "DESCRIPTION_TOO_SHORT" in stub_job.pre_filter_reason
     assert stub_job.notification_status == "dismissed"
+
+    # Verify Recruiter job (score 5.0 < 6.0 threshold, not wow) was immediately dismissed
+    recruiter_job = db.get_job_by_hash(compute_dedup_hash("HR Agency", "Recruiter & Coach", "Warsaw"))
+    assert recruiter_job is not None
+    assert recruiter_job.eval_status == "evaluated"
+    assert recruiter_job.eval_score == 5.0
+    assert recruiter_job.notification_status == "dismissed"
 
     # Verify scrape run audit records were written for each board
     with db._get_connection() as conn:

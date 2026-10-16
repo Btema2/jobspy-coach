@@ -340,3 +340,58 @@ def test_compute_dedup_hash_empty_and_fallback(tmp_path: Path):
     assert fetched.evaluated_at is None
 
 
+def test_database_update_evaluation_with_notification_status(tmp_path: Path):
+    db_file = tmp_path / "test_notif_status.db"
+    db = Database(db_file)
+    db.init_db()
+
+    job = JobPosting(
+        dedup_hash=compute_dedup_hash("Co", "Low Score Role", "Loc"),
+        site="indeed",
+        job_url="https://indeed.com/low",
+        title="Low Score Role",
+        company="Co",
+        location="Loc",
+        description="Desc",
+    )
+    job_id, _ = db.save_job(job)
+
+    eval_res = JobEvaluationResult(
+        score=4.0,
+        is_wow=False,
+        summary_uk="Низька оцінка.",
+        reasoning="Irrelevant",
+    )
+    db.update_evaluation(job_id=job_id, eval_result=eval_res, notification_status="dismissed")
+
+    reloaded = db.get_job_by_id(job_id)
+    assert reloaded is not None
+    assert reloaded.eval_status == "evaluated"
+    assert reloaded.eval_score == 4.0
+    assert reloaded.notification_status == "dismissed"
+
+
+def test_database_mark_dismissed(tmp_path: Path):
+    db_file = tmp_path / "test_mark_dismissed.db"
+    db = Database(db_file)
+    db.init_db()
+
+    job = JobPosting(
+        dedup_hash=compute_dedup_hash("Co", "Role", "Loc"),
+        site="indeed",
+        job_url="https://indeed.com/dismiss",
+        title="Role",
+        company="Co",
+        location="Loc",
+        description="Desc",
+    )
+    job_id, _ = db.save_job(job)
+    assert job.notification_status == "pending"
+
+    db.mark_dismissed(job_id)
+    reloaded = db.get_job_by_id(job_id)
+    assert reloaded is not None
+    assert reloaded.notification_status == "dismissed"
+
+
+

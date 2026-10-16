@@ -193,29 +193,69 @@ class Database:
             )
             return [self._row_to_job(r) for r in cursor.fetchall()]
 
-    def update_evaluation(self, job_id: int, eval_result: JobEvaluationResult) -> None:
+    def update_evaluation(
+        self,
+        job_id: int,
+        eval_result: JobEvaluationResult,
+        notification_status: Optional[str] = None,
+    ) -> None:
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            if notification_status is not None:
+                conn.execute("""
+                UPDATE jobs SET
+                    eval_status = 'evaluated',
+                    eval_score = ?,
+                    eval_is_wow = ?,
+                    eval_summary_uk = ?,
+                    eval_reasoning = ?,
+                    eval_languages = ?,
+                    eval_pros = ?,
+                    eval_cons = ?,
+                    notification_status = ?,
+                    evaluated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """, (
+                    eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
+                    json.dumps(eval_result.language_requirements, ensure_ascii=False),
+                    json.dumps(eval_result.pros, ensure_ascii=False),
+                    json.dumps(eval_result.cons, ensure_ascii=False),
+                    notification_status,
+                    now_str, now_str, job_id
+                ))
+            else:
+                conn.execute("""
+                UPDATE jobs SET
+                    eval_status = 'evaluated',
+                    eval_score = ?,
+                    eval_is_wow = ?,
+                    eval_summary_uk = ?,
+                    eval_reasoning = ?,
+                    eval_languages = ?,
+                    eval_pros = ?,
+                    eval_cons = ?,
+                    evaluated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """, (
+                    eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
+                    json.dumps(eval_result.language_requirements, ensure_ascii=False),
+                    json.dumps(eval_result.pros, ensure_ascii=False),
+                    json.dumps(eval_result.cons, ensure_ascii=False),
+                    now_str, now_str, job_id
+                ))
+            conn.commit()
+
+    def mark_dismissed(self, job_id: int) -> None:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
             conn.execute("""
             UPDATE jobs SET
-                eval_status = 'evaluated',
-                eval_score = ?,
-                eval_is_wow = ?,
-                eval_summary_uk = ?,
-                eval_reasoning = ?,
-                eval_languages = ?,
-                eval_pros = ?,
-                eval_cons = ?,
-                evaluated_at = ?,
+                notification_status = 'dismissed',
                 updated_at = ?
             WHERE id = ?
-            """, (
-                eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
-                json.dumps(eval_result.language_requirements, ensure_ascii=False),
-                json.dumps(eval_result.pros, ensure_ascii=False),
-                json.dumps(eval_result.cons, ensure_ascii=False),
-                now_str, now_str, job_id
-            ))
+            """, (now_str, job_id))
             conn.commit()
 
     def update_eval_failure(self, job_id: int, error_message: str) -> None:

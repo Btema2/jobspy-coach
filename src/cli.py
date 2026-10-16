@@ -61,9 +61,9 @@ def digest(
 def test_telegram():
     """Send an authentication and connectivity test message to Telegram."""
     settings = get_settings()
-    notifier = TelegramNotifier(token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id)
     msg = "👋 <b>JobSpy Coach Daemon</b> | Підключення успішне! Тестове сповіщення доставлено."
-    success = notifier.send_message(msg)
+    with TelegramNotifier(token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id) as notifier:
+        success = notifier.send_message(msg)
     if success:
         console.print("[bold green]Telegram test message sent successfully![/bold green]")
     else:
