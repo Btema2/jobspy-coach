@@ -132,7 +132,17 @@ class OpenRouterEvaluator:
                     data = resp.json()
                     content = data["choices"][0]["message"]["content"]
                     parsed = extract_json_payload(content)
-                    return JobEvaluationResult.model_validate(parsed)
+                    result = JobEvaluationResult.model_validate(parsed)
+                    actual_model = data.get("model", self.model) or self.model
+                    result.eval_model = actual_model
+                    logger.info(
+                        "OpenRouter evaluated '%s' via model '%s' -> Score: %.1f, is_wow: %s",
+                        job.title,
+                        actual_model,
+                        result.score,
+                        result.is_wow,
+                    )
+                    return result
             except Exception as e:
                 if attempt == 3:
                     logger.error(

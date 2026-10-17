@@ -12,6 +12,7 @@ class JobEvaluationResult:
     language_requirements: List[str] = field(default_factory=list)
     pros: List[str] = field(default_factory=list)
     cons: List[str] = field(default_factory=list)
+    eval_model: Optional[str] = None
 
 
 @dataclass
