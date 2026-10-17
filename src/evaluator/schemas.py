@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -10,3 +10,5 @@ class JobEvaluationResult(BaseModel):
     language_requirements: List[str] = Field(default_factory=list)
     pros: List[str] = Field(default_factory=list)
     cons: List[str] = Field(default_factory=list)
+    eval_model: Optional[str] = Field(default=None, description="Actual model routed by OpenRouter")
+
