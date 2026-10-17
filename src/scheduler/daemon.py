@@ -42,6 +42,8 @@ class DaemonService:
             jitter_max=settings.scraper_jitter_max_seconds,
             results_per_query=settings.scraper_results_per_query,
             hours_old=settings.hours_old_window,
+            enabled_boards=settings.scraper_enabled_boards,
+            proxies=settings.scraper_proxies,
         )
         self.evaluator = evaluator or OpenRouterEvaluator(
             api_key=settings.openrouter_api_key,

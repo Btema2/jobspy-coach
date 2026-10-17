@@ -414,3 +414,96 @@ def test_query_catalog_incompatible_boards_excluded():
     q_gl_rem = queries_by_id["Q-GL-REM"]
     assert q_gl_rem.site_names == ["linkedin", "indeed", "glassdoor", "google"]
 
+
+def test_jobspy_scraper_enabled_boards_filter(monkeypatch):
+    mock_scrape = MagicMock()
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape)
+
+    scraper = JobSpyScraper(enabled_boards=["indeed"], jitter_min=0.0, jitter_max=0.0)
+    query = SearchQuery(
+        query_id="Q-TEST-FILTER",
+        search_term="Executive Coach",
+        location="Warsaw",
+        site_names=["linkedin", "indeed"],
+    )
+
+    # Calling scrape_board on non-enabled board (linkedin) returns [] without calling scrape_jobs
+    res_li = scraper.scrape_board("linkedin", query)
+    assert res_li == []
+    assert mock_scrape.call_count == 0
+
+    # Calling scrape_board on enabled board (indeed) calls scrape_jobs
+    mock_scrape.return_value = pd.DataFrame([{
+        "id": "ind-1",
+        "site": "indeed",
+        "job_url": "https://indeed.com/view/100",
+        "title": "Executive Coach",
+        "company": "Corp",
+        "location": "Warsaw",
+        "description": "Coaching executives",
+    }])
+    res_ind = scraper.scrape_board("indeed", query)
+    assert len(res_ind) == 1
+    assert mock_scrape.call_count == 1
+
+
+def test_jobspy_scraper_passes_proxies(monkeypatch):
+    mock_scrape = MagicMock(return_value=pd.DataFrame())
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape)
+
+    proxies_list = ["http://proxy1:8080", "http://proxy2:8080"]
+    scraper = JobSpyScraper(proxies=proxies_list, jitter_min=0.0, jitter_max=0.0)
+    query = SearchQuery(
+        query_id="Q-TEST-PROXY",
+        search_term="Executive Coach",
+        location="Warsaw",
+        site_names=["indeed"],
+    )
+
+    scraper.scrape_board("indeed", query)
+    assert mock_scrape.call_count == 1
+    _, kwargs = mock_scrape.call_args
+    assert kwargs.get("proxies") == proxies_list
+
+
+def test_jobspy_scraper_linkedin_pacing(monkeypatch):
+    mock_scrape = MagicMock(return_value=pd.DataFrame())
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape)
+    mock_sleep = MagicMock()
+    monkeypatch.setattr("time.sleep", mock_sleep)
+
+    current_time = 1000.0
+
+    def fake_time():
+        nonlocal current_time
+        return current_time
+
+    monkeypatch.setattr("time.time", fake_time)
+
+    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0, linkedin_cooldown_seconds=12.0)
+    query = SearchQuery(
+        query_id="Q-PACING",
+        search_term="Executive Coach",
+        location="Warsaw",
+        site_names=["linkedin"],
+    )
+
+    # First call: elapsed since 0 is large -> no pacing sleep
+    scraper.scrape_board("linkedin", query)
+    mock_sleep.assert_not_called()
+    assert scraper.last_linkedin_call_time == 1000.0
+
+    # Advance clock by 3.0 seconds
+    current_time = 1003.0
+
+    # Second call: elapsed is 3.0s < 12.0s -> should sleep for 9.0s
+    scraper.scrape_board("linkedin", query)
+    mock_sleep.assert_called_once_with(9.0)
+    assert scraper.last_linkedin_call_time == 1003.0
+
+    # Non-linkedin boards should not trigger linkedin pacing
+    mock_sleep.reset_mock()
+    current_time = 1004.0
+    scraper.scrape_board("indeed", query)
+    mock_sleep.assert_not_called()
+
