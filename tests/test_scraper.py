@@ -389,3 +389,28 @@ def test_jobspy_scraper_corrupted_salary(monkeypatch):
     assert len(results) == 1
     assert results[0].salary_min is None
     assert results[0].salary_max is None
+
+
+def test_query_catalog_incompatible_boards_excluded():
+    queries_by_id = {q.query_id: q for q in DEFAULT_QUERY_CATALOG}
+
+    # 1. For every query where country_code == "poland", glassdoor is NOT in site_names
+    # 3. Polish queries have at least ["linkedin", "indeed", "google"]
+    polish_queries = [q for q in DEFAULT_QUERY_CATALOG if q.country_code == "poland"]
+    assert len(polish_queries) > 0
+    for q in polish_queries:
+        assert "glassdoor" not in q.site_names, f"Query {q.query_id} should not include glassdoor"
+        assert set(["linkedin", "indeed", "google"]).issubset(set(q.site_names)), (
+            f"Query {q.query_id} must have at least linkedin, indeed, google"
+        )
+
+    # 2. For query Q-EU-REM, zip_recruiter is NOT in site_names
+    assert "Q-EU-REM" in queries_by_id
+    q_eu_rem = queries_by_id["Q-EU-REM"]
+    assert "zip_recruiter" not in q_eu_rem.site_names, "Q-EU-REM should not include zip_recruiter"
+
+    # 4. Q-GL-REM retains ["linkedin", "indeed", "glassdoor", "google"]
+    assert "Q-GL-REM" in queries_by_id
+    q_gl_rem = queries_by_id["Q-GL-REM"]
+    assert q_gl_rem.site_names == ["linkedin", "indeed", "glassdoor", "google"]
+
