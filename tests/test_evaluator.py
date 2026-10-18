@@ -371,3 +371,90 @@ def test_extract_json_payload_broken_fence_fallback_to_json_regex():
     assert parsed["summary_uk"] == "Тестова вакансія."
 
 
+def test_openrouter_evaluator_captures_actual_routed_model(monkeypatch, caplog):
+    import logging
+
+    mock_post = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "model": "deepseek/deepseek-chat",
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "score": 9.2,
+                            "is_wow": True,
+                            "summary_uk": "Престижна позиція Executive коуча для банку.",
+                            "reasoning": "Direct match for senior coach persona.",
+                            "language_requirements": ["English"],
+                            "pros": ["Full remote"],
+                            "cons": [],
+                        }
+                    )
+                }
+            }
+        ],
+    }
+    mock_post.return_value = mock_response
+    monkeypatch.setattr("httpx.Client.post", mock_post)
+
+    evaluator = OpenRouterEvaluator(
+        api_key="fake-key",
+        model="openrouter/free",
+        base_url="https://openrouter.ai/api/v1",
+        rpm_limit=100,
+    )
+
+    job = JobPosting(
+        dedup_hash="abc",
+        site="linkedin",
+        job_url="https://example.com/job",
+        title="Executive Coach",
+        company="Global Bank",
+        location="Remote Poland",
+        description="We need an Executive Coach to work with leadership in Warsaw.",
+        is_remote=True,
+    )
+
+    with caplog.at_level(logging.INFO):
+        res = evaluator.evaluate_job(job)
+
+    assert hasattr(res, "eval_model")
+    assert res.eval_model == "deepseek/deepseek-chat"
+    assert "OpenRouter evaluated 'Executive Coach' via model 'deepseek/deepseek-chat'" in caplog.text
+
+    # Response without "model" should fall back to evaluator.model
+    mock_response_no_model = MagicMock()
+    mock_response_no_model.status_code = 200
+    mock_response_no_model.json.return_value = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "score": 8.0,
+                            "is_wow": False,
+                            "summary_uk": "Звичайна позиція коуча в компанії.",
+                            "reasoning": "Decent fit.",
+                            "language_requirements": [],
+                            "pros": [],
+                            "cons": [],
+                        }
+                    )
+                }
+            }
+        ]
+    }
+    mock_post.return_value = mock_response_no_model
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        res_fallback = evaluator.evaluate_job(job)
+
+    assert res_fallback.eval_model == "openrouter/free"
+    assert "OpenRouter evaluated 'Executive Coach' via model 'openrouter/free'" in caplog.text
+
+
+

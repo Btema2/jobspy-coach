@@ -88,17 +88,34 @@ class JobSpyScraper:
         self,
         jitter_min: float = 4.0,
         jitter_max: float = 9.0,
-        results_per_query: int = 25,
+        results_per_query: int = 10,
         hours_old: int = 48,
         apply_prefilter: bool = True,
+        enabled_boards: Optional[List[str]] = None,
+        proxies: Optional[List[str]] = None,
+        linkedin_cooldown_seconds: float = 12.0,
     ):
         self.jitter_min = jitter_min
         self.jitter_max = jitter_max
         self.results_per_query = results_per_query
         self.hours_old = hours_old
         self.apply_prefilter = apply_prefilter
+        self.enabled_boards = enabled_boards
+        self.proxies = proxies
+        self.linkedin_cooldown_seconds = linkedin_cooldown_seconds
+        self.last_linkedin_call_time = 0.0
 
     def scrape_board(self, site_name: str, query: SearchQuery) -> List[JobPosting]:
+        if self.enabled_boards is not None and site_name.lower() not in [b.lower() for b in self.enabled_boards]:
+            logger.debug("Skipping board '%s' as it is not in enabled_boards", site_name)
+            return []
+
+        if site_name.lower() == "linkedin":
+            elapsed = time.time() - self.last_linkedin_call_time
+            if elapsed < self.linkedin_cooldown_seconds:
+                time.sleep(self.linkedin_cooldown_seconds - elapsed)
+            self.last_linkedin_call_time = time.time()
+
         df: Optional[pd.DataFrame] = None
         for attempt in range(1, 4):
             try:
@@ -110,6 +127,7 @@ class JobSpyScraper:
                     hours_old=self.hours_old,
                     country_indeed=query.country_code or "poland",
                     is_remote=query.is_remote,
+                    proxies=self.proxies,
                 )
                 break
             except Exception as e:

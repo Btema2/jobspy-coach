@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
-from pydantic import Field
+from typing import Any, List, Optional
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,12 +36,27 @@ class Settings(BaseSettings):
     hours_old_window: int = Field(default=48, alias="HOURS_OLD_WINDOW")
     scraper_jitter_min_seconds: float = Field(default=4.0, alias="SCRAPER_JITTER_MIN_SECONDS")
     scraper_jitter_max_seconds: float = Field(default=9.0, alias="SCRAPER_JITTER_MAX_SECONDS")
-    scraper_results_per_query: int = Field(default=25, alias="SCRAPER_RESULTS_PER_QUERY")
+    scraper_results_per_query: int = Field(default=10, alias="SCRAPER_RESULTS_PER_QUERY")
+    scraper_enabled_boards: Optional[List[str]] = Field(default=None, alias="SCRAPER_ENABLED_BOARDS")
+    scraper_proxies: Optional[List[str]] = Field(default=None, alias="SCRAPER_PROXIES")
 
     # Evaluation Thresholds
     wow_score_threshold: float = Field(default=9.0, alias="WOW_SCORE_THRESHOLD")
     digest_score_threshold: float = Field(default=6.0, alias="DIGEST_SCORE_THRESHOLD")
     digest_max_items: int = Field(default=10, alias="DIGEST_MAX_ITEMS")
+
+    @field_validator("scraper_enabled_boards", "scraper_proxies", mode="before")
+    @classmethod
+    def parse_comma_delimited_list(cls, v: Any) -> Optional[List[str]]:
+        if v is None:
+            return None
+        if isinstance(v, list):
+            items = [str(item).strip() for item in v if str(item).strip()]
+            return items if items else None
+        if isinstance(v, str):
+            items = [item.strip() for item in v.split(",") if item.strip()]
+            return items if items else None
+        return None
 
 
 @lru_cache(maxsize=1)
