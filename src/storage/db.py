@@ -350,6 +350,16 @@ class Database:
             conn.commit()
             return cursor.rowcount
 
+    def delete_empty_description_jobs(self, site: str = "linkedin") -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM jobs WHERE lower(site) = lower(?) AND (description IS NULL OR trim(description) = '')",
+                (site,),
+            )
+            conn.commit()
+            return cursor.rowcount
+
     def get_stats(self) -> Dict[str, int]:
         with self._get_connection() as conn:
             cursor = conn.cursor()

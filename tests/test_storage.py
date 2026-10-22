@@ -394,4 +394,67 @@ def test_database_mark_dismissed(tmp_path: Path):
     assert reloaded.notification_status == "dismissed"
 
 
+def test_database_delete_empty_description_jobs(tmp_path: Path):
+    db_file = tmp_path / "test_delete_empty.db"
+    db = Database(db_file)
+    db.init_db()
+
+    # 1. Job with empty description on linkedin -> should be deleted
+    j1 = JobPosting(
+        dedup_hash=compute_dedup_hash("Comp A", "Coach 1", "Remote"),
+        site="linkedin",
+        job_url="https://linkedin.com/1",
+        title="Coach 1",
+        company="Comp A",
+        location="Remote",
+        description="",
+    )
+    # 2. Job with whitespace description on linkedin (mixed casing site) -> should be deleted
+    j2 = JobPosting(
+        dedup_hash=compute_dedup_hash("Comp B", "Coach 2", "Remote"),
+        site="LinkedIn",
+        job_url="https://linkedin.com/2",
+        title="Coach 2",
+        company="Comp B",
+        location="Remote",
+        description="   ",
+    )
+    # 3. Job with valid description on linkedin -> should NOT be deleted
+    j3 = JobPosting(
+        dedup_hash=compute_dedup_hash("Comp C", "Coach 3", "Remote"),
+        site="linkedin",
+        job_url="https://linkedin.com/3",
+        title="Coach 3",
+        company="Comp C",
+        location="Remote",
+        description="A detailed coaching job description.",
+    )
+    # 4. Job with empty description on indeed -> should NOT be deleted when site="linkedin"
+    j4 = JobPosting(
+        dedup_hash=compute_dedup_hash("Comp D", "Coach 4", "Remote"),
+        site="indeed",
+        job_url="https://indeed.com/4",
+        title="Coach 4",
+        company="Comp D",
+        location="Remote",
+        description="",
+    )
+
+    db.save_job(j1)
+    db.save_job(j2)
+    db.save_job(j3)
+    db.save_job(j4)
+
+    # Act: delete empty description jobs for linkedin
+    deleted_count = db.delete_empty_description_jobs("linkedin")
+
+    # Assert
+    assert deleted_count == 2
+    assert db.get_job_by_hash(j1.dedup_hash) is None
+    assert db.get_job_by_hash(j2.dedup_hash) is None
+    assert db.get_job_by_hash(j3.dedup_hash) is not None
+    assert db.get_job_by_hash(j4.dedup_hash) is not None
+
+
+
 
