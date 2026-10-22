@@ -161,7 +161,7 @@ git commit -m "feat(notifier): add format_version_update_notice and digest chunk
   - `DaemonService.start`: logs version check notice at startup.
   - `cli.stats`: retrieves and displays `JobSpy Version` in rich table.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `tests/test_daemon.py`:
 1. `test_daemon_daily_digest_includes_update_notice`: When `check_jobspy_update` returns `has_update=True`, `send_daily_digest` is called with the formatted notice.
@@ -170,21 +170,21 @@ In `tests/test_daemon.py`:
 In `tests/test_cli.py`:
 1. `test_cli_stats_includes_jobspy_version`: `jobspy-coach stats` displays JobSpy version row in table.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `.venv/bin/pytest tests/test_daemon.py -k update_notice tests/test_cli.py -k stats -v`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement integration in `daemon.py` and `cli.py`**
+- [x] **Step 3: Implement integration in `daemon.py` and `cli.py`**
 
 Wire `check_jobspy_update()` into `DaemonService.run_daily_digest_cycle`, `DaemonService.start`, and `src/cli.py:stats()`.
 
-- [ ] **Step 4: Run full test suite**
+- [x] **Step 4: Run full test suite**
 
 Run: `.venv/bin/pytest -v`
 Expected: 155+ tests PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/scheduler/daemon.py src/cli.py tests/test_daemon.py tests/test_cli.py
