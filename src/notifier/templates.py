@@ -1,5 +1,6 @@
 import html
 from typing import Any, Dict, List, Optional, Tuple
+from src.scraper.version_checker import VersionCheckResult
 from src.storage.models import JobPosting
 
 
@@ -93,17 +94,33 @@ def format_wow_alert(job: JobPosting) -> Tuple[str, Dict[str, Any]]:
     return msg, markup
 
 
-def format_digest_chunks(jobs: List[JobPosting], date_str: str) -> List[str]:
+def format_version_update_notice(result: VersionCheckResult) -> str:
+    """Formats a Ukrainian localized update notice for Telegram HTML digest."""
+    latest_esc = html.escape(result.latest_version)
+    installed_esc = html.escape(result.installed_version)
+    return (
+        f"\n\nℹ️ <i>Доступне оновлення python-jobspy: v{latest_esc} (встановлено: v{installed_esc}).\n"
+        f"Щоб оновити: <code>pip install -U python-jobspy</code></i>"
+    )
+
+
+def format_digest_chunks(
+    jobs: List[JobPosting],
+    date_str: str,
+    update_notice: Optional[str] = None,
+) -> List[str]:
     date_esc = html.escape(date_str or "")
     header = (
         f"☕️ <b>Ранковий Дайджест Вакансій Коучингу | {date_esc}</b>\n"
         f"Знайдено нових актуальних позицій: <b>{len(jobs)}</b>\n\n"
     )
-    footer = "\n<i>Всі позиції збережено в базі. Бажаємо продуктивного дня!</i>"
+    standard_footer = "\n<i>Всі позиції збережено в базі. Бажаємо продуктивного дня!</i>"
+    final_footer = standard_footer + (update_notice if update_notice else "")
 
     chunks = []
     current_chunk = header
     chunk_index = 1
+    total_jobs = len(jobs)
 
     for idx, job in enumerate(jobs, start=1):
         score_str = f"{job.eval_score:.1f}" if job.eval_score is not None else "-"
@@ -120,14 +137,15 @@ def format_digest_chunks(jobs: List[JobPosting], date_str: str) -> List[str]:
             f"   🔗 <a href=\"{url_esc}\">Переглянути вакансію</a>\n\n"
         )
 
-        if len(current_chunk) + len(item_str) + len(footer) > 3800:
-            current_chunk += footer
+        needed_footer = final_footer if idx == total_jobs else standard_footer
+        if len(current_chunk) + len(item_str) + len(needed_footer) > 3800:
+            current_chunk += standard_footer
             chunks.append(current_chunk)
             chunk_index += 1
             current_chunk = f"☕️ <b>Ранковий Дайджест | Частина {chunk_index}</b>\n\n" + item_str
         else:
             current_chunk += item_str
 
-    current_chunk += footer
+    current_chunk += final_footer
     chunks.append(current_chunk)
     return chunks

@@ -1,3 +1,4 @@
+import importlib.metadata
 import logging
 from typing import Optional
 import typer
@@ -7,6 +8,7 @@ from rich.table import Table
 from src.config import get_settings
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.scheduler.daemon import DaemonService
+from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
 
 app = typer.Typer(help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
@@ -87,6 +89,21 @@ def stats():
 
     for k, v in data.items():
         table.add_row(k.replace("_", " ").title(), str(v))
+
+    try:
+        version_info = check_jobspy_update()
+        if version_info:
+            version_str = (
+                f"{version_info.installed_version} (Update: v{version_info.latest_version})"
+                if version_info.has_update
+                else f"{version_info.installed_version} (Latest)"
+            )
+        else:
+            version_str = importlib.metadata.version("python-jobspy")
+    except Exception:
+        version_str = "Unknown"
+
+    table.add_row("Jobspy Version", version_str)
 
     console.print(table)
 

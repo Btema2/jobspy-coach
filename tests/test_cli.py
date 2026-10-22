@@ -31,11 +31,49 @@ def test_cli_stats_command(monkeypatch):
         "pending_digest": 5,
     })
     monkeypatch.setattr("src.storage.db.Database.get_stats", mock_stats)
+    from src.scraper.version_checker import VersionCheckResult
+    mock_check = MagicMock(return_value=VersionCheckResult(
+        has_update=True,
+        installed_version="1.3.0",
+        latest_version="1.4.0",
+    ))
+    monkeypatch.setattr("src.cli.check_jobspy_update", mock_check)
 
     result = runner.invoke(app, ["stats"])
     assert result.exit_code == 0
     assert "42" in result.stdout
     assert "15" in result.stdout
+    assert "Jobspy Version" in result.stdout
+    assert "1.3.0 (Update: v1.4.0)" in result.stdout
+
+
+def test_cli_stats_shows_jobspy_version_latest(monkeypatch):
+    mock_stats = MagicMock(return_value={"total_jobs": 42})
+    monkeypatch.setattr("src.storage.db.Database.get_stats", mock_stats)
+    from src.scraper.version_checker import VersionCheckResult
+    mock_check = MagicMock(return_value=VersionCheckResult(
+        has_update=False,
+        installed_version="1.4.0",
+        latest_version="1.4.0",
+    ))
+    monkeypatch.setattr("src.cli.check_jobspy_update", mock_check)
+
+    result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 0
+    assert "Jobspy Version" in result.stdout
+    assert "1.4.0 (Latest)" in result.stdout
+
+
+def test_cli_stats_shows_jobspy_version_fallback(monkeypatch):
+    mock_stats = MagicMock(return_value={"total_jobs": 42})
+    monkeypatch.setattr("src.storage.db.Database.get_stats", mock_stats)
+    monkeypatch.setattr("src.cli.check_jobspy_update", MagicMock(return_value=None))
+    monkeypatch.setattr("importlib.metadata.version", MagicMock(return_value="1.3.5"))
+
+    result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 0
+    assert "Jobspy Version" in result.stdout
+    assert "1.3.5" in result.stdout
 
 
 def test_cli_test_telegram_command(monkeypatch):
