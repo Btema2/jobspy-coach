@@ -507,3 +507,36 @@ def test_jobspy_scraper_linkedin_pacing(monkeypatch):
     scraper.scrape_board("indeed", query)
     mock_sleep.assert_not_called()
 
+
+def test_jobspy_scraper_passes_fetch_description(monkeypatch):
+    mock_scrape = MagicMock(return_value=pd.DataFrame())
+    monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape)
+
+    # 1. JobSpyScraper has fetch_description=True by default
+    scraper_default = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
+    assert scraper_default.fetch_description is True
+
+    query = SearchQuery(
+        query_id="Q-TEST-FETCH-DESC",
+        search_term="Executive Coach",
+        location="Warsaw",
+        site_names=["linkedin"],
+    )
+
+    # 2. When scrape_board is invoked, scrape_jobs receives fetch_description=True
+    scraper_default.scrape_board("linkedin", query)
+    assert mock_scrape.call_count == 1
+    _, kwargs_default = mock_scrape.call_args
+    assert kwargs_default.get("fetch_description") is True
+
+    # 3. When JobSpyScraper(fetch_description=False) is configured, scrape_jobs receives fetch_description=False
+    mock_scrape.reset_mock()
+    scraper_no_desc = JobSpyScraper(fetch_description=False, jitter_min=0.0, jitter_max=0.0)
+    assert scraper_no_desc.fetch_description is False
+
+    scraper_no_desc.scrape_board("linkedin", query)
+    assert mock_scrape.call_count == 1
+    _, kwargs_no_desc = mock_scrape.call_args
+    assert kwargs_no_desc.get("fetch_description") is False
+
+

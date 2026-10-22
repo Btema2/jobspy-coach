@@ -94,6 +94,7 @@ class JobSpyScraper:
         enabled_boards: Optional[List[str]] = None,
         proxies: Optional[List[str]] = None,
         linkedin_cooldown_seconds: float = 12.0,
+        fetch_description: bool = True,
     ):
         self.jitter_min = jitter_min
         self.jitter_max = jitter_max
@@ -104,6 +105,7 @@ class JobSpyScraper:
         self.proxies = proxies
         self.linkedin_cooldown_seconds = linkedin_cooldown_seconds
         self.last_linkedin_call_time = 0.0
+        self.fetch_description = fetch_description
 
     def scrape_board(self, site_name: str, query: SearchQuery) -> List[JobPosting]:
         if self.enabled_boards is not None and site_name.lower() not in [b.lower() for b in self.enabled_boards]:
@@ -128,6 +130,7 @@ class JobSpyScraper:
                     country_indeed=query.country_code or "poland",
                     is_remote=query.is_remote,
                     proxies=self.proxies,
+                    fetch_description=self.fetch_description,
                 )
                 break
             except Exception as e:
