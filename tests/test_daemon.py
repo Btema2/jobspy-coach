@@ -155,7 +155,8 @@ def test_daemon_evaluate_permanent_failure_marks_failed(tmp_path):
     assert "Invalid prompt format" in (reloaded.eval_error or "")
 
 
-def test_daemon_daily_digest_sends_and_marks_sent(tmp_path):
+def test_daemon_daily_digest_sends_and_marks_sent(monkeypatch, tmp_path):
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
     db_file = tmp_path / "daemon_digest_send.db"
     mock_notifier = MagicMock()
     mock_notifier.send_daily_digest.return_value = 1
@@ -330,6 +331,7 @@ def test_daemon_start_lifecycle_and_shutdown(monkeypatch, tmp_path):
 
     mock_scheduler = MagicMock()
     monkeypatch.setattr("src.scheduler.daemon.BlockingScheduler", MagicMock(return_value=mock_scheduler))
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
 
     daemon = DaemonService(db_path=tmp_path / "daemon_start.db")
     mock_run = MagicMock(return_value=(0, 0))
@@ -451,5 +453,114 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     assert reloaded_high.eval_status == "evaluated"
     assert reloaded_high.eval_score == 7.5
     assert reloaded_high.notification_status == "pending"
+
+
+def test_daemon_daily_digest_includes_update_notice(monkeypatch, tmp_path):
+    from src.scraper.version_checker import VersionCheckResult
+
+    db_file = tmp_path / "daemon_digest_update.db"
+    mock_notifier = MagicMock()
+    mock_notifier.send_daily_digest.return_value = 1
+
+    mock_check = MagicMock(return_value=VersionCheckResult(
+        has_update=True,
+        installed_version="1.3.0",
+        latest_version="1.4.0",
+    ))
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", mock_check)
+
+    daemon = DaemonService(
+        db_path=db_file,
+        notifier=mock_notifier,
+    )
+
+    job = JobPosting(
+        dedup_hash="hash_digest_update",
+        site="indeed",
+        job_url="https://indeed.com/update",
+        title="Agile Coach",
+        company="Agile Corp",
+        location="Warsaw",
+        description="Agile coaching role description.",
+        eval_status="evaluated",
+        eval_score=8.0,
+        notification_status="pending",
+    )
+    daemon.db.save_job(job)
+
+    count = daemon.run_daily_digest_cycle(dry_run=False)
+    assert count == 1
+    assert mock_notifier.send_daily_digest.called
+
+    call_kwargs = mock_notifier.send_daily_digest.call_args[1]
+    assert "update_notice" in call_kwargs
+    assert call_kwargs["update_notice"] is not None
+    assert "Доступне оновлення python-jobspy: v1.4.0" in call_kwargs["update_notice"]
+    assert "v1.3.0" in call_kwargs["update_notice"]
+
+
+def test_daemon_daily_digest_no_update_notice_when_latest(monkeypatch, tmp_path):
+    from src.scraper.version_checker import VersionCheckResult
+
+    db_file = tmp_path / "daemon_digest_latest.db"
+    mock_notifier = MagicMock()
+    mock_notifier.send_daily_digest.return_value = 1
+
+    mock_check = MagicMock(return_value=VersionCheckResult(
+        has_update=False,
+        installed_version="1.4.0",
+        latest_version="1.4.0",
+    ))
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", mock_check)
+
+    daemon = DaemonService(
+        db_path=db_file,
+        notifier=mock_notifier,
+    )
+
+    job = JobPosting(
+        dedup_hash="hash_digest_latest",
+        site="indeed",
+        job_url="https://indeed.com/latest",
+        title="Agile Coach",
+        company="Agile Corp",
+        location="Warsaw",
+        description="Agile coaching role description.",
+        eval_status="evaluated",
+        eval_score=8.0,
+        notification_status="pending",
+    )
+    daemon.db.save_job(job)
+
+    count = daemon.run_daily_digest_cycle(dry_run=False)
+    assert count == 1
+    assert mock_notifier.send_daily_digest.called
+
+    call_kwargs = mock_notifier.send_daily_digest.call_args[1]
+    assert call_kwargs.get("update_notice") is None
+
+
+def test_daemon_start_logs_update_notice(monkeypatch, tmp_path, caplog):
+    from src.scraper.version_checker import VersionCheckResult
+    import logging
+
+    mock_scheduler = MagicMock()
+    monkeypatch.setattr("src.scheduler.daemon.BlockingScheduler", MagicMock(return_value=mock_scheduler))
+
+    mock_check = MagicMock(return_value=VersionCheckResult(
+        has_update=True,
+        installed_version="1.3.0",
+        latest_version="1.4.0",
+    ))
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", mock_check)
+
+    daemon = DaemonService(db_path=tmp_path / "daemon_start_log.db")
+    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+
+    with caplog.at_level(logging.INFO):
+        daemon.start()
+
+    assert "New JobSpy version available: v1.4.0 (installed: v1.3.0)" in caplog.text
+
 
 

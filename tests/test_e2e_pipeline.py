@@ -9,6 +9,7 @@ from src.storage.models import JobPosting
 
 
 def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
     """End-to-end integration test verifying the complete autonomous coaching monitor lifecycle:
     1. Scraping cycle simulation with noisy raw postings (sports noise, short stubs, valid roles, cross-board duplicates).
     2. Deterministic pre-filter rejection of athletic/sports titles and short stubs without invoking LLM.

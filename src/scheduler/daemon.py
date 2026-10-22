@@ -16,8 +16,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 from src.config import get_settings
 from src.evaluator.llm_evaluator import OpenRouterEvaluator
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.notifier.templates import format_version_update_notice
 from src.scraper.jobspy_scraper import JobSpyScraper
 from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries
+from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
 from src.storage.models import JobPosting
 
@@ -214,7 +216,15 @@ class DaemonService:
             logger.info(f"[DRY-RUN] Daily digest would contain {len(pending)} jobs.")
             return len(pending)
 
-        sent_count = self.notifier.send_daily_digest(pending, date_str=date_str)
+        update_notice = None
+        try:
+            version_info = check_jobspy_update()
+            if version_info and version_info.has_update:
+                update_notice = format_version_update_notice(version_info)
+        except Exception as e:
+            logger.debug("Failed checking JobSpy update for daily digest: %s", e)
+
+        sent_count = self.notifier.send_daily_digest(pending, date_str=date_str, update_notice=update_notice)
         if sent_count > 0:
             self.db.mark_digest_sent([j.id for j in pending if j.id is not None])
         return len(pending)
@@ -247,6 +257,17 @@ class DaemonService:
 
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
+
+        try:
+            version_info = check_jobspy_update()
+            if version_info and version_info.has_update:
+                logger.info(
+                    "New JobSpy version available: v%s (installed: v%s). Run 'pip install -U python-jobspy' to update.",
+                    version_info.latest_version,
+                    version_info.installed_version,
+                )
+        except Exception as e:
+            logger.debug("Failed startup JobSpy version check: %s", e)
 
         logger.info("Running initial startup scraping cycle...")
         self.run_pipeline_cycle()
