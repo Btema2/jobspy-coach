@@ -109,11 +109,16 @@ class TelegramNotifier:
         text, markup = format_wow_alert(job)
         return self.send_message(text, reply_markup=markup)
 
-    def send_daily_digest(self, jobs: List[JobPosting], date_str: str) -> int:
+    def send_daily_digest(
+        self,
+        jobs: List[JobPosting],
+        date_str: str,
+        update_notice: Optional[str] = None,
+    ) -> int:
         if not jobs:
             return 0
 
-        chunks = format_digest_chunks(jobs, date_str=date_str)
+        chunks = format_digest_chunks(jobs, date_str=date_str, update_notice=update_notice)
         sent_count = 0
         for chunk in chunks:
             if self.send_message(chunk):

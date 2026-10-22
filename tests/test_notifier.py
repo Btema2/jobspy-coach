@@ -4,7 +4,12 @@ import httpx
 import pytest
 
 from src.notifier.telegram_notifier import TelegramNotifier
-from src.notifier.templates import format_digest_chunks, format_wow_alert
+from src.notifier.templates import (
+    format_digest_chunks,
+    format_version_update_notice,
+    format_wow_alert,
+)
+from src.scraper.version_checker import VersionCheckResult
 from src.storage.models import JobPosting
 
 
@@ -356,3 +361,125 @@ def test_telegram_notifier_from_settings():
     default_notifier = TelegramNotifier.from_settings()
     assert isinstance(default_notifier, TelegramNotifier)
     default_notifier.close()
+
+
+def test_format_version_update_notice():
+    result = VersionCheckResult(
+        has_update=True,
+        installed_version="1.3.0",
+        latest_version="1.4.0",
+    )
+    notice = format_version_update_notice(result)
+    assert "ℹ️" in notice
+    assert "Доступне оновлення python-jobspy: v1.4.0" in notice
+    assert "(встановлено: v1.3.0)" in notice
+    assert "<code>pip install -U python-jobspy</code>" in notice
+
+    # Test HTML escaping of version strings
+    unsafe_result = VersionCheckResult(
+        has_update=True,
+        installed_version="1.3.0<beta>",
+        latest_version="1.4.0&test",
+    )
+    unsafe_notice = format_version_update_notice(unsafe_result)
+    assert "v1.4.0&amp;test" in unsafe_notice
+    assert "v1.3.0&lt;beta&gt;" in unsafe_notice
+    assert "<beta>" not in unsafe_notice
+
+
+def test_format_digest_chunks_with_update_notice():
+    job = JobPosting(
+        dedup_hash="hash_update_notice",
+        site="linkedin",
+        job_url="https://linkedin.com/jobs/view/999",
+        title="Agile Coach",
+        company="Coaching Org",
+        location="Kyiv",
+        description="Desc",
+        eval_score=8.5,
+        eval_summary_uk="Опис позиції коуча.",
+    )
+    notice = "\n\nℹ️ <i>Доступне оновлення python-jobspy: v1.4.0 (встановлено: v1.3.0).\nЩоб оновити: <code>pip install -U python-jobspy</code></i>"
+
+    # 1. Single job with notice
+    chunks = format_digest_chunks([job], date_str="22.10.2026", update_notice=notice)
+    assert len(chunks) == 1
+    assert notice in chunks[0]
+    assert len(chunks[0]) <= 3800
+
+    # 2. Empty jobs with notice
+    empty_chunks = format_digest_chunks([], date_str="22.10.2026", update_notice=notice)
+    assert len(empty_chunks) == 1
+    assert notice in empty_chunks[0]
+    assert "Знайдено нових актуальних позицій: <b>0</b>" in empty_chunks[0]
+    assert len(empty_chunks[0]) <= 3800
+
+    # 3. Multi-chunk split: notice must be appended ONLY to final chunk
+    jobs = []
+    for i in range(25):
+        jobs.append(
+            JobPosting(
+                dedup_hash=f"hash_{i}",
+                site="indeed",
+                job_url=f"https://example.com/job/{i}",
+                title=f"Coaching Role {i} with long title and details",
+                company=f"Company {i}",
+                location="Remote Poland",
+                description="Long description",
+                eval_score=8.0 - (i * 0.1),
+                eval_summary_uk="Опис ролі та ключові обов'язки тренера або коуча команди.",
+            )
+        )
+    multi_chunks = format_digest_chunks(jobs, date_str="22.10.2026", update_notice=notice)
+    assert len(multi_chunks) > 1
+    for chunk in multi_chunks:
+        assert len(chunk) <= 3800
+    assert notice in multi_chunks[-1]
+    for chunk in multi_chunks[:-1]:
+        assert notice not in chunk
+
+
+def test_format_digest_chunks_without_update_notice():
+    job = JobPosting(
+        dedup_hash="hash_no_notice",
+        site="linkedin",
+        job_url="https://linkedin.com/jobs/view/888",
+        title="Career Coach",
+        company="Talent Inc",
+        location="Warsaw",
+        description="Desc",
+        eval_score=8.0,
+        eval_summary_uk="Тестовий опис ролі.",
+    )
+    chunks_default = format_digest_chunks([job], date_str="22.10.2026")
+    chunks_none = format_digest_chunks([job], date_str="22.10.2026", update_notice=None)
+    assert chunks_default == chunks_none
+    assert "Доступне оновлення" not in chunks_default[0]
+
+
+def test_send_daily_digest_forwards_update_notice(monkeypatch):
+    mock_chunks = ["chunk1", "chunk2"]
+    mock_format = MagicMock(return_value=mock_chunks)
+    monkeypatch.setattr("src.notifier.telegram_notifier.format_digest_chunks", mock_format)
+
+    mock_send = MagicMock(return_value=True)
+    notifier = TelegramNotifier(token="fake-token", chat_id="12345")
+    monkeypatch.setattr(notifier, "send_message", mock_send)
+    monkeypatch.setattr("time.sleep", MagicMock())
+
+    job = JobPosting(
+        dedup_hash="hash_fwd",
+        site="linkedin",
+        job_url="https://linkedin.com/1",
+        title="Coach",
+        company="Co",
+        location="Remote",
+        description="Desc",
+    )
+    notice = "sample update notice"
+    count = notifier.send_daily_digest([job], date_str="22.10.2026", update_notice=notice)
+
+    assert count == 2
+    mock_format.assert_called_once_with([job], date_str="22.10.2026", update_notice=notice)
+    notifier.close()
+
