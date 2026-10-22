@@ -1,5 +1,10 @@
+import json
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -50,3 +55,31 @@ DEFAULT_QUERY_CATALOG: List[SearchQuery] = [
         is_remote=True,
     ),
 ]
+
+
+def load_custom_queries() -> Optional[List[SearchQuery]]:
+    """Loads user-specific search queries from local git-ignored queries.json if present."""
+    for path in [Path("queries.json"), Path("config/queries.json")]:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return [
+                    SearchQuery(
+                        query_id=item["query_id"],
+                        search_term=item["search_term"],
+                        location=item["location"],
+                        site_names=item["site_names"],
+                        country_code=item.get("country_code"),
+                        is_remote=item.get("is_remote", False),
+                    )
+                    for item in data
+                ]
+            except Exception as e:
+                logger.warning("Could not load custom queries from %s: %s", path, e)
+    return None
+
+
+def get_active_queries() -> List[SearchQuery]:
+    """Returns custom queries if present, otherwise default catalog."""
+    custom = load_custom_queries()
+    return custom if custom else DEFAULT_QUERY_CATALOG

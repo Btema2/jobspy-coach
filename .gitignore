@@ -59,6 +59,16 @@ ENV/
 env.bak/
 venv.bak/
 
+# Private user / candidate data (DO NOT COMMIT)
+.candidate_profile.md
+candidate_profile.md
+*.candidate_profile.md
+config/candidate_profile.*
+config/custom_*
+config/queries.json
+queries.json
+local/
+
 # SQLite / Databases
 *.db
 *.sqlite

@@ -15,9 +15,9 @@ The **Coaching Job Monitor Daemon** (`jobspy-coach`) is an automated, self-hoste
 
 * **Target Candidate Profile:**
   * **Role Domains:** Executive Coaching, Leadership Coaching, Business Coaching, Career Coaching, Life Coaching, and Corporate Learning & Development (L&D Specialist / L&D Manager / Leadership Development Facilitator).
-  * **Candidate Background:** certified professional coach.
+  * **Candidate Profile:** Certified professional coach specializing in executive, leadership, career, agile, and corporate L&D domains.
   * **Languages:** Configurable via local profile (supports multilingual evaluation).
-  * **Work Preferences:** Remote (EU / Global) or Hybrid / Onsite within major Polish tech & business hubs (Warsaw, Kraków, Wrocław, Gdańsk, Poznań, Katowice, Remote Poland).
+  * **Locations:** Configurable target markets (local, hybrid, and remote).
 
 ### 1.2 Core Problem & Value Proposition
 Standard job alerts (LinkedIn notifications, Indeed alerts) flood candidate inboxes with massive noise:
@@ -30,7 +30,7 @@ Standard job alerts (LinkedIn notifications, Indeed alerts) flood candidate inbo
 `jobspy-coach` solves this by running an autonomous 24/7 daemon pipeline:
 * **Multi-Board Aggregation:** Leverages `python-jobspy` to scrape LinkedIn, Indeed, Glassdoor, Google Jobs, and ZipRecruiter across EU/Global remote queries and Polish regional queries within a rolling 48-hour window.
 * **Deterministic Local Pre-Filtering:** Instant regex-based rejection of athletic, sports, fitness, vocal, and artistic roles, plus stub description checks. Drops ~60-80% of noise without spending API tokens.
-* **Intelligent LLM Evaluation:** Evaluates candidates using OpenRouter's free router (`openrouter/free`) with candidate persona context, scoring match quality from 1.0 to 10.0, evaluating "WOW" criteria, and generating a concise 1–2 sentence Ukrainian executive summary.
+* **Intelligent LLM Evaluation:** Evaluates candidates using OpenRouter's free router (`openrouter/free`) with candidate persona context, scoring match quality from 1.0 to 10.0, evaluating "WOW" criteria, and generating a concise executive summary (configured in local profile).
 * **Local State Machine & Deduplication:** SQLite database in Write-Ahead Logging (WAL) mode with normalized SHA-256 deduplication hashing to ensure zero duplicate notifications across multiple scrapers.
 * **Dual-Tier Telegram Notification:**
   * **Instant WOW Alerts:** Instant Telegram push with action buttons for exceptional vacancies (score $\ge 9.0$ or flagged `is_wow`).
@@ -139,7 +139,7 @@ The data collection component utilizes `python-jobspy` (`jobspy`), an open-sourc
 * **Location & Mode Strategy:**
   1. **Poland Regional:** Target onsite, hybrid, and local remote jobs within Poland.
      * Locations: `"Poland"`, `"Warsaw"`, `"Krakow"`, `"Wroclaw"`.
-  2. **EU / Global Remote:** Target cross-border English and Ukrainian remote postings.
+  2. **EU / Global Remote:** Target cross-border remote postings.
      * Locations: `"Remote"`, `"European Union"`, `"Europe"`.
 * **Search Queries:**
   * `"Executive Coach"`
@@ -249,18 +249,18 @@ Your job is to evaluate whether a scraped job vacancy is a strong match for a sp
 CANDIDATE PERSONA:
 - Domain Expertise: Executive Coaching, Leadership Development, Business Coaching, Career Coaching, Life Coaching, Corporate Learning & Development (L&D).
 - Excluded Roles: Sports coaching, fitness/gym training, musical/vocal coaching, purely technical IT/software delivery without people development.
-- Candidate Location: Configurable via local profile (compatible with local, hybrid, and remote opportunities).
+- Candidate Location: Configurable target markets (local, hybrid, and remote).
 - Language Capabilities: Configurable via local profile (supports multilingual evaluation).
 
 EVALUATION INSTRUCTIONS:
 1. Analyze the job title, company, work location (remote vs onsite), language requirements, responsibilities, and qualifications.
 2. Assign an overall match score from 1.0 to 10.0:
-   - 9.0 - 10.0 (WOW Match): Executive/leadership/career coaching or high-level L&D role; explicitly remote (EU/Global) or in Poland; matches candidate language skills; excellent compensation or prestige.
+   - 9.0 - 10.0 (WOW Match): Executive/leadership/career coaching or high-level L&D role; matching target location/remote preferences; matches candidate language skills; excellent compensation or prestige.
    - 7.0 - 8.9 (Strong Match): Clear corporate/executive coaching or L&D role; compatible location/remote terms; candidate qualifications align.
    - 5.0 - 6.9 (Marginal Match): Mixed HR/recruitment responsibilities; unclear coaching scope; junior/admin L&D; or minor language mismatch.
    - 1.0 - 4.9 (Poor / Mismatch): Sports/fitness; pure technical/agile software delivery; incompatible geography (e.g. US-only onsite); requires languages candidate does not speak.
 3. Determine `is_wow`: True ONLY if score >= 9.0 OR the opportunity has exceptional prestige, compensation, and profile fit.
-4. Provide `summary_uk`: A concise 1-2 sentence summary strictly in executive summary format explaining why this role is relevant, core duties, and key working conditions.
+4. Provide `summary_uk`: A concise executive summary (configured in local profile) explaining why this role is relevant, core duties, and key working conditions.
 5. Provide `reasoning`: A concise English explanation of your scoring rationale.
 6. Provide `language_requirements`: List of languages required by the employer.
 
@@ -286,7 +286,7 @@ from typing import List
 class JobEvaluationResult(BaseModel):
     score: float = Field(ge=1.0, le=10.0, description="Match score between 1.0 and 10.0")
     is_wow: bool = Field(description="Flag for exceptional dream roles")
-    summary_uk: str = Field(min_length=10, description="1-2 sentence Ukrainian summary")
+    summary_uk: str = Field(min_length=10, description="1-2 sentence executive summary (configured in local profile)")
     reasoning: str = Field(description="Brief English reasoning")
     language_requirements: List[str] = Field(default_factory=list)
     pros: List[str] = Field(default_factory=list)
@@ -604,7 +604,7 @@ The project enforces Test-Driven Development (TDD) across all modules:
 3. **LLM Evaluator Tests (`test_evaluator.py`):**
    * Mocks OpenRouter responses with valid JSON, markdown-wrapped JSON, and broken syntax.
    * Tests 20 RPM rate limiter throttle under burst loads.
-   * Tests Pydantic validation rules and Ukrainian summary presence.
+   * Tests Pydantic validation rules and executive summary presence.
 
 4. **Telegram Notifier Tests (`test_notifier.py`):**
    * Verifies HTML tag escaping for job titles containing `<` or `&`.
@@ -651,10 +651,10 @@ WantedBy=multi-user.target
 
 ## 12. Verification & Acceptance Criteria Checklist
 
-- [x] **Executive Summary & Profile:** Clear candidate definition (certified professional coach, UKR/PL/EN languages, Executive/Career/L&D domains).
+- [x] **Executive Summary & Profile:** Clear candidate definition (configurable persona profile, languages, Executive/Career/L&D domains).
 - [x] **Multi-Board Scraper:** Integrated with `python-jobspy` covering LinkedIn, Indeed, Glassdoor, Google Jobs, ZipRecruiter across Poland & EU Remote.
 - [x] **Local Pre-Filtering:** Robust regex exclusion for sports, gym, fitness, vocal, and short stubs.
-- [x] **LLM Evaluation:** OpenRouter free router (`openrouter/free`), 1–10 scoring, `is_wow` criteria, Ukrainian summary, 20 RPM throttle.
+- [x] **LLM Evaluation:** OpenRouter free router (`openrouter/free`), 1–10 scoring, `is_wow` criteria, concise executive summary (configured in local profile), 20 RPM throttle.
 - [x] **SQLite State Machine:** WAL mode, `busy_timeout 5000`, SHA-256 deduplication hashing, complete lifecycle tracking.
 - [x] **Telegram Alerts:** Instant WOW alerts ($\ge 9.0$) with inline action buttons, daily 09:00 CET digest, HTML escaping, 4096-char guard.
 - [x] **CLI & Modularity:** Full suite of commands (`run`, `scrape`, `evaluate`, `digest`, `test-telegram`, `--dry-run`) with modular project layout.

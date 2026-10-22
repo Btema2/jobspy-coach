@@ -23,7 +23,7 @@ JobSpy Coach scouts coaching vacancies across major job boards (LinkedIn, Indeed
 
 ## Overview
 
-JobSpy Coach is specifically engineered for professional coaching and leadership development candidates seeking opportunities across local, regional, and remote global markets.
+JobSpy Coach is specifically engineered for professional coaching, leadership development, and talent development candidates seeking opportunities across local and remote global markets.
 
 ### Targeted Roles
 - **Executive Coaching & Leadership Coaching**
@@ -32,7 +32,7 @@ JobSpy Coach is specifically engineered for professional coaching and leadership
 - **Corporate Training & Organizational Development (L&D)**
 - **Team Coaching & Business Coaching**
 
-The daemon operates autonomously around the clock, continuously scraping configured job boards, deduplicating postings across providers, evaluating candidates with structured LLM reasoning in Ukrainian, and routing high-value opportunities to Telegram.
+The daemon operates autonomously around the clock, continuously scraping configured job boards, deduplicating postings across providers, evaluating candidates with structured LLM reasoning against your locally configured candidate profile, and routing high-value opportunities to Telegram.
 
 ---
 
@@ -54,12 +54,12 @@ The daemon operates autonomously around the clock, continuously scraping configu
 
 4. **Intelligent OpenRouter LLM Evaluation**:
    - Evaluates vacancies against the target candidate persona using OpenRouter models.
-   - Generates scores from 1.0 to 10.0, concise concise executive summaries (`summary_uk`), rationale (`reasoning`), extracted language requirements, and pros/cons.
+   - Generates scores from 1.0 to 10.0, concise executive summaries (`summary_uk`), rationale (`reasoning`), extracted language requirements, and pros/cons.
    - Enforces token-bucket rate limiting and handles transient network/server errors (leaving unprocessed jobs for subsequent retry).
 
 5. **Two-Tier Telegram Dispatching**:
    - **Instant WOW Alerts**: Vacancies scoring $\ge 9.0$ (or marked `is_wow = True`) trigger immediate Telegram push alerts with inline application buttons.
-   - **Daily Morning Digest**: Every day at 09:00 Europe/Warsaw, qualifying vacancies ($6.0 \le \text{score} < 9.0$) are batched and delivered in formatted digest messages.
+   - **Daily Morning Digest**: Every day at the configured digest time (`DIGEST_TIME_CET`), qualifying vacancies ($6.0 \le \text{score} < 9.0$) are batched and delivered in formatted digest messages.
    - **Immediate Low-Score Dismissal**: Vacancies scoring $< 6.0$ are immediately marked `dismissed` to keep queues clean.
    - **Stale Expiration**: Stale pending postings older than 7 days are automatically transitioned to `expired_dismissed`.
    - **Defensive Telegram Safety**: Automatic HTML entity escaping, message chunking ($\le 3,800$ chars), and summary/reasoning length guards ($\le 600$ and $\le 800$ chars) ensure messages never exceed Telegram's 4,096 character limit.

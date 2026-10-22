@@ -4,23 +4,16 @@
 
 ---
 
-## 1. Project Overview & Candidate Persona
+## 1. Candidate Privacy Protocol & Persona Architecture
 
-### The Candidate
-- **Profile**: Certified professional coach specializing in corporate coaching and leadership development.
-- **Languages (Configurable)**:
-  - Configurable via local profile (multilingual evaluation support).
-  
-  
-- **Target Domains**:
-  - Executive Coaching & Leadership Development
-  - Agile Coaching, Scrum Coaching & Enterprise Transformation
-  - Career Coaching & Mentorship
-  - Corporate Training & Learning & Development (L&D Specialist / Manager / Lead)
-  - Team Coaching & Business Coaching
-- **Target Markets**:
-  - Configurable target markets (local, hybrid, and remote).
-  - European Union & Global Remote: International companies hiring EU-based talent.
+> [!CAUTION]
+> **STRICT PRIVACY MANDATE FOR ALL AI AGENTS & DEVELOPERS**:
+> Under **NO circumstances** should private user data (candidate name, specific personal background, city/country of residence, native languages, personal credentials, or customized search targets) be committed, documented, or pushed to any public or remote repository.
+> 
+> - **Local Storage Only**: All actual candidate profiles and user-specific personas are stored exclusively in local, git-ignored configuration files (such as `.candidate_profile.md` and `.env`).
+> - **Public Neutrality**: Tracked repository files, documentation, commit messages, and PRs must strictly use sanitized, generic templates and configurable placeholders (e.g., `<TARGET_ROLE>`, `<TARGET_REGION>`).
+> - **Runtime Persona Injection**: When running locally, agents and the evaluator engine read `.candidate_profile.md` to evaluate vacancies against the user's private persona. If missing, the engine falls back to a generic professional template.
+
 
 ---
 
@@ -52,11 +45,11 @@ src/
 ### Key Workflows
 1. **Scraping**: `JobSpyScraper` queries configured job boards (LinkedIn, Indeed, Glassdoor, Google) with randomized jitter (`4.0–9.0s`).
 2. **Deterministic Pre-Filtering**: Zero-cost multilingual regex eliminates athletic, sports, fitness, vocal, animal, and gaming roles, and drops stub descriptions (<150 chars or <30 words) before invoking LLMs.
-3. **Cross-Board Deduplication**: Normalizes corporate legal suffixes (`Sp. z o.o.`, `LLC`, `GmbH`, `Inc.`), casing, and punctuation to compute SHA-256 `dedup_hash` over `company:title:location`.
-4. **LLM Evaluation**: Evaluates non-prefiltered vacancies via OpenRouter, extracting 1–10 match score, boolean `is_wow`, Ukrainian summary (`summary_uk`), English rationale, and dynamically routed model name (`eval_model`).
+3. **Cross-Board Deduplication**: Normalizes corporate legal suffixes (`LLC`, `GmbH`, `Inc.`), casing, and punctuation to compute SHA-256 `dedup_hash` over `company:title:location`.
+4. **LLM Evaluation**: Evaluates non-prefiltered vacancies via OpenRouter, extracting 1–10 match score, boolean `is_wow`, executive summary (`summary_uk`), English rationale, and dynamically routed model name (`eval_model`).
 5. **Two-Tier Telegram Alerts**:
    - **Instant WOW Alerts**: Vacancies scoring $\ge 9.0$ or flagged `is_wow = True` immediately trigger Telegram push notifications with an inline application button.
-   - **Daily Morning Digest**: Every morning at 09:00 Europe/Warsaw, qualifying vacancies ($6.0 \le \text{score} < 9.0$) are formatted in clean HTML chunks ($\le 3,800$ chars) and dispatched.
+   - **Daily Morning Digest**: Every morning at the scheduled digest time, qualifying vacancies ($6.0 \le \text{score} < 9.0$) are formatted in clean HTML chunks ($\le 3,800$ chars) and dispatched.
    - **Low-Score Dismissal**: Vacancies scoring $< 6.0$ are immediately marked `dismissed` to keep queues lean.
    - **Stale Expiration**: Pending items older than 7 days transition to `expired_dismissed`.
 
@@ -122,9 +115,11 @@ Any AI agent working on this codebase must adhere strictly to these principles:
 3. **Git Hygiene & Development Branches**:
    - Never implement directly on `main`. Always create a descriptive feature branch (`feature/<name>`).
    - Verify all tests pass, conduct task-level reviews, perform a whole-branch review, merge into `main`, and push.
-4. **Security & Secrets**:
+4. **Security, Privacy & Secrets**:
    - **NEVER hardcode or commit secrets** (OpenRouter API keys, Telegram bot tokens, chat IDs, proxy credentials).
-   - All secrets belong in `.env` (which is in `.gitignore`). Use `.env.example` with sanitized placeholders for documentation.
+   - **NEVER commit private user/candidate data** (name, background, residence, native languages, target locations, or custom prompts).
+   - All secrets belong in `.env` (which is in `.gitignore`). All private candidate personas belong in `.candidate_profile.md` (which is in `.gitignore`).
+   - Use `.env.example` with sanitized placeholders for documentation.
 5. **BypassSandbox Execution**:
    - Shell commands that modify files, run tests, or execute git commands (`pytest`, `git`, `python`) require `BypassSandbox: true` to avoid sandbox read-only filesystem errors.
 

@@ -17,7 +17,7 @@ from src.config import get_settings
 from src.evaluator.llm_evaluator import OpenRouterEvaluator
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.scraper.jobspy_scraper import JobSpyScraper
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery
+from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries
 from src.storage.db import Database
 from src.storage.models import JobPosting
 
@@ -134,7 +134,7 @@ class DaemonService:
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
     ) -> Tuple[int, int]:
-        active_queries = queries or DEFAULT_QUERY_CATALOG
+        active_queries = queries or get_active_queries()
         logger.info("Starting pipeline scrape cycle across queries...")
         total_new_saved = 0
 

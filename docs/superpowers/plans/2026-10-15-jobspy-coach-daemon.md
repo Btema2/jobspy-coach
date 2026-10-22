@@ -10,7 +10,7 @@
 ## 1. Executive Summary & Goals
 
 ### 1.1 Goal
-Build, verify, and document an autonomous, self-hosted, 24/7 background daemon (`jobspy-coach`) tailored for a certified professional coach specializing in corporate coaching. The daemon continuously discovers, pre-filters, intelligently evaluates, and notifies the candidate of high-match corporate coaching and leadership opportunities while eliminating athletic/sports spam and zeroing out recurring API costs.
+Build, verify, and document an autonomous, self-hosted, 24/7 background daemon (`jobspy-coach`) tailored for a certified professional coach specializing in executive, leadership, career, agile, and corporate L&D domains. The daemon continuously discovers, pre-filters, intelligently evaluates, and notifies the candidate of high-match corporate coaching and leadership opportunities while eliminating athletic/sports spam and zeroing out recurring API costs.
 
 ### 1.2 Architecture Overview
 The system is constructed as a pipeline of decoupled, modular components:
@@ -1135,7 +1135,7 @@ git commit -m "feat(filters): implement regex and length deterministic pre-filte
 ## Task 4: LLM Evaluation Engine via OpenRouter
 
 ### Overview
-Implement candidate evaluation using OpenRouter (`openrouter/free`). Features strict Pydantic validation, a leaky/token-bucket 20 RPM rate limiter, regex fallback for markdown-wrapped JSON, and concise executive summaries.
+Implement candidate evaluation using OpenRouter (`openrouter/free`). Features strict Pydantic validation, a leaky/token-bucket 20 RPM rate limiter, regex fallback for markdown-wrapped JSON, and concise executive summaries (configured in local profile).
 
 ### Files
 * **Created:**
@@ -1257,7 +1257,7 @@ def test_openrouter_evaluator_success(monkeypatch):
                     "is_wow": True,
                     "summary_uk": "Престижна позиція Executive коуча для міжнародного банку.",
                     "reasoning": "Direct match for senior coach persona with relevant qualifications.",
-                    "language_requirements": ["English", "Ukrainian"],
+                    "language_requirements": ["English"],
                     "pros": ["Top tier bank", "Full remote"],
                     "cons": []
                 })
@@ -1310,7 +1310,7 @@ from typing import List
 class JobEvaluationResult(BaseModel):
     score: float = Field(ge=1.0, le=10.0, description="Match score between 1.0 and 10.0")
     is_wow: bool = Field(description="Flag for exceptional dream roles")
-    summary_uk: str = Field(min_length=10, description="1-2 sentence Ukrainian summary")
+    summary_uk: str = Field(min_length=10, description="1-2 sentence executive summary (configured in local profile)")
     reasoning: str = Field(description="English reasoning")
     language_requirements: List[str] = Field(default_factory=list)
     pros: List[str] = Field(default_factory=list)
@@ -1325,18 +1325,18 @@ Your job is to evaluate whether a scraped job vacancy is a strong match for a sp
 CANDIDATE PERSONA:
 - Domain Expertise: Executive Coaching, Leadership Development, Business Coaching, Career Coaching, Life Coaching, Corporate Learning & Development (L&D).
 - Excluded Roles: Sports coaching, fitness/gym training, musical/vocal coaching, purely technical IT/software delivery without people development.
-- Candidate Location: Configurable via local profile (compatible with local, hybrid, and remote opportunities).
+- Candidate Location: Configurable target markets (local, hybrid, and remote).
 - Language Capabilities: Configurable via local profile (supports multilingual evaluation).
 
 EVALUATION INSTRUCTIONS:
 1. Analyze the job title, company, work location (remote vs onsite), language requirements, responsibilities, and qualifications.
 2. Assign an overall match score from 1.0 to 10.0:
-   - 9.0 - 10.0 (WOW Match): Executive/leadership/career coaching or high-level L&D role; explicitly remote (EU/Global) or in Poland; matches candidate language skills; excellent compensation or prestige.
+   - 9.0 - 10.0 (WOW Match): Executive/leadership/career coaching or high-level L&D role; matching target location/remote preferences; matches candidate language skills; excellent compensation or prestige.
    - 7.0 - 8.9 (Strong Match): Clear corporate/executive coaching or L&D role; compatible location/remote terms; candidate qualifications align.
    - 5.0 - 6.9 (Marginal Match): Mixed HR/recruitment responsibilities; unclear coaching scope; junior/admin L&D; or minor language mismatch.
    - 1.0 - 4.9 (Poor / Mismatch): Sports/fitness; pure technical/agile software delivery; incompatible geography (e.g. US-only onsite); requires languages candidate does not speak.
 3. Determine `is_wow`: True ONLY if score >= 9.0 OR the opportunity has exceptional prestige, compensation, and profile fit.
-4. Provide `summary_uk`: A concise 1-2 sentence summary strictly in executive summary format explaining why this role is relevant, core duties, and key working conditions.
+4. Provide `summary_uk`: A concise executive summary (configured in local profile) explaining why this role is relevant, core duties, and key working conditions.
 5. Provide `reasoning`: A concise English explanation of your scoring rationale.
 6. Provide `language_requirements`: List of languages required by the employer.
 
@@ -2756,8 +2756,8 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
                 score=9.6,
                 is_wow=True,
                 summary_uk="Топ-вакансія executive коуча для роботи з керівниками банку.",
-                reasoning="Dream role with international exposure and professional growth opportunity",
-                language_requirements=["English", "Ukrainian"],
+                reasoning="Direct match for senior coach persona with relevant qualifications.",
+                language_requirements=["English"],
                 pros=["High salary", "C-suite client base"],
                 cons=[]
             )

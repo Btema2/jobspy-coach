@@ -136,7 +136,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
                 is_wow=True,
                 summary_uk="Топ-вакансія executive коуча для роботи з керівниками банку.",
                 reasoning="Dream role with international exposure and professional growth opportunity",
-                language_requirements=["English", "Ukrainian"],
+                language_requirements=["English"],
                 pros=["High salary", "C-suite client base"],
                 cons=[],
             )

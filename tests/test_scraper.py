@@ -1,10 +1,17 @@
+import logging
+from pathlib import Path
+from unittest.mock import MagicMock
 import numpy as np
 import pandas as pd
 import pytest
-from unittest.mock import MagicMock
 
 from src.scraper.jobspy_scraper import JobSpyScraper, clean_job_url
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery
+from src.scraper.query_catalog import (
+    DEFAULT_QUERY_CATALOG,
+    SearchQuery,
+    get_active_queries,
+    load_custom_queries,
+)
 
 
 def test_clean_job_url():
@@ -538,5 +545,125 @@ def test_jobspy_scraper_passes_fetch_description(monkeypatch):
     assert mock_scrape.call_count == 1
     _, kwargs_no_desc = mock_scrape.call_args
     assert kwargs_no_desc.get("fetch_description") is False
+
+
+def test_load_custom_queries_valid(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    custom_data = [
+        {
+            "query_id": "CUSTOM-1",
+            "search_term": "Executive Leadership Coach",
+            "location": "Warsaw, Poland",
+            "site_names": ["linkedin", "indeed"],
+            "country_code": "poland",
+            "is_remote": False,
+        },
+        {
+            "query_id": "CUSTOM-REMOTE",
+            "search_term": "Agile Coach",
+            "location": "Remote",
+            "site_names": ["glassdoor"],
+            "is_remote": True,
+        },
+    ]
+
+    # Test loading from queries.json
+    queries_file = tmp_path / "queries.json"
+    import json
+    queries_file.write_text(json.dumps(custom_data), encoding="utf-8")
+
+    queries = load_custom_queries()
+    assert queries is not None
+    assert len(queries) == 2
+    assert queries[0] == SearchQuery(
+        query_id="CUSTOM-1",
+        search_term="Executive Leadership Coach",
+        location="Warsaw, Poland",
+        site_names=["linkedin", "indeed"],
+        country_code="poland",
+        is_remote=False,
+    )
+    assert queries[1] == SearchQuery(
+        query_id="CUSTOM-REMOTE",
+        search_term="Agile Coach",
+        location="Remote",
+        site_names=["glassdoor"],
+        country_code=None,
+        is_remote=True,
+    )
+
+    # Test loading from config/queries.json when queries.json is removed
+    queries_file.unlink()
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "queries.json").write_text(json.dumps([custom_data[0]]), encoding="utf-8")
+
+    queries_config = load_custom_queries()
+    assert queries_config is not None
+    assert len(queries_config) == 1
+    assert queries_config[0].query_id == "CUSTOM-1"
+
+
+def test_load_custom_queries_invalid_json(tmp_path, monkeypatch, caplog):
+    monkeypatch.chdir(tmp_path)
+    bad_file = tmp_path / "queries.json"
+    bad_file.write_text("{\"query_id\": INVALID_JSON...", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        res = load_custom_queries()
+
+    assert res is None
+    assert "Could not load custom queries" in caplog.text
+
+
+def test_load_custom_queries_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # Neither queries.json nor config/queries.json exists
+    assert load_custom_queries() is None
+
+
+def test_get_active_queries(monkeypatch):
+    # 1. When custom queries exist, get_active_queries returns custom queries
+    mock_custom = [
+        SearchQuery(
+            query_id="MOCK-Q",
+            search_term="Mock Coach",
+            location="Remote",
+            site_names=["indeed"],
+        )
+    ]
+    monkeypatch.setattr("src.scraper.query_catalog.load_custom_queries", lambda: mock_custom)
+    active = get_active_queries()
+    assert active == mock_custom
+
+    # 2. When custom queries is None, get_active_queries returns DEFAULT_QUERY_CATALOG
+    monkeypatch.setattr("src.scraper.query_catalog.load_custom_queries", lambda: None)
+    active_default = get_active_queries()
+    assert active_default == DEFAULT_QUERY_CATALOG
+
+
+def test_jobspy_scraper_scrape_all_queries_defaults_to_active_queries(monkeypatch):
+    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
+    mock_scrape_query = MagicMock(return_value=[])
+    scraper.scrape_query = mock_scrape_query
+
+    mock_custom_queries = [
+        SearchQuery(query_id="Q-ACTIVE-1", search_term="Coach", location="Warsaw", site_names=["linkedin"]),
+    ]
+    monkeypatch.setattr("src.scraper.jobspy_scraper.get_active_queries", lambda: mock_custom_queries)
+
+    # Calling scrape_all_queries with queries=None uses get_active_queries
+    res = scraper.scrape_all_queries(None)
+    assert res == []
+    assert mock_scrape_query.call_count == 1
+    assert mock_scrape_query.call_args[0][0] == mock_custom_queries[0]
+
+    # Calling run_scraping_cycle with queries=None also uses get_active_queries
+    mock_scrape_query.reset_mock()
+    res_cycle = scraper.run_scraping_cycle()
+    assert res_cycle == []
+    assert mock_scrape_query.call_count == 1
+    assert mock_scrape_query.call_args[0][0] == mock_custom_queries[0]
+
 
 

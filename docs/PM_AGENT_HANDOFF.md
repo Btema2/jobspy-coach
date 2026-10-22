@@ -6,12 +6,12 @@
 
 ---
 
-## 1. Project Background & Candidate Profile
+## 1. Project Background & Privacy Protocol
 - **Repository**: `https://github.com/Btema2/jobspy-coach` (local workspace: `/home/btema2/smart-things/code/jobspy-coach`)
-- **Candidate Profile**: Certified professional coach specializing in corporate coaching and leadership development.
-- **Target Domains**: Executive Coaching, Leadership Coaching, Business Coaching, Career Coaching, Life Coaching, and Corporate L&D (Learning & Development) Specialist / Manager roles.
-- **Geographic Scope**: Poland local/hybrid + European Union / Global Remote roles.
-- **Current Status**: Production-ready codebase on branch `main` with 141 passing tests (3.4s execution time, 97% statement coverage).
+- **Privacy Protocol**: Private candidate persona definitions and personal credentials must NEVER be committed or pushed to any public repository. The local user persona is stored exclusively in `.candidate_profile.md` (which is in `.gitignore`).
+- **Target Domains**: Executive Coaching, Leadership Development, Agile/Scrum Coaching, Career Coaching, and Corporate L&D (Learning & Development) roles.
+- **Geographic Scope**: Configurable local and global remote roles.
+- **Current Status**: Production-ready codebase on branch `main` with 143 passing tests (3.2s execution time, 97% statement coverage).
 - **Recent Completed Work**:
   - Improvement A (`9153af6`): Captured actual OpenRouter model in `JobEvaluationResult.eval_model` and logged at `INFO`.
   - Improvement B (`7c3967b`): Cleaned query catalog (`src/scraper/query_catalog.py`) to eliminate Glassdoor from Poland queries and ZipRecruiter from EU queries.
@@ -23,10 +23,10 @@
 ## 2. Core Architecture & Tech Stack
 1. **Scraper Pipeline (`src/scraper/`)**: Uses `python-jobspy` across LinkedIn, Indeed, Glassdoor, and Google Jobs. Uses query catalog in `src/scraper/query_catalog.py`.
 2. **Deterministic Pre-Filtering (`src/filters/`)**: Zero-cost multilingual regex in `src/filters/pre_filter.py` eliminating sports, gym, fitness, vocal, animal, and gaming roles in EN/PL/UK, plus stub descriptions (<150 chars or <30 words) with reason `DESCRIPTION_TOO_SHORT`.
-3. **LLM Evaluation (`src/evaluator/`)**: Evaluates vacancies via OpenRouter (`openrouter/free` meta-router or specific model) with 20 RPM rate limiting, 3-tier JSON parsing + regex fallback, and Pydantic validation (`src/evaluator/schemas.py`). Returns 1-10 match score, boolean `is_wow`, and 1-2 sentence Ukrainian summary (`summary_uk`).
-4. **Storage & Deduplication (`src/storage/`)**: SQLite in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`) with cross-board SHA-256 deduplication over normalized `company:title:location` (stripping corporate suffixes like `Sp. z o.o.`, `LLC`, `GmbH`), scrape run telemetry (`scrape_runs`), and 7-day stale job expiration.
-5. **Telegram Notifications (`src/notifier/`)**: Instant WOW alerts for `score >= 9.0` or `is_wow == True` with inline URL button (`"🚀 Apply / View Job"`). Daily morning digest at 09:00 Europe/Warsaw for `score >= 6.0` in HTML chunks ($\le 3,800$ chars).
-6. **Daemon & CLI (`src/scheduler/daemon.py`, `src/cli.py`)**: APScheduler with cron at 09:00 Europe/Warsaw and recurring interval scraping. Unified Typer CLI (`run`, `scrape`, `evaluate`, `digest`, `test-telegram`, `stats`, `--dry-run`).
+3. **LLM Evaluation (`src/evaluator/`)**: Evaluates vacancies via OpenRouter (`openrouter/free` meta-router or specific model) with 20 RPM rate limiting, 3-tier JSON parsing + regex fallback, and Pydantic validation (`src/evaluator/schemas.py`). Returns 1-10 match score, boolean `is_wow`, and 1-2 sentence executive summary (`summary_uk`).
+4. **Storage & Deduplication (`src/storage/`)**: SQLite in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`) with cross-board SHA-256 deduplication over normalized `company:title:location` (stripping corporate suffixes like `LLC`, `GmbH`), scrape run telemetry (`scrape_runs`), and 7-day stale job expiration.
+5. **Telegram Notifications (`src/notifier/`)**: Instant WOW alerts for `score >= 9.0` or `is_wow == True` with inline URL button (`"🚀 Apply / View Job"`). Daily morning digest at configured digest time for `score >= 6.0` in HTML chunks ($\le 3,800$ chars).
+6. **Daemon & CLI (`src/scheduler/daemon.py`, `src/cli.py`)**: APScheduler with cron for daily morning digest and recurring interval scraping. Unified Typer CLI (`run`, `scrape`, `evaluate`, `digest`, `test-telegram`, `stats`, `--dry-run`).
 
 ---
 
