@@ -1,0 +1,1 @@
+"""JobSpy Coach daemon package."""

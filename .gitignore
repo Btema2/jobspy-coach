@@ -1,0 +1,103 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.venv
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Private user / candidate data (DO NOT COMMIT)
+.candidate_profile.md
+candidate_profile.md
+*.candidate_profile.md
+config/candidate_profile.*
+config/custom_*
+config/queries.json
+queries.json
+local/
+
+# SQLite / Databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Logs and runtime data
+logs/
+*.log
+*.pid
+
+# Daemon / process artifacts
+daemon.pid
+
+# Superpowers / agent cache
+.superpowers/
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Scratch / temporary artifacts
+scratch/
+tmp/
+
+# Internal agent planning / handoff notes (contain environment-specific detail; keep local)
+docs/superpowers/
+docs/PM_AGENT_HANDOFF.md

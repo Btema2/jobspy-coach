@@ -1,0 +1,16 @@
+[
+  {
+    "query_id": "Q-REM-LEAD",
+    "search_term": "Executive Coach OR Leadership Coach",
+    "location": "Remote",
+    "site_names": ["linkedin", "indeed", "google"],
+    "is_remote": true
+  },
+  {
+    "query_id": "Q-REM-LD",
+    "search_term": "Learning and Development Manager",
+    "location": "Remote",
+    "site_names": ["linkedin", "indeed", "google"],
+    "is_remote": true
+  }
+]
