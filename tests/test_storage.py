@@ -458,3 +458,211 @@ def test_database_delete_empty_description_jobs(tmp_path: Path):
 
 
 
+
+
+def _mk_job(name: str = "x", **kw) -> JobPosting:
+    return JobPosting(
+        dedup_hash=compute_dedup_hash("Co " + name, "Coach " + name, "Remote"),
+        site="indeed",
+        job_url=f"https://example.com/{name}",
+        title="Coach " + name,
+        company="Co " + name,
+        location="Remote",
+        description="A sufficiently descriptive coaching vacancy text.",
+        **kw,
+    )
+
+
+_OLD_SCHEMA = """
+CREATE TABLE jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedup_hash TEXT UNIQUE NOT NULL,
+    site TEXT NOT NULL,
+    external_id TEXT,
+    job_url TEXT NOT NULL,
+    job_url_direct TEXT,
+    title TEXT NOT NULL,
+    company TEXT NOT NULL,
+    location TEXT NOT NULL,
+    job_type TEXT,
+    date_posted TEXT,
+    salary_min REAL,
+    salary_max REAL,
+    salary_currency TEXT,
+    salary_interval TEXT,
+    description TEXT NOT NULL,
+    is_remote INTEGER NOT NULL DEFAULT 0,
+    pre_filtered INTEGER NOT NULL DEFAULT 0,
+    pre_filter_reason TEXT,
+    eval_status TEXT NOT NULL DEFAULT 'unprocessed',
+    eval_score REAL,
+    eval_is_wow INTEGER DEFAULT 0,
+    eval_summary_uk TEXT,
+    eval_reasoning TEXT,
+    eval_languages TEXT,
+    eval_pros TEXT,
+    eval_cons TEXT,
+    eval_error TEXT,
+    evaluated_at TEXT,
+    notification_status TEXT NOT NULL DEFAULT 'pending',
+    instant_sent_at TEXT,
+    digest_sent_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+    updated_at TEXT NOT NULL DEFAULT (DATETIME('now'))
+);
+"""
+
+
+def _columns(db_file: Path) -> set:
+    import sqlite3
+    conn = sqlite3.connect(db_file)
+    try:
+        return {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_old_schema_and_is_idempotent(tmp_path: Path):
+    import sqlite3
+    db_file = tmp_path / "old.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(_OLD_SCHEMA)
+    conn.execute(
+        "INSERT INTO jobs (dedup_hash, site, job_url, title, company, location, description) "
+        "VALUES ('h1', 'indeed', 'u', 't', 'c', 'l', 'd')"
+    )
+    conn.commit()
+    conn.close()
+    assert "eval_model" not in _columns(db_file)
+    assert "eval_attempts" not in _columns(db_file)
+
+    db = Database(db_file)
+    db.init_db()
+    db.init_db()  # idempotent
+
+    cols = _columns(db_file)
+    assert "eval_model" in cols and "eval_attempts" in cols
+    job = db.get_job_by_hash("h1")
+    assert job is not None
+    assert job.title == "t"
+    assert job.eval_model is None
+    assert job.eval_attempts == 0
+
+
+def test_ensure_column_tolerates_concurrent_duplicate(tmp_path: Path):
+    import sqlite3
+    from src.storage.db import _ensure_column
+    db_file = tmp_path / "dup.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(_OLD_SCHEMA)
+
+    class RacyConn:
+        """Reports the column as missing, then loses the race on ALTER."""
+        def execute(self, sql, *a):
+            if sql.startswith("PRAGMA table_info"):
+                return []
+            return conn.execute(sql, *a)
+
+    conn.execute("ALTER TABLE jobs ADD COLUMN eval_model TEXT")
+    _ensure_column(RacyConn(), "jobs", "eval_model", "TEXT")  # must not raise
+    conn.close()
+
+
+def test_update_evaluation_persists_eval_model(tmp_path: Path):
+    db = Database(tmp_path / "m.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("a"))
+    db.update_evaluation(
+        job_id,
+        JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r", eval_model="vendor/model-x"),
+    )
+    assert db.get_job_by_id(job_id).eval_model == "vendor/model-x"
+
+
+def test_update_evaluation_tolerates_non_string_eval_model(tmp_path: Path):
+    from unittest.mock import MagicMock
+    db = Database(tmp_path / "mm.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("b"))
+    result = JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r")
+    result.eval_model = MagicMock()
+    db.update_evaluation(job_id, result, notification_status="pending")
+    assert db.get_job_by_id(job_id).eval_model is None
+
+    job_id2, _ = db.save_job(_mk_job("c"))
+    db.update_evaluation(job_id2, result)
+    assert db.get_job_by_id(job_id2).eval_model is None
+
+
+def test_record_eval_attempt_below_and_at_cap(tmp_path: Path):
+    db = Database(tmp_path / "att.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("d"))
+
+    assert db.record_eval_attempt(job_id, "bad json", max_attempts=3) == 1
+    job = db.get_job_by_id(job_id)
+    assert job.eval_attempts == 1
+    assert job.eval_status == "unprocessed"
+    assert job.eval_error == "bad json"
+    assert [j.id for j in db.get_unprocessed_jobs()] == [job_id]
+
+    assert db.record_eval_attempt(job_id, "bad schema", max_attempts=3) == 2
+    assert db.get_job_by_id(job_id).eval_status == "unprocessed"
+
+    assert db.record_eval_attempt(job_id, "still bad", max_attempts=3) == 3
+    job = db.get_job_by_id(job_id)
+    assert job.eval_attempts == 3
+    assert job.eval_status == "failed"
+    assert job.eval_error == "still bad"
+    assert db.get_unprocessed_jobs() == []
+    assert db.get_stats()["failed_jobs"] == 1
+
+
+def test_record_eval_attempt_unknown_job_returns_zero(tmp_path: Path):
+    db = Database(tmp_path / "unk.db")
+    db.init_db()
+    assert db.record_eval_attempt(999, "x", max_attempts=3) == 0
+
+
+def test_record_eval_attempt_ignores_non_unprocessed_jobs(tmp_path: Path):
+    db = Database(tmp_path / "guard.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("g"))
+    db.update_evaluation(
+        job_id, JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r")
+    )
+
+    assert db.record_eval_attempt(job_id, "late failure", max_attempts=1) == 0
+    job = db.get_job_by_id(job_id)
+    assert job.eval_status == "evaluated"
+    assert job.eval_attempts == 0
+    assert job.eval_error is None
+    assert job.eval_score == 7.0
+
+
+def test_get_stats_custom_pending_threshold(tmp_path: Path):
+    db = Database(tmp_path / "st.db")
+    db.init_db()
+    for name, score in (("lo", 6.2), ("mid", 6.7), ("hi", 8.0)):
+        job_id, _ = db.save_job(_mk_job(name))
+        db.update_evaluation(
+            job_id, JobEvaluationResult(score=score, is_wow=False, summary_uk="s", reasoning="r")
+        )
+    assert db.get_stats()["pending_digest"] == 3  # default 6.0
+    assert db.get_stats(pending_threshold=6.5)["pending_digest"] == 2
+    assert db.get_stats(pending_threshold=9.0)["pending_digest"] == 0
+
+
+def test_job_posting_defaults_for_new_fields():
+    job = _mk_job("e")
+    assert job.eval_model is None
+    assert job.eval_attempts == 0
+
+
+def test_save_job_round_trips_new_fields(tmp_path: Path):
+    db = Database(tmp_path / "rt.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("f", eval_model="vendor/m", eval_attempts=2))
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.eval_model == "vendor/m"
+    assert loaded.eval_attempts == 2

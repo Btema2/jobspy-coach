@@ -38,3 +38,6 @@ include = ["src*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "live: real network calls to LLM providers; skipped unless run with -m live",
+]

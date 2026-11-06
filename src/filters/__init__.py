@@ -3,6 +3,7 @@ from src.filters.pre_filter import (
     MIN_DESCRIPTION_CHARS,
     MIN_DESCRIPTION_WORDS,
     PreFilterResult,
+    classify_title,
     pre_filter_job,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "MIN_DESCRIPTION_CHARS",
     "MIN_DESCRIPTION_WORDS",
     "PreFilterResult",
+    "classify_title",
     "pre_filter_job",
 ]

@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.table import Table
 
 from src.config import get_settings
+from src.evaluator.errors import ConfigurationError
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
@@ -17,12 +18,20 @@ console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
+def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
+    console.print(f"[bold red]Configuration error:[/bold red] {error}")
+    return typer.Exit(code=1)
+
+
 @app.command()
 def run():
     """Start the 24/7 background daemon scheduler."""
     console.print("[bold green]Starting JobSpy Coach Daemon...[/bold green]")
     daemon = DaemonService()
-    daemon.start()
+    try:
+        daemon.start()
+    except ConfigurationError as e:
+        raise _exit_on_missing_provider(e) from None
 
 
 @app.command()
@@ -32,19 +41,29 @@ def scrape(
     """Run a single one-shot scraping cycle."""
     console.print(f"[bold blue]Executing one-shot scrape (dry_run={dry_run})...[/bold blue]")
     daemon = DaemonService()
-    new_jobs, wow_sent = daemon.run_pipeline_cycle(dry_run=dry_run)
+    try:
+        new_jobs, wow_sent = daemon.run_pipeline_cycle(dry_run=dry_run)
+    except ConfigurationError as e:
+        raise _exit_on_missing_provider(e) from None
     console.print(f"[bold green]Done! New jobs: {new_jobs}, Instant WOW alerts: {wow_sent}[/bold green]")
 
 
 @app.command()
 def evaluate(
-    limit: int = typer.Option(50, "--limit", help="Max jobs to evaluate"),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Max jobs to evaluate (default: EVAL_BATCH_LIMIT from settings)"
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Evaluate without saving or notifying"),
 ):
     """Evaluate queued unprocessed vacancies independently from scraping."""
+    if limit is None:
+        limit = get_settings().eval_batch_limit
     console.print(f"[bold blue]Evaluating up to {limit} unprocessed vacancies (dry_run={dry_run})...[/bold blue]")
     daemon = DaemonService()
-    evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run)
+    try:
+        evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run)
+    except ConfigurationError as e:
+        raise _exit_on_missing_provider(e) from None
     console.print(f"[bold green]Evaluation completed. Evaluated: {evaluated}, Instant WOW alerts: {wow_sent}[/bold green]")
 
 
@@ -81,7 +100,7 @@ def stats():
     settings = get_settings()
     db = Database(settings.db_path)
     db.init_db()
-    data = db.get_stats()
+    data = db.get_stats(pending_threshold=settings.digest_score_threshold)
 
     table = Table(title="JobSpy Coach: Repository Statistics")
     table.add_column("Metric", style="cyan", no_wrap=True)

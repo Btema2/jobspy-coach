@@ -50,6 +50,8 @@ class JobPosting:
     eval_cons: List[str] = field(default_factory=list)
     eval_error: Optional[str] = None
     evaluated_at: Optional[datetime] = None
+    eval_model: Optional[str] = None
+    eval_attempts: int = 0
 
     # Notification
     notification_status: str = "pending"  # pending, instant_sent, digest_sent, dismissed, expired_dismissed

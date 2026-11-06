@@ -1,0 +1,142 @@
+[
+  {
+    "id": "trap-it-pm-coaching-side-duty",
+    "category": "hard_reject",
+    "title": "IT Project Manager (Delivery & Team Coaching)",
+    "company": "Northwind Software GmbH",
+    "location": "Berlin, Germany",
+    "is_remote": false,
+    "description": "We are looking for an experienced IT Project Manager to lead the delivery of our cloud platform releases. You will own the project plan, budget and risk register, manage vendor contracts, and report to the steering committee every sprint. As a secondary responsibility you will coach junior developers on estimation and communication. Requirements: 6+ years of IT project delivery, PMP or PRINCE2, strong knowledge of CI/CD pipelines, Jira and software architecture, and hands-on experience managing a P&L for software projects.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "trap-scrum-master",
+    "category": "hard_reject",
+    "title": "Scrum Master / Agile Team Coach",
+    "company": "Brightlane Digital",
+    "location": "Remote, Europe",
+    "is_remote": true,
+    "description": "Brightlane Digital is hiring a Scrum Master to serve three cross-functional software development teams. You will facilitate daily stand-ups, sprint planning, retrospectives and backlog refinement, remove delivery impediments and track velocity metrics. Certified Scrum Master (CSM or PSM) is required, together with experience in Jira, SAFe and DevOps practices. You will work closely with product owners and engineering leads to improve release predictability and reduce cycle time across the platform.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "trap-sales-director",
+    "category": "hard_reject",
+    "title": "Regional Sales Director - Coaching Culture Builder",
+    "company": "Meridian Industrial Supplies",
+    "location": "Madrid, Spain",
+    "is_remote": false,
+    "description": "Meridian Industrial Supplies seeks a Regional Sales Director responsible for a 25 million euro revenue target and full P&L ownership across three countries. You will build the pipeline, negotiate strategic accounts, forecast quarterly results and lead a team of twelve account managers, coaching them on closing techniques and deal strategy. We expect a track record of exceeding quota in B2B sales, strong negotiation skills and willingness to travel up to 50 percent of your time.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "trap-software-engineer",
+    "category": "hard_reject",
+    "title": "Senior Backend Software Engineer",
+    "company": "Lumen Data Systems",
+    "location": "Remote, Europe",
+    "is_remote": true,
+    "description": "Join Lumen Data Systems as a Senior Backend Software Engineer building high-throughput services in Go and Python. You will design APIs, optimise PostgreSQL queries, maintain Kubernetes deployments and mentor less experienced engineers through code review. We expect five or more years of professional programming experience, a solid grasp of distributed systems, and familiarity with cloud infrastructure on AWS. Participation in the on-call rotation is part of the role.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "trap-executive-coach-native-c2",
+    "category": "hard_reject",
+    "title": "Executive Coach for C-Suite Leaders",
+    "company": "Hartmann & Weiss Advisory",
+    "location": "Hamburg, Germany",
+    "is_remote": false,
+    "description": "Our advisory firm is looking for a seasoned Executive Coach to work exclusively with CEOs and board members of listed DAX companies. Assignments are delivered fully in German; native-level or C2 German is strictly required, as are at least fifteen years of senior leadership experience at board level and an established network among top executives. You will conduct confidential strategy and leadership sessions on site at client headquarters.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "trap-engineering-manager",
+    "category": "hard_reject",
+    "title": "Engineering Manager (People Growth & Delivery)",
+    "company": "Cobalt Cloud Labs",
+    "location": "Amsterdam, Netherlands",
+    "is_remote": false,
+    "description": "As Engineering Manager at Cobalt Cloud Labs you will lead two squads of backend and mobile engineers. You are accountable for delivery commitments, technical roadmap, hiring and system reliability, and you will also coach engineers on career growth during regular one-to-ones. A background in software engineering with hands-on coding experience is mandatory, along with experience managing technical budgets and vendor relationships.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "trap-fitness-coach",
+    "category": "hard_reject",
+    "title": "Personal Fitness Coach",
+    "company": "PulseFit Studios",
+    "location": "Lisbon, Portugal",
+    "is_remote": false,
+    "description": "PulseFit Studios is looking for an energetic Personal Fitness Coach to run small-group training sessions and one-to-one gym workouts. You will design strength and conditioning programmes, track client progress, demonstrate correct exercise technique and help members reach their body composition goals. A recognised personal trainer certification and first aid qualification are required. Flexible shifts including early mornings, evenings and weekends.",
+    "expected": {"min": 1.0, "max": 2.0}
+  },
+  {
+    "id": "relevant-career-coach-edtech",
+    "category": "relevant",
+    "title": "Career Coach (1-on-1 Online Coaching)",
+    "company": "Skillbridge Academy",
+    "location": "Remote, Europe",
+    "is_remote": true,
+    "description": "Skillbridge Academy is an online education company helping adult learners move into new careers. As a Career Coach you will run weekly one-on-one video sessions with students, help them clarify goals, build resumes and prepare for interviews using a non-directive, client-centred coaching approach. You will track progress, hold learners accountable and celebrate milestones. Requirements: a recognised coaching qualification or psychology background, strong listening skills and professional English. Flexible part-time hours are available.",
+    "expected": {"min": 6.0, "max": 10.0}
+  },
+  {
+    "id": "relevant-associate-coach-platform",
+    "category": "relevant",
+    "title": "Associate Wellbeing Coach (Freelance)",
+    "company": "MindPath Coaching Platform",
+    "location": "Remote, Global",
+    "is_remote": true,
+    "description": "MindPath is a digital coaching platform serving employees of large organisations. We are expanding our network of associate coaches who deliver confidential one-to-one wellbeing and personal development sessions by video. You will support clients with stress management, work-life balance and career transitions following professional coaching standards and ethics. Applicants should hold a recognised coaching credential, have logged coaching hours, and be fluent in English. You choose your own availability.",
+    "expected": {"min": 6.0, "max": 10.0}
+  },
+  {
+    "id": "relevant-corporate-ld-specialist",
+    "category": "relevant",
+    "title": "Learning and Development Specialist",
+    "company": "Aurora Financial Services",
+    "location": "Dublin, Ireland",
+    "is_remote": false,
+    "description": "Aurora Financial Services is looking for a Learning and Development Specialist to design and deliver internal training programmes for around 800 employees. You will assess training needs with line managers, run workshops on communication and soft skills, coordinate external trainers, maintain the learning management system and measure programme impact. Experience in corporate training or HR development is required, a background in psychology or coaching is an advantage. Hybrid working, three days in the office.",
+    "expected": {"min": 6.0, "max": 10.0}
+  },
+  {
+    "id": "relevant-career-advisor-university",
+    "category": "relevant",
+    "title": "Career Advisor - Student Services",
+    "company": "Riverside University",
+    "location": "Manchester, United Kingdom",
+    "is_remote": false,
+    "description": "The Careers Service at Riverside University is recruiting a Career Advisor to support students and recent graduates. You will deliver individual guidance appointments, run CV and interview workshops, help students explore career options and connect them with employers. We are looking for someone with excellent interpersonal skills, knowledge of the labour market and a qualification in career guidance, counselling or coaching. Experience of working with diverse and international student groups is welcome.",
+    "expected": {"min": 6.0, "max": 10.0}
+  },
+  {
+    "id": "relevant-corporate-psychologist",
+    "category": "relevant",
+    "title": "Corporate Psychologist / Employee Wellbeing Specialist",
+    "company": "Vertex Logistics Group",
+    "location": "Prague, Czechia",
+    "is_remote": false,
+    "description": "Vertex Logistics Group is hiring a Corporate Psychologist to strengthen employee wellbeing across our European offices. You will provide confidential one-to-one psychological support and short coaching conversations to staff, run workshops on stress resilience and communication, advise managers on team climate and support return-to-work plans after long absences. A university degree in psychology is required; coaching or counselling training is a strong plus. Hybrid arrangement with occasional remote days.",
+    "expected": {"min": 6.0, "max": 10.0}
+  },
+  {
+    "id": "relevant-talent-development-specialist",
+    "category": "relevant",
+    "title": "Talent Development Specialist",
+    "company": "Helix Consumer Brands",
+    "location": "Remote, Europe",
+    "is_remote": true,
+    "description": "Helix Consumer Brands is building a talent development team and needs a Talent Development Specialist to support employee growth. You will run career conversations, coordinate mentoring and internal coaching programmes, help managers create individual development plans, organise training calendars and report on participation and satisfaction. We value empathy, facilitation skills and a solid understanding of adult learning. Experience in HR, coaching or psychology is welcome. Fully remote within Europe.",
+    "expected": {"min": 6.0, "max": 10.0}
+  },
+  {
+    "id": "relevant-internal-coach-people-team",
+    "category": "relevant",
+    "title": "Internal Coach (People & Culture)",
+    "company": "Tandem Health Network",
+    "location": "Brussels, Belgium",
+    "is_remote": false,
+    "description": "Tandem Health Network is creating an internal coaching service for its staff and is looking for an Internal Coach in the People and Culture team. You will hold confidential one-to-one coaching sessions with employees on career development, resilience and work-life balance, maintain coaching records, and organise short group sessions on personal effectiveness. A recognised coaching qualification and the ability to work in English are required. Hybrid working with two office days per week.",
+    "expected": {"min": 6.0, "max": 10.0}
+  }
+]

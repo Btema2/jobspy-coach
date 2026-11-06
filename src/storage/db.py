@@ -42,6 +42,18 @@ def _parse_dt(val: Any) -> Optional[datetime]:
         return None
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
+    """Idempotently add a column; tolerant of a concurrent init_db winning the race."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if name in existing:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 class Database:
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
@@ -96,6 +108,8 @@ class Database:
                 eval_cons TEXT,
                 eval_error TEXT,
                 evaluated_at TEXT,
+                eval_model TEXT,
+                eval_attempts INTEGER NOT NULL DEFAULT 0,
 
                 notification_status TEXT NOT NULL DEFAULT 'pending',
                 instant_sent_at TEXT,
@@ -105,6 +119,8 @@ class Database:
                 updated_at TEXT NOT NULL DEFAULT (DATETIME('now'))
             );
             """)
+            _ensure_column(conn, "jobs", "eval_model", "TEXT")
+            _ensure_column(conn, "jobs", "eval_attempts", "INTEGER NOT NULL DEFAULT 0")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedup_hash ON jobs(dedup_hash);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_eval_status ON jobs(eval_status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_notif_status ON jobs(notification_status);")
@@ -142,9 +158,9 @@ class Database:
                 description, is_remote, pre_filtered, pre_filter_reason,
                 eval_status, eval_score, eval_is_wow, eval_summary_uk,
                 eval_reasoning, eval_languages, eval_pros, eval_cons,
-                eval_error, evaluated_at,
+                eval_error, evaluated_at, eval_model, eval_attempts,
                 notification_status, instant_sent_at, digest_sent_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.dedup_hash, job.site, job.external_id, job.job_url, job.job_url_direct,
                 job.title, job.company, job.location, job.job_type, job.date_posted,
@@ -157,6 +173,8 @@ class Database:
                 json.dumps(job.eval_cons, ensure_ascii=False) if job.eval_cons else None,
                 job.eval_error,
                 job.evaluated_at.isoformat() if job.evaluated_at else None,
+                job.eval_model if isinstance(job.eval_model, str) else None,
+                int(job.eval_attempts or 0),
                 job.notification_status,
                 job.instant_sent_at.isoformat() if job.instant_sent_at else None,
                 job.digest_sent_at.isoformat() if job.digest_sent_at else None,
@@ -200,6 +218,7 @@ class Database:
         notification_status: Optional[str] = None,
     ) -> None:
         now_str = datetime.now(timezone.utc).isoformat()
+        eval_model = eval_result.eval_model if isinstance(eval_result.eval_model, str) else None
         with self._get_connection() as conn:
             if notification_status is not None:
                 conn.execute("""
@@ -212,6 +231,7 @@ class Database:
                     eval_languages = ?,
                     eval_pros = ?,
                     eval_cons = ?,
+                    eval_model = ?,
                     notification_status = ?,
                     evaluated_at = ?,
                     updated_at = ?
@@ -221,6 +241,7 @@ class Database:
                     json.dumps(eval_result.language_requirements, ensure_ascii=False),
                     json.dumps(eval_result.pros, ensure_ascii=False),
                     json.dumps(eval_result.cons, ensure_ascii=False),
+                    eval_model,
                     notification_status,
                     now_str, now_str, job_id
                 ))
@@ -235,6 +256,7 @@ class Database:
                     eval_languages = ?,
                     eval_pros = ?,
                     eval_cons = ?,
+                    eval_model = ?,
                     evaluated_at = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -243,6 +265,7 @@ class Database:
                     json.dumps(eval_result.language_requirements, ensure_ascii=False),
                     json.dumps(eval_result.pros, ensure_ascii=False),
                     json.dumps(eval_result.cons, ensure_ascii=False),
+                    eval_model,
                     now_str, now_str, job_id
                 ))
             conn.commit()
@@ -269,6 +292,31 @@ class Database:
             WHERE id = ?
             """, (error_message, now_str, job_id))
             conn.commit()
+
+    def record_eval_attempt(self, job_id: int, error: str, max_attempts: int) -> int:
+        """Record a job-specific failed evaluation attempt.
+
+        Increments ``eval_attempts`` and stores the last error. The job stays
+        ``unprocessed`` (retried next cycle) until attempts reach ``max_attempts``,
+        at which point it becomes ``failed``. Only ``unprocessed`` jobs are touched
+        (an already evaluated/failed job is left unchanged). Returns the job's
+        attempt count (0 if the job does not exist).
+        """
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET
+                    eval_attempts = eval_attempts + 1,
+                    eval_error = ?,
+                    eval_status = CASE WHEN eval_attempts + 1 >= ? THEN 'failed' ELSE eval_status END,
+                    updated_at = ?
+                WHERE id = ? AND eval_status = 'unprocessed'
+                """,
+                (error, max_attempts, now_str, job_id),
+            )
+            row = conn.execute("SELECT eval_attempts FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return int(row["eval_attempts"]) if row else 0
 
     def get_pending_digest_jobs(self, min_score: float = 6.0, limit: int = 10) -> List[JobPosting]:
         with self._get_connection() as conn:
@@ -360,7 +408,7 @@ class Database:
             conn.commit()
             return cursor.rowcount
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self, pending_threshold: float = 6.0) -> Dict[str, int]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             total = cursor.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
@@ -369,7 +417,7 @@ class Database:
             failed = cursor.execute("SELECT COUNT(*) FROM jobs WHERE eval_status = 'failed'").fetchone()[0]
             instant = cursor.execute("SELECT COUNT(*) FROM jobs WHERE notification_status = 'instant_sent'").fetchone()[0]
             digest = cursor.execute("SELECT COUNT(*) FROM jobs WHERE notification_status = 'digest_sent'").fetchone()[0]
-            pending_digest = cursor.execute("SELECT COUNT(*) FROM jobs WHERE eval_status = 'evaluated' AND notification_status = 'pending' AND eval_score >= 6.0").fetchone()[0]
+            pending_digest = cursor.execute("SELECT COUNT(*) FROM jobs WHERE eval_status = 'evaluated' AND notification_status = 'pending' AND eval_score >= ?", (pending_threshold,)).fetchone()[0]
             return {
                 "total_jobs": total,
                 "prefiltered_jobs": prefiltered,
@@ -411,6 +459,8 @@ class Database:
             eval_cons=json.loads(row["eval_cons"]) if row["eval_cons"] else [],
             eval_error=row["eval_error"],
             evaluated_at=_parse_dt(row["evaluated_at"]),
+            eval_model=row["eval_model"],
+            eval_attempts=row["eval_attempts"] or 0,
             notification_status=row["notification_status"],
             instant_sent_at=_parse_dt(row["instant_sent_at"]),
             digest_sent_at=_parse_dt(row["digest_sent_at"]),

@@ -82,10 +82,10 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             is_remote=True,
         ),
         JobPosting(
-            dedup_hash=compute_dedup_hash("Fast Track", "Agile Coach", "Krakow"),
+            dedup_hash=compute_dedup_hash("Fast Track", "Team Coach", "Krakow"),
             site="glassdoor",
             job_url="https://glassdoor.com/stub",
-            title="Agile Coach",
+            title="Team Coach",
             company="Fast Track",
             location="Krakow",
             description="Short stub description.",  # Under 150 chars / under 30 words
@@ -182,7 +182,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     db = Database(db_file)
     stats = db.get_stats()
     assert stats["total_jobs"] == 5
-    assert stats["prefiltered_jobs"] == 2  # Swimming Coach (sports) + Agile Coach (short stub)
+    assert stats["prefiltered_jobs"] == 2  # Swimming Coach (sports) + Team Coach (short stub description)
     assert stats["evaluated_jobs"] == 3    # Recruiter, Career, Executive
     assert stats["instant_sent"] == 1      # Executive WOW role
     assert stats["pending_digest"] == 1    # Career Coach (score 7.5 >= 6.0)
@@ -194,7 +194,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     assert "EXCLUDED_TITLE_REGEX" in swimming_job.pre_filter_reason
     assert swimming_job.notification_status == "dismissed"
 
-    stub_job = db.get_job_by_hash(compute_dedup_hash("Fast Track", "Agile Coach", "Krakow"))
+    stub_job = db.get_job_by_hash(compute_dedup_hash("Fast Track", "Team Coach", "Krakow"))
     assert stub_job is not None
     assert stub_job.pre_filtered is True
     assert "DESCRIPTION_TOO_SHORT" in stub_job.pre_filter_reason

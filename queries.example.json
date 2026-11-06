@@ -1,7 +1,7 @@
 [
   {
-    "query_id": "Q-REM-LEAD",
-    "search_term": "Executive Coach OR Leadership Coach",
+    "query_id": "Q-REM-COACH",
+    "search_term": "Career Coach OR Wellbeing Coach",
     "location": "Remote",
     "site_names": ["linkedin", "indeed", "google"],
     "is_remote": true
