@@ -201,7 +201,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 | `TELEGRAM_CHAT_ID` | *(required)* | Telegram Chat ID or Channel ID receiving notifications. |
 | `SCRAPE_INTERVAL_HOURS` | `6` | Hours between automatic background scrape pipeline cycles. With many LinkedIn queries a pass can take 15-30 minutes (12 s cooldown), so `12` is a reasonable choice for large query sets. |
 | `DIGEST_TIME_CET` | `09:00` | Daily 24-hour time (`HH:MM`) when the morning digest is dispatched. |
-| `HOURS_OLD_WINDOW` | `48` | Maximum posting age (in hours) to fetch from job boards. |
+| `HOURS_OLD_WINDOW` | `48` | Maximum posting age (in hours) to fetch from job boards. Indeed always uses at least 168 h, because narrower windows starve niche queries. |
 | `SCRAPER_JITTER_MIN_SECONDS` | `4.0` | Minimum delay in seconds between scraping individual job boards. |
 | `SCRAPER_JITTER_MAX_SECONDS` | `9.0` | Maximum delay in seconds between scraping individual job boards. |
 | `SCRAPER_RESULTS_PER_QUERY` | `10` | Target number of raw postings requested per query from each board (keep below 25 for LinkedIn). |
