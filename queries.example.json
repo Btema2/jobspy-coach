@@ -1,16 +1,26 @@
 [
   {
-    "query_id": "Q-REM-LEAD",
-    "search_term": "Executive Coach OR Leadership Coach",
+    "query_id": "Q-REM-COACH",
+    "search_term": "Career Coach OR Wellbeing Coach",
     "location": "Remote",
+    "country_code": "usa",
     "site_names": ["linkedin", "indeed", "google"],
-    "is_remote": true
+    "is_remote": true,
+    "google_search_term": "career coach OR wellbeing coach jobs remote in the last 3 days"
   },
   {
     "query_id": "Q-REM-LD",
     "search_term": "Learning and Development Manager",
     "location": "Remote",
+    "country_code": "usa",
     "site_names": ["linkedin", "indeed", "google"],
+    "is_remote": true
+  },
+  {
+    "query_id": "Q-REGION-LD",
+    "search_term": "Learning and Development Manager",
+    "location": "Europe",
+    "site_names": ["linkedin", "google"],
     "is_remote": true
   }
 ]

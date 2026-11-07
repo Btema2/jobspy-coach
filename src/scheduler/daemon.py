@@ -1,11 +1,16 @@
 import logging
+import math
 import random
 import signal
 import sys
+import threading
 import time
+from collections import Counter
+from dataclasses import dataclass
+from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -14,7 +19,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from src.config import get_settings
-from src.evaluator.llm_evaluator import OpenRouterEvaluator
+from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
+from src.evaluator.errors import ConfigurationError, EvaluationRejected, ProvidersUnavailable, StopRequested
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.notifier.templates import format_version_update_notice
 from src.scraper.jobspy_scraper import JobSpyScraper
@@ -26,12 +32,44 @@ from src.storage.models import JobPosting
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class LatencyStats:
+    mean: float
+    p95: float
+    max: float
+
+
+def latency_stats(latencies: List[float]) -> LatencyStats:
+    """Mean, nearest-rank p95 and max of per-job latencies in seconds (zeros when empty)."""
+    if not latencies:
+        return LatencyStats(0.0, 0.0, 0.0)
+    ordered = sorted(latencies)
+    rank = max(1, math.ceil(0.95 * len(ordered)))
+    return LatencyStats(sum(ordered) / len(ordered), ordered[rank - 1], ordered[-1])
+
+
+def _iter_completed(futures: Dict[Future, Any], poll_seconds: float = 0.2) -> Iterator[Future]:
+    """Yield futures as they finish, including ones cancelled by ``shutdown(cancel_futures=True)``.
+
+    ``concurrent.futures.as_completed`` never reports a future that was cancelled while still
+    pending (the executor's shutdown does not notify its waiters), so it would block forever
+    after a batch abort or a shutdown signal. Cancelled futures are therefore polled for.
+    """
+    pending = set(futures)
+    while pending:
+        done, pending = wait(pending, timeout=poll_seconds, return_when=FIRST_COMPLETED)
+        yield from done
+        cancelled = {f for f in pending if f.cancelled()}
+        pending -= cancelled
+        yield from cancelled
+
+
 class DaemonService:
     def __init__(
         self,
         db_path: Optional[Path] = None,
         scraper: Optional[JobSpyScraper] = None,
-        evaluator: Optional[OpenRouterEvaluator] = None,
+        evaluator: Optional[ProviderChainEvaluator] = None,
         notifier: Optional[TelegramNotifier] = None,
     ):
         settings = get_settings()
@@ -47,42 +85,199 @@ class DaemonService:
             enabled_boards=settings.scraper_enabled_boards,
             proxies=settings.scraper_proxies,
         )
-        self.evaluator = evaluator or OpenRouterEvaluator(
-            api_key=settings.openrouter_api_key,
-            model=settings.openrouter_model,
-            base_url=settings.openrouter_base_url,
-            rpm_limit=settings.openrouter_rpm_limit,
-            timeout=settings.openrouter_timeout_seconds,
-        )
+        # The provider chain is built lazily (first evaluation): constructing the daemon must
+        # never require API keys. ``_stop_event`` is shared with the chain once it is built.
+        self.evaluator: Optional[ProviderChainEvaluator] = evaluator
+        self._stop_event = threading.Event()
+        self._shutdown_requested = threading.Event()
+        self._chain_lock = threading.Lock()
+        # Futures of the batch in flight (snapshot-cancelled by request_shutdown).
+        self._futures: List[Future] = []
         self.notifier = notifier or TelegramNotifier(
             token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
         )
         self.scheduler: Optional[BlockingScheduler] = None
 
-    def evaluate_unprocessed(self, limit: int = 50, dry_run: bool = False) -> Tuple[int, int]:
-        unprocessed = self.db.get_unprocessed_jobs(limit=limit)
-        logger.info(f"Evaluating {len(unprocessed)} unprocessed postings with LLM...")
+    # ----- evaluation engine -----
+
+    def _get_evaluator(self) -> Any:
+        """Return the provider chain, building it on first use (raises ConfigurationError)."""
+        with self._chain_lock:
+            if self.evaluator is None:
+                self.evaluator = build_chain_from_settings(self.settings, stop_event=self._stop_event)
+            return self.evaluator
+
+    def _stop_chain(self) -> None:
+        stop = getattr(self.evaluator, "stop", None)
+        if callable(stop):
+            stop()
+
+    def request_shutdown(self) -> None:
+        """Signal-handler hook: wake blocked workers and drop queued evaluations.
+
+        Safe to call at any time (before the chain/batch exist, or repeatedly). It never
+        calls ``executor.shutdown()``: that takes the executor's internal lock, which the
+        interrupted main thread may already hold (self-deadlock). Queued futures are
+        cancelled instead; the batch's own caller thread shuts the executor down. Workers
+        mid-HTTP finish or time out on their own; nothing joins them.
+        """
+        self._shutdown_requested.set()
+        self._stop_event.set()
+        self._stop_chain()
+        for future in list(self._futures):
+            future.cancel()
+
+    def _rearm_stop_event(self, chain: Any) -> bool:
+        """Undo a previous batch abort so a new batch can run.
+
+        Returns False (leaving the stop events set) if a shutdown was requested, including
+        one that landed between the caller's earlier check and the clear below.
+        """
+        self._stop_event.clear()
+        event = getattr(chain, "stop_event", None)
+        if isinstance(event, threading.Event):
+            event.clear()
+        if self._shutdown_requested.is_set():
+            self._stop_event.set()
+            if isinstance(event, threading.Event):
+                event.set()
+            return False
+        return True
+
+    @staticmethod
+    def _provider_for_model(chain: Any, model: Optional[str]) -> str:
+        for provider in getattr(chain, "providers", None) or []:
+            models = [getattr(provider, "model", None), *(getattr(provider, "models", None) or [])]
+            if model and model in models:
+                return str(getattr(provider, "name", "unknown"))
+        return "unknown"
+
+    def evaluate_unprocessed(self, limit: Optional[int] = None, dry_run: bool = False) -> Tuple[int, int]:
+        """Evaluate queued jobs concurrently; return ``(evaluated_count, wow_sent)``.
+
+        Invariant: the thread that calls this method is the only one that touches the
+        database or Telegram. Worker threads only run ``chain.evaluate_job`` (LLM calls).
+
+        Database or Telegram errors raised while handling a result abort the whole batch
+        (the exception propagates); jobs not yet handled stay ``unprocessed`` and are
+        retried next cycle.
+        """
+        if self._shutdown_requested.is_set():
+            return 0, 0
+        if limit is None:
+            limit = self.settings.eval_batch_limit
+        jobs = [j for j in self.db.get_unprocessed_jobs(limit=limit) if j.id is not None]
+        if not jobs:
+            return 0, 0
+
+        chain = self._get_evaluator()
+        if not self._rearm_stop_event(chain) or self._shutdown_requested.is_set():
+            return 0, 0
+        total = len(jobs)
+        settings = self.settings
+        logger.info(
+            "Evaluating %d unprocessed postings with %d workers...", total, settings.eval_max_workers
+        )
 
         evaluated_count = 0
         wow_sent = 0
+        failures = 0
+        done = 0
+        per_provider: Counter = Counter()
+        batch_stopped = False
+        t0 = time.monotonic()
 
-        for job in unprocessed:
-            if job.id is None:
-                continue
+        stats_lock = threading.Lock()
+        call_latencies: List[float] = []
+        in_flight = 0
+        in_flight_peak = 0
+
+        def timed_eval(job: JobPosting) -> Tuple[Any, float]:
+            nonlocal in_flight, in_flight_peak
+            started = time.monotonic()
+            with stats_lock:
+                in_flight += 1
+                in_flight_peak = max(in_flight_peak, in_flight)
             try:
-                eval_res = self.evaluator.evaluate_job(job)
-                if dry_run:
-                    logger.info(
-                        f"[DRY-RUN] Evaluated job {job.id} ({job.title}): Score={eval_res.score}, WOW={eval_res.is_wow}"
+                return chain.evaluate_job(job), time.monotonic() - started
+            finally:
+                with stats_lock:
+                    in_flight -= 1
+                    call_latencies.append(time.monotonic() - started)
+
+        # No ``with``: its __exit__ would shutdown(wait=True) and block shutdown for minutes.
+        executor = ThreadPoolExecutor(max_workers=max(1, settings.eval_max_workers), thread_name_prefix="eval")
+        futures: Dict[Future, JobPosting] = {}
+        self._futures = []
+        try:
+            for job in jobs:
+                if self._shutdown_requested.is_set():
+                    break
+                future = executor.submit(timed_eval, job)
+                futures[future] = job
+                self._futures.append(future)
+            if self._shutdown_requested.is_set():  # a signal landed while submitting
+                for future in futures:
+                    future.cancel()
+            for future in _iter_completed(futures):
+                job = futures[future]
+                try:
+                    eval_res, latency = future.result()
+                except (CancelledError, StopRequested):
+                    continue
+                except ProvidersUnavailable as e:
+                    # Provider-wide outage: job stays unprocessed with attempts unchanged.
+                    if not batch_stopped:
+                        batch_stopped = True
+                        logger.error(
+                            "All evaluation providers unavailable (%s); stopping this batch. "
+                            "Remaining jobs stay 'unprocessed' for the next cycle.",
+                            e,
+                        )
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        self._stop_chain()
+                    continue
+                except EvaluationRejected as e:
+                    failures += 1
+                    done += 1
+                    logger.warning(
+                        "[%d/%d] job %s ('%s') rejected by every provider: %s", done, total, job.id, job.title, e
                     )
+                    if not dry_run:
+                        self.db.record_eval_attempt(job.id, str(e), settings.eval_max_attempts)
+                    continue
+                except Exception as e:  # keep the pre-existing exception -> outcome mapping
+                    failures += 1
+                    done += 1
+                    self._handle_legacy_failure(job, e, dry_run)
+                    continue
+
+                done += 1
+                model = eval_res.eval_model if isinstance(eval_res.eval_model, str) else None
+                provider_name = self._provider_for_model(chain, model)
+                per_provider[provider_name] += 1
+                logger.info(
+                    "[%d/%d] %s %s %.1fs %s -> %.1f",
+                    done, total, provider_name, model or "unknown-model", latency, job.title, eval_res.score,
+                )
+
+                # The alert decision lives here, from settings, once.
+                # WOW additionally requires a direct-coaching role, so a lowered WOW_SCORE_THRESHOLD can never
+                # promote capped (<= 8.4) non-coaching roles into instant alerts.
+                eval_res.is_wow = bool(
+                    eval_res.score >= settings.wow_score_threshold
+                    and not eval_res.hard_reject
+                    and eval_res.role_is_direct_coaching
+                )
+                if dry_run:
                     evaluated_count += 1
-                    if eval_res.score >= self.settings.wow_score_threshold or eval_res.is_wow:
+                    if eval_res.is_wow:
                         wow_sent += 1
                     continue
 
                 notification_status = None
-                if eval_res.score < self.settings.digest_score_threshold and not eval_res.is_wow:
+                if eval_res.score < settings.digest_score_threshold and not eval_res.is_wow:
                     notification_status = "dismissed"
 
                 self.db.update_evaluation(
@@ -92,7 +287,7 @@ class DaemonService:
                 if notification_status:
                     job.notification_status = notification_status
 
-                if eval_res.score >= self.settings.wow_score_threshold or eval_res.is_wow:
+                if eval_res.is_wow:
                     job.eval_score = eval_res.score
                     job.eval_is_wow = eval_res.is_wow
                     job.eval_summary_uk = eval_res.summary_uk
@@ -104,34 +299,60 @@ class DaemonService:
                     if sent:
                         self.db.mark_instant_sent(job.id)
                         wow_sent += 1
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                # Transient network/timeout errors leave status unprocessed to retry on next cycle
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._futures = []
+
+        wall = time.monotonic() - t0
+        rpm = (done / wall * 60.0) if wall > 0 else 0.0
+        provider_counts = ", ".join(f"{k}={v}" for k, v in sorted(per_provider.items())) or "none"
+        with stats_lock:
+            lat = latency_stats(list(call_latencies))
+            peak = in_flight_peak
+        logger.info(
+            "Evaluation batch finished: processed=%d/%d evaluated=%d wow=%d failures=%d providers[%s] "
+            "wall=%.1fs effective=%.1f rpm latency[mean=%.1fs p95=%.1fs max=%.1fs] inflight_peak=%d%s",
+            done, total, evaluated_count, wow_sent, failures, provider_counts, wall, rpm,
+            lat.mean, lat.p95, lat.max, peak,
+            " (batch aborted: providers unavailable)" if batch_stopped else "",
+        )
+        return evaluated_count, wow_sent
+
+    def _handle_legacy_failure(self, job: JobPosting, e: Exception, dry_run: bool) -> None:
+        """Pre-existing mapping: transient errors leave the job unprocessed, others fail it."""
+        if isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
+            logger.warning(
+                f"Transient network/timeout error evaluating job {job.id} ('{job.title}'): {e}. "
+                "Leaving in 'unprocessed' status for subsequent cycle retry."
+            )
+        elif isinstance(e, httpx.HTTPStatusError):
+            if e.response.status_code in (429, 500, 502, 503, 504):
                 logger.warning(
-                    f"Transient network/timeout error evaluating job {job.id} ('{job.title}'): {e}. "
+                    f"Transient HTTP {e.response.status_code} evaluating job {job.id} ('{job.title}'): {e}. "
                     "Leaving in 'unprocessed' status for subsequent cycle retry."
                 )
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (429, 500, 502, 503, 504):
-                    logger.warning(
-                        f"Transient HTTP {e.response.status_code} evaluating job {job.id} ('{job.title}'): {e}. "
-                        "Leaving in 'unprocessed' status for subsequent cycle retry."
-                    )
-                else:
-                    logger.error(f"Non-recoverable HTTP {e.response.status_code} evaluating job {job.id}: {e}")
-                    if not dry_run:
-                        self.db.update_eval_failure(job.id, str(e))
-            except Exception as e:
-                if any(k in str(e).lower() for k in ["503", "502", "504", "429", "timeout", "connection", "network"]):
-                    logger.warning(
-                        f"Transient error evaluating job {job.id} ('{job.title}'): {e}. "
-                        "Leaving in 'unprocessed' status for subsequent cycle retry."
-                    )
-                else:
-                    logger.error(f"Permanent evaluation failure for job {job.id}: {e}")
-                    if not dry_run:
-                        self.db.update_eval_failure(job.id, str(e))
+            else:
+                logger.error(f"Non-recoverable HTTP {e.response.status_code} evaluating job {job.id}: {e}")
+                if not dry_run:
+                    self.db.update_eval_failure(job.id, str(e))
+        elif any(k in str(e).lower() for k in ["503", "502", "504", "429", "timeout", "connection", "network"]):
+            logger.warning(
+                f"Transient error evaluating job {job.id} ('{job.title}'): {e}. "
+                "Leaving in 'unprocessed' status for subsequent cycle retry."
+            )
+        else:
+            logger.error(f"Permanent evaluation failure for job {job.id}: {e}")
+            if not dry_run:
+                self.db.update_eval_failure(job.id, str(e))
 
-        return evaluated_count, wow_sent
+    def _begin_scrape_progress(self, queries: List[SearchQuery]) -> List[Tuple[SearchQuery, str]]:
+        """Starts the scraper's progress tracking and returns the (query, board) calls to make."""
+        begin = getattr(self.scraper, "begin_cycle", None)
+        plan = begin(queries) if callable(begin) else None
+        if isinstance(plan, list):
+            return plan
+        # Scraper without a call plan (e.g. a test double): run every configured board.
+        return [(q, site) for q in queries for site in q.site_names]
 
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
@@ -140,10 +361,14 @@ class DaemonService:
         logger.info("Starting pipeline scrape cycle across queries...")
         total_new_saved = 0
 
-        for q_idx, q in enumerate(active_queries):
-            for s_idx, site in enumerate(q.site_names):
+        # The scraper owns the progress lines ([i/N] before/after every call, per-board summary);
+        # the call plan holds only the calls that will really be requested (enabled boards, country set).
+        plan = self._begin_scrape_progress(active_queries)
+
+        try:
+            for idx, (q, site) in enumerate(plan, start=1):
                 jitter_max = getattr(self.scraper, "jitter_max", 0.0)
-                if (q_idx > 0 or s_idx > 0) and isinstance(jitter_max, (int, float)) and jitter_max > 0:
+                if idx > 1 and isinstance(jitter_max, (int, float)) and jitter_max > 0:
                     jitter_min = getattr(self.scraper, "jitter_min", 0.0)
                     min_val = jitter_min if isinstance(jitter_min, (int, float)) else 0.0
                     time.sleep(random.uniform(min_val, jitter_max))
@@ -167,6 +392,10 @@ class DaemonService:
                             total_new_saved += 1
 
                     if not dry_run:
+                        logger.info(
+                            "[%d/%d] %s %s saved %d new (%d already known)",
+                            idx, len(plan), q.query_id, site, board_new_saved, len(board_postings) - board_new_saved,
+                        )
                         self.db.record_scrape_run(
                             board=site,
                             query=q.search_term,
@@ -188,12 +417,16 @@ class DaemonService:
                             status="failed",
                             error_message=str(e),
                         )
+        finally:
+            end_cycle = getattr(self.scraper, "end_cycle", None)
+            if callable(end_cycle):
+                end_cycle()
 
         if dry_run:
             return 0, 0
 
         # Process evaluations
-        _, wow_sent = self.evaluate_unprocessed(limit=50, dry_run=False)
+        _, wow_sent = self.evaluate_unprocessed(limit=self.settings.eval_batch_limit, dry_run=False)
         logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {wow_sent}")
         return total_new_saved, wow_sent
 
@@ -251,6 +484,7 @@ class DaemonService:
 
         def shutdown(signum, frame):
             logger.info("Received termination signal. Shutting down daemon gracefully...")
+            self.request_shutdown()
             if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown(wait=False)
             sys.exit(0)
@@ -269,8 +503,21 @@ class DaemonService:
         except Exception as e:
             logger.debug("Failed startup JobSpy version check: %s", e)
 
+        if self.evaluator is None and not (self.settings.nim_enabled or self.settings.openrouter_enabled):
+            logger.warning(
+                "No LLM provider is configured (set NVIDIA_API_KEY and/or OPENROUTER_API_KEY with "
+                "OPENROUTER_MODELS): scraping will run but evaluation will fail until one is set."
+            )
+
         logger.info("Running initial startup scraping cycle...")
-        self.run_pipeline_cycle()
+        try:
+            self.run_pipeline_cycle()
+        except ConfigurationError as exc:
+            logger.error(
+                "Startup cycle could not evaluate jobs: %s. Scraping continues on schedule; "
+                "queued jobs stay unprocessed until an LLM provider is configured.",
+                exc,
+            )
 
         logger.info(
             f"Daemon started. Scrape every {self.settings.scrape_interval_hours}h, "

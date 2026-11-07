@@ -82,10 +82,10 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             is_remote=True,
         ),
         JobPosting(
-            dedup_hash=compute_dedup_hash("Fast Track", "Agile Coach", "Krakow"),
+            dedup_hash=compute_dedup_hash("Fast Track", "Team Coach", "Krakow"),
             site="glassdoor",
             job_url="https://glassdoor.com/stub",
-            title="Agile Coach",
+            title="Team Coach",
             company="Fast Track",
             location="Krakow",
             description="Short stub description.",  # Under 150 chars / under 30 words
@@ -135,6 +135,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             return JobEvaluationResult(
                 score=9.6,
                 is_wow=True,
+                role_is_direct_coaching=True,
                 summary_uk="Топ-вакансія executive коуча для роботи з керівниками банку.",
                 reasoning="Dream role with international exposure and professional growth opportunity",
                 language_requirements=["English"],
@@ -182,7 +183,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     db = Database(db_file)
     stats = db.get_stats()
     assert stats["total_jobs"] == 5
-    assert stats["prefiltered_jobs"] == 2  # Swimming Coach (sports) + Agile Coach (short stub)
+    assert stats["prefiltered_jobs"] == 2  # Swimming Coach (sports) + Team Coach (short stub description)
     assert stats["evaluated_jobs"] == 3    # Recruiter, Career, Executive
     assert stats["instant_sent"] == 1      # Executive WOW role
     assert stats["pending_digest"] == 1    # Career Coach (score 7.5 >= 6.0)
@@ -194,7 +195,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
     assert "EXCLUDED_TITLE_REGEX" in swimming_job.pre_filter_reason
     assert swimming_job.notification_status == "dismissed"
 
-    stub_job = db.get_job_by_hash(compute_dedup_hash("Fast Track", "Agile Coach", "Krakow"))
+    stub_job = db.get_job_by_hash(compute_dedup_hash("Fast Track", "Team Coach", "Krakow"))
     assert stub_job is not None
     assert stub_job.pre_filtered is True
     assert "DESCRIPTION_TOO_SHORT" in stub_job.pre_filter_reason
@@ -287,6 +288,7 @@ def test_e2e_dry_run_pipeline_cycle(tmp_path):
     mock_evaluator.evaluate_job.return_value = JobEvaluationResult(
         score=9.5,
         is_wow=True,
+        role_is_direct_coaching=True,
         summary_uk="Тестова dry-run вакансія.",
         reasoning="Dry-run fit",
         language_requirements=["English"],
@@ -356,6 +358,7 @@ def test_e2e_evaluator_retry_and_recovery(tmp_path):
         JobEvaluationResult(
             score=9.2,
             is_wow=True,
+            role_is_direct_coaching=True,
             summary_uk="Executive коучинг після успішного retry.",
             reasoning="Passed on retry",
             language_requirements=["English"],

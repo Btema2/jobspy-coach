@@ -32,6 +32,8 @@ def test_daemon_pipeline_cycle(monkeypatch, tmp_path):
     mock_eval_result.language_requirements = ["English"]
     mock_eval_result.pros = []
     mock_eval_result.cons = []
+    mock_eval_result.hard_reject = False
+    mock_eval_result.eval_model = None
     mock_evaluator.evaluate_job.return_value = mock_eval_result
 
     mock_notifier = MagicMock()
@@ -261,6 +263,8 @@ def test_daemon_evaluate_unprocessed_dry_run(tmp_path):
     mock_eval_res = MagicMock()
     mock_eval_res.score = 9.8
     mock_eval_res.is_wow = True
+    mock_eval_res.hard_reject = False
+    mock_eval_res.eval_model = None
     mock_evaluator.evaluate_job.return_value = mock_eval_res
 
     mock_notifier = MagicMock()
@@ -401,6 +405,8 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     eval_low.language_requirements = []
     eval_low.pros = []
     eval_low.cons = []
+    eval_low.hard_reject = False
+    eval_low.eval_model = None
 
     # High score, not wow
     eval_high = MagicMock()
@@ -411,8 +417,12 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     eval_high.language_requirements = []
     eval_high.pros = []
     eval_high.cons = []
+    eval_high.hard_reject = False
+    eval_high.eval_model = None
 
-    mock_evaluator.evaluate_job.side_effect = [eval_low, eval_high]
+    # Workers finish in arbitrary order, so key the scripted result by job title.
+    results_by_title = {"Junior Sourcer": eval_low, "Executive Coach": eval_high}
+    mock_evaluator.evaluate_job.side_effect = lambda job: results_by_title[job.title]
 
     daemon = DaemonService(db_path=db_file, evaluator=mock_evaluator)
 

@@ -3,6 +3,7 @@ import time
 from typing import Any, Dict, List, Optional
 import httpx
 
+from src.logging_config import redact_secrets
 from src.notifier.templates import format_digest_chunks, format_wow_alert
 from src.storage.models import JobPosting
 
@@ -99,10 +100,12 @@ class TelegramNotifier:
                 resp.raise_for_status()
                 return True
             except httpx.HTTPStatusError as e:
-                logger.error(f"Telegram HTTP error: {e}")
+                # Never log str(e): httpx embeds the full request URL, which contains the bot token.
+                logger.error(f"Telegram HTTP error: status {e.response.status_code}")
                 return False
             except Exception as e:
-                logger.error(f"Failed to send Telegram notification: {e}")
+                # str(e) may embed the request URL (bot token): always pass it through the shared redactor.
+                logger.error(f"Failed to send Telegram notification: {type(e).__name__}: {redact_secrets(str(e))}")
                 return False
 
     def send_wow_alert(self, job: JobPosting) -> bool:

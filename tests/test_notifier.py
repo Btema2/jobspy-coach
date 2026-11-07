@@ -483,3 +483,41 @@ def test_send_daily_digest_forwards_update_notice(monkeypatch):
     mock_format.assert_called_once_with([job], date_str="22.10.2026", update_notice=notice)
     notifier.close()
 
+
+
+def test_notifier_http_error_log_does_not_leak_token(caplog):
+    import logging
+    import httpx
+    from src.notifier.telegram_notifier import TelegramNotifier
+
+    fake_token = "123456:FAKEFAKEFAKEFAKEFAKEFAKEFAKE_abc-XYZ"
+    transport = httpx.MockTransport(lambda request: httpx.Response(401, json={"ok": False}))
+    notifier = TelegramNotifier(token=fake_token, chat_id="1")
+    notifier._client = httpx.Client(transport=transport)
+    with caplog.at_level(logging.DEBUG):
+        assert notifier.send_message("hi") is False
+    own = " ".join(r.getMessage() for r in caplog.records if r.name.startswith("src.notifier"))
+    assert own
+    assert fake_token not in own
+    assert "401" in own
+
+
+def test_notifier_connect_error_logged_redacted_but_diagnosable(caplog):
+    import logging
+    import httpx
+    from src.logging_config import RedactingFilter
+    from src.notifier.telegram_notifier import TelegramNotifier
+
+    fake_token = "123456:FAKEFAKEFAKEFAKEFAKEFAKEFAKE_abc-XYZ"
+
+    def boom(request):
+        raise httpx.ConnectError(f"[Errno -2] Name or service not known for {request.url}")
+
+    notifier = TelegramNotifier(token=fake_token, chat_id="1")
+    notifier._client = httpx.Client(transport=httpx.MockTransport(boom))
+    with caplog.at_level(logging.DEBUG):
+        assert notifier.send_message("hi") is False
+    own = " ".join(r.getMessage() for r in caplog.records if r.name.startswith("src.notifier"))
+    assert fake_token not in own
+    assert "Name or service not known" in own
+    assert "bot<redacted>" in own
