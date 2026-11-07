@@ -5,6 +5,7 @@ generous timeouts that are only reached when a test would otherwise fail.
 """
 
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -24,7 +25,7 @@ from src.evaluator.errors import (
 from src.evaluator.providers import CompletionResult
 from src.evaluator.rate_limiter import SlidingWindowRateLimiter
 from src.evaluator.schemas import JobEvaluationResult
-from src.scheduler.daemon import DaemonService
+from src.scheduler.daemon import DaemonService, latency_stats
 from src.storage.models import JobPosting
 
 WAIT = 5.0  # upper bound for any blocking wait in these tests
@@ -43,6 +44,7 @@ def make_settings(**overrides) -> Settings:
 
 
 def make_result(score: float, model: str = "vendor/model", **extra) -> JobEvaluationResult:
+    extra.setdefault("role_is_direct_coaching", True)  # WOW needs it; tests opt out explicitly
     return JobEvaluationResult(
         score=score,
         summary_uk="A sufficiently long summary.",
@@ -423,6 +425,57 @@ def test_logs_per_job_progress_and_batch_summary_without_descriptions(tmp_path, 
     assert "coaching role description" not in text  # descriptions never logged
 
 
+def test_batch_summary_reports_latency_stats_and_inflight_peak(tmp_path, caplog):
+    barrier = threading.Barrier(3, timeout=WAIT)  # forces 3 simultaneous in-flight calls
+
+    def behaviour(job):
+        barrier.wait()
+        return make_result(7.0)
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(behaviour), EVAL_MAX_WORKERS=3)
+    seed(daemon, 3)
+
+    with caplog.at_level(logging.INFO, logger="src.scheduler.daemon"):
+        daemon.evaluate_unprocessed(limit=10)
+
+    summary = [r.getMessage() for r in caplog.records if "Evaluation batch finished" in r.getMessage()]
+    assert len(summary) == 1
+    assert re.search(r"latency\[mean=\d+\.\ds p95=\d+\.\ds max=\d+\.\ds\]", summary[0]), summary[0]
+    assert "inflight_peak=3" in summary[0]
+
+
+def test_latency_stats_mean_p95_max():
+    stats = latency_stats([float(n) for n in range(1, 21)])  # 1..20
+    assert stats.mean == pytest.approx(10.5)
+    assert stats.p95 == 19.0  # nearest rank: ceil(0.95 * 20) = 19th value
+    assert stats.max == 20.0
+
+
+def test_latency_stats_single_and_unsorted_and_empty():
+    one = latency_stats([4.0])
+    assert (one.mean, one.p95, one.max) == (4.0, 4.0, 4.0)
+    mixed = latency_stats([30.0, 10.0, 20.0])
+    assert (mixed.mean, mixed.p95, mixed.max) == (20.0, 30.0, 30.0)
+    empty = latency_stats([])
+    assert (empty.mean, empty.p95, empty.max) == (0.0, 0.0, 0.0)
+
+
+def test_failed_calls_count_towards_latency_stats(tmp_path, caplog):
+    def behaviour(job):
+        raise EvaluationRejected("bad job")
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(behaviour), EVAL_MAX_WORKERS=1)
+    seed(daemon, 2)
+
+    with caplog.at_level(logging.INFO, logger="src.scheduler.daemon"):
+        daemon.evaluate_unprocessed(limit=10)
+
+    summary = [r.getMessage() for r in caplog.records if "Evaluation batch finished" in r.getMessage()]
+    assert "failures=2" in summary[0]
+    assert "inflight_peak=1" in summary[0]
+    assert "latency[" in summary[0]
+
+
 # ----- lazy chain construction -----
 
 
@@ -698,3 +751,80 @@ def test_scheduler_job_defaults_are_single_instance_and_coalesced():
     scheduler = BlockingScheduler()
     assert scheduler._job_defaults["max_instances"] == 1
     assert scheduler._job_defaults["coalesce"] is True
+
+
+# ----- WOW requires direct coaching (real chain post-processing, scripted provider) -----
+
+
+class ScriptedProvider:
+    name = "scripted"
+    model = "vendor/scripted"
+    max_tokens = 100
+
+    def __init__(self, content: str):
+        from src.evaluator.circuit_breaker import CircuitBreaker
+
+        self.content = content
+        self.breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=600)
+
+    def is_available(self) -> bool:
+        return True
+
+    def complete(self, system, user, max_tokens=None):
+        return CompletionResult(content=self.content, model_used=self.model, latency=0.0, finish_reason="stop")
+
+
+@pytest.mark.parametrize(
+    "direct, expect_wow, expect_score, expect_status",
+    [
+        (False, False, 8.4, "pending"),  # capped: lands in the digest band, no instant alert
+        (True, True, 9.5, "instant_sent"),
+    ],
+)
+def test_non_direct_coaching_job_never_triggers_wow(tmp_path, direct, expect_wow, expect_score, expect_status):
+    import json
+
+    content = json.dumps(
+        {
+            "score": 8.0,
+            "summary_uk": "A sufficiently long summary.",
+            "reasoning": "r",
+            "role_is_direct_coaching": direct,
+            "matches_bonus_criteria": True,
+        }
+    )
+    chain = ProviderChainEvaluator([ScriptedProvider(content)], system_prompt="x", bonus_enabled=True)
+    notifier = MagicMock()
+    notifier.send_wow_alert.return_value = True
+    daemon = make_daemon(tmp_path, chain, notifier=notifier)
+    (job_id,) = seed(daemon, 1)
+
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+
+    assert (evaluated, wow) == (1, 1 if expect_wow else 0)
+    assert notifier.send_wow_alert.called == expect_wow
+    job = daemon.db.get_job_by_id(job_id)
+    assert job.eval_score == expect_score
+    assert bool(job.eval_is_wow) == expect_wow
+    assert job.notification_status == expect_status
+
+
+def test_wow_needs_direct_coaching_even_when_threshold_is_below_the_digest_cap(tmp_path):
+    """With WOW_SCORE_THRESHOLD=8.0 a capped (8.4) non-coaching role must stay in the digest band."""
+    notifier = MagicMock()
+    notifier.send_wow_alert.return_value = True
+    fake = FakeEvaluator(
+        lambda job: make_result(8.4, role_is_direct_coaching=("Direct" in job.title))
+    )
+    daemon = make_daemon(tmp_path, fake, notifier=notifier, WOW_SCORE_THRESHOLD=8.0)
+    other_id = daemon.db.save_job(make_job(1, title="Programme Trainer"))[0]
+    direct_id = daemon.db.save_job(make_job(2, title="Direct Coach"))[0]
+
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+
+    assert (evaluated, wow) == (2, 1)
+    other = daemon.db.get_job_by_id(other_id)
+    assert not other.eval_is_wow and other.notification_status == "pending"
+    direct = daemon.db.get_job_by_id(direct_id)
+    assert direct.eval_is_wow and direct.notification_status == "instant_sent"
+    assert notifier.send_wow_alert.call_count == 1

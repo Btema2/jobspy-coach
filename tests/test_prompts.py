@@ -91,3 +91,21 @@ def test_prompt_without_profile_file_has_no_profile_content(no_profile):
 def test_user_prompt_truncates_description():
     text = build_job_user_prompt("T", "C", "L", True, "x" * 5000)
     assert text.count("x") == 4000
+
+
+def test_prompt_bonus_requires_posting_text_to_ask_for_it(no_profile):
+    prompt = build_system_prompt().lower()
+    assert "posting text itself" in prompt
+    # holding the credential / being a good fit / plausibility is explicitly not enough
+    assert "candidate holding" in prompt
+    assert "not enough" in prompt
+
+
+def test_prompt_defines_direct_coaching_strictly(no_profile):
+    prompt = build_system_prompt()
+    lowered = prompt.lower()
+    assert "main duty" in lowered
+    assert "1-on-1" in prompt
+    for non_coaching in ("corporate trainer", "learning and development", "internal training facilitator"):
+        assert non_coaching in lowered
+    assert "wow also requires" in lowered or "only direct" in lowered

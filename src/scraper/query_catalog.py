@@ -15,6 +15,8 @@ class SearchQuery:
     site_names: List[str]
     country_code: Optional[str] = None
     is_remote: bool = False
+    # Optional full Google Jobs query override. None -> derived per query by the scraper.
+    google_search_term: Optional[str] = None
 
 
 # Location-neutral defaults. Personal / regional targets belong in the git-ignored queries.json.
@@ -23,7 +25,8 @@ DEFAULT_QUERY_CATALOG: List[SearchQuery] = [
         query_id="Q-EU-REM",
         search_term="Career Coach OR Life Coach",
         location="Europe",
-        site_names=["linkedin", "indeed", "google"],
+        # No indeed: it searches one country at a time and needs a country_code.
+        site_names=["linkedin", "google"],
         is_remote=True,
     ),
     SearchQuery(
@@ -51,6 +54,7 @@ def load_custom_queries() -> Optional[List[SearchQuery]]:
                         site_names=item["site_names"],
                         country_code=item.get("country_code"),
                         is_remote=item.get("is_remote", False),
+                        google_search_term=item.get("google_search_term"),
                     )
                     for item in data
                 ]

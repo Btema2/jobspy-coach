@@ -250,7 +250,8 @@ def test_jobspy_scraper_nan_and_missing_handling(monkeypatch):
         query_id="Q-NAN-TEST",
         search_term="Coach",
         location="Warsaw, Poland",
-        site_names=["indeed"]
+        site_names=["indeed"],
+        country_code="poland",
     )
 
     results = scraper.scrape_board("indeed", query)
@@ -286,7 +287,8 @@ def test_jobspy_scraper_inter_board_jitter(monkeypatch):
         query_id="Q-MULTI-BOARD",
         search_term="Coach",
         location="Warsaw",
-        site_names=["linkedin", "indeed", "glassdoor"]
+        site_names=["linkedin", "indeed", "glassdoor"],
+        country_code="poland",
     )
 
     results = scraper.scrape_query(query)
@@ -391,7 +393,7 @@ def test_jobspy_scraper_corrupted_salary(monkeypatch):
 
     monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape_jobs)
     scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
-    query = SearchQuery(query_id="Q-SALARY", search_term="Coach", location="Warsaw", site_names=["indeed"])
+    query = SearchQuery(query_id="Q-SALARY", search_term="Coach", location="Warsaw", site_names=["indeed"], country_code="poland")
     results = scraper.scrape_board("indeed", query)
     assert len(results) == 1
     assert results[0].salary_min is None
@@ -429,13 +431,13 @@ def test_default_query_catalog_has_no_personal_location_targeting():
         assert forbidden not in blob
 
 
-def test_scrape_board_default_country_is_neutral(monkeypatch):
+def test_scrape_board_never_defaults_to_usa(monkeypatch):
     mock_scrape = MagicMock(return_value=pd.DataFrame())
     monkeypatch.setattr("jobspy.scrape_jobs", mock_scrape)
     scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
     query = SearchQuery(query_id="Q-X", search_term="Coach", location="Remote", site_names=["indeed"])
-    scraper.scrape_board("indeed", query)
-    assert mock_scrape.call_args.kwargs["country_indeed"] == "usa"
+    assert scraper.scrape_board("indeed", query) == []
+    mock_scrape.assert_not_called()
 
 
 def test_jobspy_scraper_enabled_boards_filter(monkeypatch):
@@ -448,6 +450,7 @@ def test_jobspy_scraper_enabled_boards_filter(monkeypatch):
         search_term="Executive Coach",
         location="Warsaw",
         site_names=["linkedin", "indeed"],
+        country_code="poland",
     )
 
     # Calling scrape_board on non-enabled board (linkedin) returns [] without calling scrape_jobs
@@ -481,6 +484,7 @@ def test_jobspy_scraper_passes_proxies(monkeypatch):
         search_term="Executive Coach",
         location="Warsaw",
         site_names=["indeed"],
+        country_code="poland",
     )
 
     scraper.scrape_board("indeed", query)
@@ -509,6 +513,7 @@ def test_jobspy_scraper_linkedin_pacing(monkeypatch):
         search_term="Executive Coach",
         location="Warsaw",
         site_names=["linkedin"],
+        country_code="poland",
     )
 
     # First call: elapsed since 0 is large -> no pacing sleep

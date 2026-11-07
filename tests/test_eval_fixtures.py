@@ -53,3 +53,15 @@ def test_fixture_has_no_home_paths_or_secrets():
     assert not re.search(r"/home/[A-Za-z0-9._-]+/", text)
     assert "file:" + "///" not in text
     assert not re.search(r"(sk-|nvapi-)[A-Za-z0-9]{10,}", text)
+
+
+def test_relevant_cases_declare_whether_they_are_direct_coaching():
+    relevant = [c for c in _load() if c["category"] == "relevant"]
+    for case in relevant:
+        assert isinstance(case.get("direct_coaching"), bool), case["id"]
+    # Both kinds must exist: direct coaching can reach WOW, other relevant roles stay in the digest band.
+    assert any(c["direct_coaching"] for c in relevant)
+    assert any(not c["direct_coaching"] for c in relevant)
+    for case in _load():
+        if case["category"] == "hard_reject":
+            assert "direct_coaching" not in case, case["id"]

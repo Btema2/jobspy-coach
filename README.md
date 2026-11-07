@@ -54,17 +54,18 @@ The daemon operates autonomously around the clock, continuously scraping configu
    - Automatically drops stub descriptions (<150 characters or <30 words).
 
 3. **Cross-Board Deduplication**:
-   - Normalizes corporate suffixes (`Sp. z o.o.`, `LLC`, `GmbH`, `Inc.`), casing, and punctuation.
+   - Normalizes casing, diacritics, punctuation, parentheticals and corporate suffixes (`Sp. z o.o.`, `S.A.`, `LLC`, `GmbH`, `Inc.`) in the company, drops trailing regional words (`Polska`, `International`, `Group`), drops connector words (`and`, `&`, `und`) and gender markers (`(m/w/d)`) in the title, and reduces the location to its city (`Lyon Metropolitan Area` = `Lyon, Auvergne-Rhône-Alpes, France`).
+   - Matching is exact on the normalized fields, never fuzzy: different roles at one company, different seniority/language variants and the same title in different cities stay separate postings.
    - Computes deterministic SHA-256 hashes (`company:title:location`) to prevent duplicate alerts when a vacancy is cross-posted across multiple boards.
 
 4. **Concurrent, NIM-First LLM Evaluation**:
    - Evaluates vacancies against the target candidate persona through a **provider chain**: NVIDIA NIM first, then OpenRouter (pinned free models) as fallback.
    - Worker threads (`EVAL_MAX_WORKERS`) evaluate jobs concurrently while a sliding-window limiter caps NIM at `NVIDIA_RPM_LIMIT` requests per minute (default 30) **per process**.
    - Per-call retry with backoff, a circuit breaker per provider, and an OpenRouter daily budget. If every provider fails, the job simply stays `unprocessed` and is retried next cycle (`EVAL_MAX_ATTEMPTS` bounds repeated job-specific failures).
-   - Generates scores from 1.0 to 10.0, concise executive summaries (`summary_uk`), rationale (`reasoning`), extracted language requirements, and pros/cons. Hard-reject and bonus-criteria adjustments are applied in code, not by the model; the model that actually answered is stored per job (`eval_model`). The language of `summary_uk` is set by the output language stated in your local `.candidate_profile.md` (English if none is stated). The bonus only applies when your local `.candidate_profile.md` contains a "Bonus criteria" section; without it the model's bonus flag is ignored.
+   - Generates scores from 1.0 to 10.0, concise executive summaries (`summary_uk`), rationale (`reasoning`), extracted language requirements, and pros/cons. Hard-reject and bonus-criteria adjustments are applied in code, not by the model; the model that actually answered is stored per job (`eval_model`). The language of `summary_uk` is set by the output language stated in your local `.candidate_profile.md` (English if none is stated). The bonus only applies when your local `.candidate_profile.md` contains a "Bonus criteria" section; without it the model's bonus flag is ignored. The model sets the bonus flag only when the posting text itself asks for or values a bonus criterion. WOW requires direct coaching: roles that are not flagged `role_is_direct_coaching` (corporate trainer, L&D, leadership-development and programme roles) are capped at 8.4 after the bonus, so they land in the digest, never in an instant alert.
 
 5. **Two-Tier Telegram Dispatching**:
-   - **Instant WOW Alerts**: Vacancies whose final score is $\ge 8.5$ (`WOW_SCORE_THRESHOLD`) trigger immediate Telegram push alerts with inline application buttons. WOW status is derived from the final score by the daemon; the model does not decide it.
+   - **Instant WOW Alerts**: Vacancies whose final score is $\ge 8.5$ (`WOW_SCORE_THRESHOLD`; reachable only by direct 1-on-1 coaching / psychological-support roles) trigger immediate Telegram push alerts with inline application buttons. WOW status is derived from the final score by the daemon; the model does not decide it.
    - **Daily Morning Digest**: Every day at the configured digest time (`DIGEST_TIME_CET`), qualifying vacancies ($6.5 \le \text{score} < 8.5$) are batched and delivered in formatted digest messages.
    - **Immediate Low-Score Dismissal**: Vacancies scoring $< 6.5$ (`DIGEST_SCORE_THRESHOLD`) are immediately marked `dismissed` to keep queues clean.
    - **Stale Expiration**: Stale pending postings older than 7 days are automatically transitioned to `expired_dismissed`.
@@ -206,7 +207,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 | `SCRAPER_RESULTS_PER_QUERY` | `10` | Target number of raw postings requested per query from each board (keep below 25 for LinkedIn). |
 | `SCRAPER_ENABLED_BOARDS` | *(all configured)* | Optional comma-separated board allow-list. |
 | `SCRAPER_PROXIES` | *(none)* | Optional comma-separated proxy URLs (needed for LinkedIn on datacenter IPs). |
-| `WOW_SCORE_THRESHOLD` | `8.5` | Minimum final score (1-10) triggering an immediate WOW Telegram alert. |
+| `WOW_SCORE_THRESHOLD` | `8.5` | Minimum final score (1-10) triggering an immediate WOW Telegram alert; additionally requires a direct-coaching role (other roles are capped at 8.4 and never alert instantly, even if this is set lower). |
 | `DIGEST_SCORE_THRESHOLD` | `6.5` | Minimum final score (1-10) for the morning digest; lower scores are dismissed. |
 | `DIGEST_MAX_ITEMS` | `10` | Maximum number of top vacancies included in a single daily digest. |
 
@@ -217,6 +218,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 - If a provider is rate-limited, out of budget, has a tripped circuit breaker, or returns an unusable answer, the next provider is tried. If none can answer, the job stays `unprocessed` and is retried next cycle.
 - No providers configured: the daemon starts (so scraping still works) but evaluation raises a clear `ConfigurationError` the first time it is needed. Nothing is built at import or construction time.
 - **Rate limit is per process**: the 30 rpm NIM cap is enforced inside one process. Do **not** run `jobspy-coach evaluate` while the daemon is evaluating: two processes double the effective rate and can send duplicate WOW alerts.
+- **Batch latency stats**: the `Evaluation batch finished` log line reports per-job `latency[mean p95 max]` (retries included) and `inflight_peak`. Use them to judge `EVAL_MAX_WORKERS` / `NVIDIA_TIMEOUT_SECONDS`; the measured evidence behind the current defaults is in `docs/model-selection.md`.
 
 ### Privacy of Local Configuration
 
@@ -224,7 +226,11 @@ Everything specific to you stays in git-ignored local files and is never committ
 
 - `.env`: API keys, bot token, thresholds.
 - `.candidate_profile.md`: your private candidate persona (read at runtime by the evaluator; a generic template is used if it is absent). Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details).
-- `queries.json`: your search queries (see `queries.example.json` for the format; the built-in defaults are location-neutral).
+- `queries.json`: your search queries (see `queries.example.json` for the format; the built-in defaults are location-neutral). Per query, `country_code` is required for Indeed and Glassdoor (they search one country at a time; queries without it skip those boards with a logged warning, e.g. pan-regional "Europe" queries should list only LinkedIn/Google), and the optional `google_search_term` overrides the Google Jobs query string that is otherwise derived as `<search_term> jobs near <location> <time window> [remote]`. Note that Google Jobs currently returns no data to python-jobspy from some networks (it serves a JavaScript challenge page); the scraper logs this once instead of failing silently.
+
+### Log Hygiene
+
+Logging goes through `configure_logging()`, which keeps `httpx`/`httpcore` at WARNING (their INFO lines contain the full Telegram API URL, including the bot token) and redacts bot-token-shaped strings and `Bearer`/`Authorization` secrets from every log record. If your bot token was ever logged, pasted or committed, rotate it (BotFather `/revoke`) and update `.env`.
 
 ### Model Selection and Bake-off
 
@@ -287,6 +293,28 @@ Validates Telegram bot token, chat ID, and network connectivity by delivering a 
 ```bash
 jobspy-coach test-telegram
 ```
+
+### 1b. `rehash`
+After upgrading to a new dedup normalization, existing rows still carry their old hashes. Recompute them and merge duplicate postings (stop the daemon first; the operation is idempotent):
+```bash
+jobspy-coach rehash --dry-run   # report only
+jobspy-coach rehash
+```
+Per group of duplicates it keeps the row that already sent an alert, else an evaluated row, else the oldest. Rows that already sent an alert are never deleted.
+
+### 1c. `cleanup-empty`
+Removes stub rows with an empty description (default board `linkedin`, override with `--site`), e.g. rows saved by older versions when a LinkedIn detail fetch failed. Their dedup hash would otherwise keep suppressing the real posting. Stop the daemon first.
+```bash
+jobspy-coach cleanup-empty
+```
+
+#### Upgrading from a version before this change
+1. Stop the daemon.
+2. Optional: `jobspy-coach cleanup-empty` to drop empty-description LinkedIn stubs saved by older versions.
+3. `jobspy-coach rehash --dry-run` to preview, then `jobspy-coach rehash` to recompute dedup hashes and merge duplicate postings.
+4. Restart the daemon.
+
+Until `rehash` has run, re-scraped postings can hash differently from the stored rows, so they may be re-evaluated and re-alerted.
 
 ### 2. `stats`
 Displays a colorized terminal table detailing total jobs discovered, pre-filter dismissals, LLM evaluations, failed calls, instant alerts, digests sent, and pending digest candidates.
@@ -435,6 +463,7 @@ COVERAGE_FILE=/tmp/.coverage pytest -o cache_dir=/tmp/.pytest_cache --cov=src --
 
 ### Test Suite Structure
 
+- `tests/test_logging_config.py`: Secret redaction filter and `configure_logging()` behaviour.
 - `tests/test_cli.py`: CLI command invocation, argument parsing, error exits, and context manager lifecycle.
 - `tests/test_config.py`: Settings validation, aliases, default values, and environment variable overrides.
 - `tests/test_daemon.py`: Scheduler execution, inter-board jitter delays, immediate low-score dismissals, transient/permanent error handling, and signal shutdown.
@@ -447,6 +476,7 @@ COVERAGE_FILE=/tmp/.coverage pytest -o cache_dir=/tmp/.pytest_cache --cov=src --
 - `tests/test_pre_filter.py`: Exhaustive regex pattern and heuristic validation across sports noise, edge cases, and short stubs.
 - `tests/test_scraper.py`: JobSpy board scraping, URL sanitization, and retry backoff.
 - `tests/test_storage.py`: SQLite WAL database operations, schema constraints, dedup hashing, and stats.
+- `tests/test_dedup.py`: Dedup normalization (merge and non-merge cases) and the `rehash` migration.
 
 ---
 

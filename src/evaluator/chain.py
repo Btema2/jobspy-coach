@@ -67,6 +67,7 @@ TRUNCATION_RETRY_FACTOR = 1.5
 BONUS_POINTS = 1.5
 BONUS_MIN_BASE_SCORE = 6.0
 REJECT_CAP = 2.0
+DIGEST_MAX_SCORE = 8.4  # ceiling for roles that are not direct coaching (WOW needs >= 8.5)
 
 _OK = "ok"
 _JOB_FAULT = "job"  # this provider judged the job unusable; not an outage
@@ -233,6 +234,16 @@ class ProviderChainEvaluator:
         if title_reason and score > REJECT_CAP:
             score = REJECT_CAP
             result.reasoning = f"{result.reasoning} [Title safety net: {title_reason}; score capped at {REJECT_CAP}]"
+
+        # WOW is reserved for direct coaching: any other role stays in the digest band, however
+        # high the model scored it or however much the bonus lifted it. A missing flag counts as false.
+        if not result.role_is_direct_coaching and score > DIGEST_MAX_SCORE:
+            logger.info(
+                "Direct-coaching cap: %r raw model score %.1f, final score %.1f "
+                "(role_is_direct_coaching=false, capped at %.1f)",
+                job.title, float(result.score), DIGEST_MAX_SCORE, DIGEST_MAX_SCORE,
+            )
+            score = DIGEST_MAX_SCORE
 
         result.score = round(score, 1)
         result.is_wow = False  # decided by the daemon from the final score, never by the model

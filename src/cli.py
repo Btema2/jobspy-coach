@@ -1,5 +1,4 @@
 import importlib.metadata
-import logging
 from typing import Optional
 import typer
 from rich.console import Console
@@ -7,6 +6,7 @@ from rich.table import Table
 
 from src.config import get_settings
 from src.evaluator.errors import ConfigurationError
+from src.logging_config import configure_logging
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
@@ -15,7 +15,7 @@ from src.storage.db import Database
 app = typer.Typer(help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
 console = Console()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+configure_logging()
 
 
 def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
@@ -92,6 +92,39 @@ def test_telegram():
             "[bold red]Failed to send Telegram test message. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.[/bold red]"
         )
         raise typer.Exit(code=1)
+
+
+@app.command()
+def rehash(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would change without writing"),
+):
+    """Recompute dedup hashes with the current normalization and merge duplicate postings.
+
+    Run once after upgrading (and never while the daemon is running). Keeps the row that already sent an
+    alert, else an evaluated row, else the oldest; rows that already sent an alert are never deleted.
+    """
+    db = Database(get_settings().db_path)
+    db.init_db()
+    result = db.rehash_all(dry_run=dry_run)
+    verb = "Would change" if dry_run else "Done"
+    console.print(
+        f"[bold green]{verb}: scanned {result['total']}, rehashed {result['rehashed']}, "
+        f"merged (deleted) {result['merged']}, kept alert-sent twins {result['kept_twins']}.[/bold green]"
+    )
+
+
+@app.command("cleanup-empty")
+def cleanup_empty(
+    site: str = typer.Option("linkedin", "--site", help="Board whose empty-description rows are removed"),
+):
+    """Delete stub rows with an empty description (e.g. LinkedIn rows from a failed detail fetch).
+
+    Their dedup hash would otherwise keep suppressing the real posting. Never run while the daemon is running.
+    """
+    db = Database(get_settings().db_path)
+    db.init_db()
+    removed = db.delete_empty_description_jobs(site)
+    console.print(f"[bold green]Removed {removed} empty-description {site} row(s).[/bold green]")
 
 
 @app.command()

@@ -1,10 +1,12 @@
 import logging
+import math
 import random
 import signal
 import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +30,22 @@ from src.storage.db import Database
 from src.storage.models import JobPosting
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LatencyStats:
+    mean: float
+    p95: float
+    max: float
+
+
+def latency_stats(latencies: List[float]) -> LatencyStats:
+    """Mean, nearest-rank p95 and max of per-job latencies in seconds (zeros when empty)."""
+    if not latencies:
+        return LatencyStats(0.0, 0.0, 0.0)
+    ordered = sorted(latencies)
+    rank = max(1, math.ceil(0.95 * len(ordered)))
+    return LatencyStats(sum(ordered) / len(ordered), ordered[rank - 1], ordered[-1])
 
 
 def _iter_completed(futures: Dict[Future, Any], poll_seconds: float = 0.2) -> Iterator[Future]:
@@ -170,9 +188,23 @@ class DaemonService:
         batch_stopped = False
         t0 = time.monotonic()
 
+        stats_lock = threading.Lock()
+        call_latencies: List[float] = []
+        in_flight = 0
+        in_flight_peak = 0
+
         def timed_eval(job: JobPosting) -> Tuple[Any, float]:
+            nonlocal in_flight, in_flight_peak
             started = time.monotonic()
-            return chain.evaluate_job(job), time.monotonic() - started
+            with stats_lock:
+                in_flight += 1
+                in_flight_peak = max(in_flight_peak, in_flight)
+            try:
+                return chain.evaluate_job(job), time.monotonic() - started
+            finally:
+                with stats_lock:
+                    in_flight -= 1
+                    call_latencies.append(time.monotonic() - started)
 
         # No ``with``: its __exit__ would shutdown(wait=True) and block shutdown for minutes.
         executor = ThreadPoolExecutor(max_workers=max(1, settings.eval_max_workers), thread_name_prefix="eval")
@@ -231,8 +263,12 @@ class DaemonService:
                 )
 
                 # The alert decision lives here, from settings, once.
+                # WOW additionally requires a direct-coaching role, so a lowered WOW_SCORE_THRESHOLD can never
+                # promote capped (<= 8.4) non-coaching roles into instant alerts.
                 eval_res.is_wow = bool(
-                    eval_res.score >= settings.wow_score_threshold and not eval_res.hard_reject
+                    eval_res.score >= settings.wow_score_threshold
+                    and not eval_res.hard_reject
+                    and eval_res.role_is_direct_coaching
                 )
                 if dry_run:
                     evaluated_count += 1
@@ -270,10 +306,14 @@ class DaemonService:
         wall = time.monotonic() - t0
         rpm = (done / wall * 60.0) if wall > 0 else 0.0
         provider_counts = ", ".join(f"{k}={v}" for k, v in sorted(per_provider.items())) or "none"
+        with stats_lock:
+            lat = latency_stats(list(call_latencies))
+            peak = in_flight_peak
         logger.info(
             "Evaluation batch finished: processed=%d/%d evaluated=%d wow=%d failures=%d providers[%s] "
-            "wall=%.1fs effective=%.1f rpm%s",
+            "wall=%.1fs effective=%.1f rpm latency[mean=%.1fs p95=%.1fs max=%.1fs] inflight_peak=%d%s",
             done, total, evaluated_count, wow_sent, failures, provider_counts, wall, rpm,
+            lat.mean, lat.p95, lat.max, peak,
             " (batch aborted: providers unavailable)" if batch_stopped else "",
         )
         return evaluated_count, wow_sent
@@ -305,6 +345,15 @@ class DaemonService:
             if not dry_run:
                 self.db.update_eval_failure(job.id, str(e))
 
+    def _begin_scrape_progress(self, queries: List[SearchQuery]) -> List[Tuple[SearchQuery, str]]:
+        """Starts the scraper's progress tracking and returns the (query, board) calls to make."""
+        begin = getattr(self.scraper, "begin_cycle", None)
+        plan = begin(queries) if callable(begin) else None
+        if isinstance(plan, list):
+            return plan
+        # Scraper without a call plan (e.g. a test double): run every configured board.
+        return [(q, site) for q in queries for site in q.site_names]
+
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
     ) -> Tuple[int, int]:
@@ -312,10 +361,14 @@ class DaemonService:
         logger.info("Starting pipeline scrape cycle across queries...")
         total_new_saved = 0
 
-        for q_idx, q in enumerate(active_queries):
-            for s_idx, site in enumerate(q.site_names):
+        # The scraper owns the progress lines ([i/N] before/after every call, per-board summary);
+        # the call plan holds only the calls that will really be requested (enabled boards, country set).
+        plan = self._begin_scrape_progress(active_queries)
+
+        try:
+            for idx, (q, site) in enumerate(plan, start=1):
                 jitter_max = getattr(self.scraper, "jitter_max", 0.0)
-                if (q_idx > 0 or s_idx > 0) and isinstance(jitter_max, (int, float)) and jitter_max > 0:
+                if idx > 1 and isinstance(jitter_max, (int, float)) and jitter_max > 0:
                     jitter_min = getattr(self.scraper, "jitter_min", 0.0)
                     min_val = jitter_min if isinstance(jitter_min, (int, float)) else 0.0
                     time.sleep(random.uniform(min_val, jitter_max))
@@ -339,6 +392,10 @@ class DaemonService:
                             total_new_saved += 1
 
                     if not dry_run:
+                        logger.info(
+                            "[%d/%d] %s %s saved %d new (%d already known)",
+                            idx, len(plan), q.query_id, site, board_new_saved, len(board_postings) - board_new_saved,
+                        )
                         self.db.record_scrape_run(
                             board=site,
                             query=q.search_term,
@@ -360,6 +417,10 @@ class DaemonService:
                             status="failed",
                             error_message=str(e),
                         )
+        finally:
+            end_cycle = getattr(self.scraper, "end_cycle", None)
+            if callable(end_cycle):
+                end_cycle()
 
         if dry_run:
             return 0, 0

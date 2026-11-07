@@ -98,6 +98,61 @@ router and any model with `expiration_date`. That left 8 candidates. Every call 
   but does not advertise `response_format`; it was not tested. It is worth trying as a same-model backup.
 - OpenRouter free models are frequently rate-limited upstream: treat the fallback as best-effort.
 
+## Latency and timeouts under concurrency (live-run analysis and drill)
+
+Evidence from one live evaluation batch (148 postings, 8 workers, `reasoning_effort=low`, read timeout 240 s,
+the candidate's local persona) plus a small follow-up drill. Job text and names are deliberately omitted.
+
+Live batch, per-job latency as logged by the daemon (includes retries and backoff):
+
+| Slice | Jobs | Mean / p50 / p95 / max (s) |
+|---|---|---|
+| Whole batch | 148 | 59.8 / 43.1 / 270.9 / 338.8 |
+| Healthy jobs (< 200 s) | 140 | 46.5 / 41.5 / 97.6 / 115.0 |
+| Stalled jobs (>= 200 s, 270-339 s) | 8 | one read timeout (240 s) plus a successful retry of 30-100 s |
+
+- Wall time 1140 s, effective 7.8 jobs/min, against a 30 rpm assumption. By Little's law 8 workers at a 46.5 s
+  mean give a ceiling of about 10 jobs/min; the first 132 jobs ran at about 9.8 jobs/min. The gap to 30 rpm is
+  latency, not the client-side limiter (which never delayed anything) and not provider throttling.
+- Error classes: 8 `ReadTimeout` and 2 `ConnectTimeout` transport errors, zero HTTP 429, zero 5xx. All 8 read
+  timeouts fell in one 2-minute window (calls that started around the same time, ending about 240 s later):
+  one provider-side stall, not steady degradation. 7 of those jobs recovered on the first retry; one job
+  burned a read timeout and two connect timeouts (about 100 s of backoff and attempts) and was answered by the
+  OpenRouter fallback (338.8 s in total). No job was lost, no failures.
+- The circuit breaker never opened (it needs 3 consecutive failed jobs; only that one job failed on NIM).
+- About 7% of healthy jobs (10 of 140) took longer than 90 s, so a 90 s read timeout would have cut about as
+  many healthy calls as stalled ones.
+
+Drill (16 postings built from the generic fixtures, each description repeated to about 2.5k characters, the
+real provider chain with NIM only, same settings as the live run, run one configuration at a time;
+40 NIM calls in total and no retries occurred, 2026-11-07):
+
+| Configuration | Jobs | OK | Latency mean / p50 / p95 / max (s) | Wall (s) | Jobs/min | In-flight peak |
+|---|---|---|---|---|---|---|
+| `EVAL_MAX_WORKERS=4`, read timeout 240 | 16 | 16 | 22.2 / 19.0 / 38.6 / 57.5 | 115.6 | 8.3 | 4 |
+| `EVAL_MAX_WORKERS=8`, read timeout 240 | 16 | 16 | 21.8 / 20.5 / 37.0 / 39.3 | 56.0 | 17.1 | 8 |
+| `EVAL_MAX_WORKERS=8`, read timeout 30 | 8 | 8 | 12.6 / 10.8 / 24.7 / 24.7 | 24.7 | 19.5 | 8 |
+
+Reading the numbers (small samples, one run each, and NIM latency varied by roughly 2x between runs minutes
+apart):
+
+- Per-call latency did not depend on 4 versus 8 concurrent calls (22.2 versus 21.8 s mean), so throughput
+  scaled with workers (8.3 to 17.1 jobs/min). That supports keeping 8 workers; it does not show a
+  concurrency penalty up to 8, so the live run's 46 s mean is better explained by the provider being slower at
+  that time (and longer real descriptions) than by the worker count. It does not show that more than 8 is safe:
+  the bake-off saw HTTP 429 at 12 parallel requests.
+- The 30 s read-timeout variant never timed out (max 24.7 s that run), so it demonstrates nothing about tail
+  behaviour. It cannot be used to justify a shorter timeout.
+- Decision: no default changed (`EVAL_MAX_WORKERS=8`, `NVIDIA_TIMEOUT_SECONDS=240`, connect timeout 10 s, 3
+  attempts). A shorter read timeout (for example 90 s) would recover a stalled call about 150 s sooner, but
+  it would also cancel and repeat roughly 7% of healthy calls, wasting a rate-limited request each, and the
+  evidence is a single stall event. Revisit if stalls recur: look at `inflight_peak` and the latency stats
+  below, and consider a read timeout of about 150 s (above the healthy maximum seen, 115 s).
+
+Each evaluation batch now logs `latency[mean=.. p95=.. max=..]` (per-job seconds, retries included, failed
+jobs included) and `inflight_peak=N` on the existing "Evaluation batch finished" line, so this comparison
+can be repeated from the normal log without a drill.
+
 ## Chosen defaults
 
 | Setting | Value |

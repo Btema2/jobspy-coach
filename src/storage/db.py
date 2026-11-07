@@ -1,7 +1,9 @@
 import hashlib
+import html
 import json
 import re
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,24 +12,109 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 from src.storage.models import JobEvaluationResult, JobPosting, ScrapeRun
 
 
+# --- Dedup normalization -----------------------------------------------------------------------
+#
+# Design: exact equality of *normalized* fields, never fuzzy matching. Each rule below only removes
+# text that is noise for identity (casing, diacritics, punctuation, legal forms, regional-branch
+# words, connector words, location granularity) and never text that distinguishes two roles
+# (title specialisations, seniority, language variants, other cities).
+
+_EXTRA_FOLD = str.maketrans({"ł": "l", "đ": "d", "ø": "o", "æ": "ae", "œ": "oe", "ß": "ss", "ı": "i"})
+
+# Gender markers such as "(m/w/d)", "(K/M)", "(all genders)"; only these parentheticals are dropped from titles.
+_GENDER_PARTS = {"m", "f", "w", "d", "k", "x", "h", "gn", "nb", "inni", "divers", "diverse"}
+_GENDER_PAREN_RE = re.compile(r"\(\s*([a-z]+(?:\s*[/,]\s*[a-z]+)*|all genders)\s*\)")
+
+# Legal-form suffixes, matched only at the END of a company name (as token sequences).
+_LEGAL_SUFFIXES = (
+    ("sp", "z", "oo"), ("sp", "z", "o", "o"), ("sp", "k"), ("sp", "j"), ("spolka", "akcyjna"),
+    ("sa",), ("inc",), ("llc",), ("ltd",), ("limited",), ("gmbh",), ("ag",), ("plc",), ("corp",),
+    ("bv",), ("nv",), ("srl",), ("spa",), ("co",),
+)
+# Regional-branch / group descriptor words, stripped from the END of a company name only
+# (never when they would be the whole name).
+_COMPANY_DESCRIPTORS = {"polska", "poland", "international", "global", "group", "europe", "deutschland"}
+
+# Connector words dropped from titles. "i" (Polish "and") is only dropped BETWEEN two other words so a
+# trailing level such as "Analyst I" keeps its meaning.
+_TITLE_CONNECTORS = {"and", "und"}
+
+_REMOTE_MARKERS = ("remote", "hybrid", "anywhere", "worldwide")
+_LOCATION_AREA_RE = re.compile(r"\s+(?:(?:metropolitan|metro)(?:\s+(?:area|region))?|area)$")
+
+
+def _fold(text: Optional[str]) -> str:
+    """Lowercase, unescape HTML entities and fold diacritics."""
+    if not text:
+        return ""
+    s = html.unescape(text).lower().translate(_EXTRA_FOLD)
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+def _tokens(s: str) -> List[str]:
+    """Collapse dotted abbreviations (s.a. -> sa), turn punctuation into spaces, split."""
+    s = re.sub(r"\b(\w)\.", r"\1", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    return s.split()
+
+
+def _normalize_company(text: Optional[str]) -> str:
+    s = re.sub(r"\([^)]*\)", " ", _fold(text))
+    tokens = _tokens(s)
+    changed = True
+    while changed and len(tokens) > 1:
+        changed = False
+        for suffix in _LEGAL_SUFFIXES:
+            n = len(suffix)
+            if len(tokens) > n and tuple(tokens[-n:]) == suffix:
+                tokens = tokens[:-n]
+                changed = True
+                break
+        if not changed and len(tokens) > 1 and tokens[-1] in _COMPANY_DESCRIPTORS:
+            tokens = tokens[:-1]
+            changed = True
+    return " ".join(tokens)
+
+
+def _drop_gender_markers(match: "re.Match[str]") -> str:
+    body = match.group(1)
+    if body == "all genders":
+        return " "
+    parts = [p.strip() for p in re.split(r"[/,]", body)]
+    return " " if all(p in _GENDER_PARTS for p in parts) else match.group(0)
+
+
+def _normalize_title(text: Optional[str]) -> str:
+    s = _GENDER_PAREN_RE.sub(_drop_gender_markers, _fold(text))
+    tokens = _tokens(s)
+    kept = [
+        t for i, t in enumerate(tokens)
+        if t not in _TITLE_CONNECTORS and not (t == "i" and 0 < i < len(tokens) - 1)
+    ]
+    return " ".join(kept)
+
+
+def _normalize_location(text: Optional[str]) -> str:
+    s = _fold(text)
+    if any(marker in s for marker in _REMOTE_MARKERS):
+        # "Remote Poland" vs "Remote Germany" are different postings: keep the whole string.
+        return " ".join(_tokens(s))
+    city = s.split(",")[0].strip()
+    stripped = _LOCATION_AREA_RE.sub("", city)
+    return " ".join(_tokens(stripped or city))
+
+
 def compute_dedup_hash(company: str, title: str, location: str) -> str:
-    """Computes deterministic SHA-256 hash over normalized canonical fields."""
-    def normalize(text: Optional[str]) -> str:
-        if not text:
-            return ""
-        s = text.lower()
-        # Strip corporate entity suffixes
-        s = re.sub(r"\b(sp\.\s*z\s*o\.?\s*o\.?|sp\s*z\s*o\s*o|inc\.?|llc|ltd|gmbh|sa|corp)(?=\b|\s|$)", "", s)
-        # Strip non-alphanumeric punctuation except spaces
-        s = re.sub(r"[^\w\s]", " ", s)
-        # Condense whitespace
-        return " ".join(s.split())
+    """Deterministic SHA-256 over normalized company, title and location.
 
-    norm_company = normalize(company)
-    norm_title = normalize(title)
-    norm_location = normalize(location)
-
-    payload = f"{norm_company}:{norm_title}:{norm_location}".encode("utf-8")
+    Same posting scraped twice with a regional company suffix, a connector word in the title or a
+    different location granularity (city vs "City Metropolitan Area" vs "City, Region, Country")
+    hashes identically; different roles or different cities never do.
+    """
+    payload = (
+        f"{_normalize_company(company)}:{_normalize_title(title)}:{_normalize_location(location)}"
+    ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -407,6 +494,68 @@ class Database:
             )
             conn.commit()
             return cursor.rowcount
+
+    def rehash_all(self, dry_run: bool = False) -> Dict[str, int]:
+        """Recompute ``dedup_hash`` for every row with the current normalization (idempotent).
+
+        Rows whose new hash collides are one posting seen twice. Per group the keeper is the row that
+        already sent an alert (``instant_sent``/``digest_sent``), else an evaluated row, else a row that was not
+        pre-filtered (so a legacy stub never beats a full posting), else the oldest (lowest id). The other rows are deleted, EXCEPT further alert-sent rows: those are never deleted;
+        they keep a unique filler hash derived from the canonical one ("twins"). Returns counters:
+        ``total`` rows scanned, ``rehashed`` rows whose stored hash changed, ``merged`` rows deleted,
+        ``kept_twins`` alert-sent rows kept as twins. With ``dry_run`` nothing is written.
+        """
+        alerted = ("instant_sent", "digest_sent")
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, dedup_hash, company, title, location, eval_status, notification_status, pre_filtered "
+                "FROM jobs ORDER BY id"
+            ).fetchall()
+            groups: Dict[str, List[sqlite3.Row]] = {}
+            for row in rows:
+                groups.setdefault(
+                    compute_dedup_hash(row["company"], row["title"], row["location"]), []
+                ).append(row)
+
+            deletions: List[int] = []
+            targets: Dict[int, str] = {}
+            twins = 0
+            for canonical, members in groups.items():
+                members.sort(key=lambda r: (
+                    r["notification_status"] not in alerted,
+                    r["eval_status"] != "evaluated",
+                    bool(r["pre_filtered"]),
+                    r["id"],
+                ))
+                targets[members[0]["id"]] = canonical
+                for extra in members[1:]:
+                    if extra["notification_status"] in alerted:
+                        twins += 1
+                        targets[extra["id"]] = hashlib.sha256(
+                            f"{canonical}:twin:{extra['id']}".encode("utf-8")
+                        ).hexdigest()
+                    else:
+                        deletions.append(extra["id"])
+
+            current = {r["id"]: r["dedup_hash"] for r in rows}
+            changes = {i: h for i, h in targets.items() if current[i] != h}
+            stats = {
+                "total": len(rows),
+                "rehashed": len(changes),
+                "merged": len(deletions),
+                "kept_twins": twins,
+            }
+            if dry_run:
+                return stats
+
+            for job_id in deletions:
+                conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            # Two phases so a new hash can never collide with a not-yet-rewritten old hash (UNIQUE).
+            for job_id in changes:
+                conn.execute("UPDATE jobs SET dedup_hash = ? WHERE id = ?", (f"rehash-tmp-{job_id}", job_id))
+            for job_id, new_hash in changes.items():
+                conn.execute("UPDATE jobs SET dedup_hash = ? WHERE id = ?", (new_hash, job_id))
+            return stats
 
     def get_stats(self, pending_threshold: float = 6.0) -> Dict[str, int]:
         with self._get_connection() as conn:

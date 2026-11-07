@@ -135,6 +135,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             return JobEvaluationResult(
                 score=9.6,
                 is_wow=True,
+                role_is_direct_coaching=True,
                 summary_uk="Топ-вакансія executive коуча для роботи з керівниками банку.",
                 reasoning="Dream role with international exposure and professional growth opportunity",
                 language_requirements=["English"],
@@ -287,6 +288,7 @@ def test_e2e_dry_run_pipeline_cycle(tmp_path):
     mock_evaluator.evaluate_job.return_value = JobEvaluationResult(
         score=9.5,
         is_wow=True,
+        role_is_direct_coaching=True,
         summary_uk="Тестова dry-run вакансія.",
         reasoning="Dry-run fit",
         language_requirements=["English"],
@@ -356,6 +358,7 @@ def test_e2e_evaluator_retry_and_recovery(tmp_path):
         JobEvaluationResult(
             score=9.2,
             is_wow=True,
+            role_is_direct_coaching=True,
             summary_uk="Executive коучинг після успішного retry.",
             reasoning="Passed on retry",
             language_requirements=["English"],

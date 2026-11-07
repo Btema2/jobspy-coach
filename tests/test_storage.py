@@ -9,7 +9,7 @@ def test_compute_dedup_hash_normalization():
     # Identical after normalizing casing, corporate suffixes and whitespace
     h1 = compute_dedup_hash("Allegro Sp. z o.o.", "Executive Coach ", "Warsaw, Poland")
     h2 = compute_dedup_hash("allegro", "executive coach", "warsaw, poland")
-    h3 = compute_dedup_hash("Allegro LLC", "EXECUTIVE  COACH", "Warsaw Poland")
+    h3 = compute_dedup_hash("Allegro LLC", "EXECUTIVE  COACH", "WARSAW,  POLAND")
     assert h1 == h2 == h3
 
     # Different title should produce different hash

@@ -77,7 +77,8 @@
     "location": "Remote, Europe",
     "is_remote": true,
     "description": "Skillbridge Academy is an online education company helping adult learners move into new careers. As a Career Coach you will run weekly one-on-one video sessions with students, help them clarify goals, build resumes and prepare for interviews using a non-directive, client-centred coaching approach. You will track progress, hold learners accountable and celebrate milestones. Requirements: a recognised coaching qualification or psychology background, strong listening skills and professional English. Flexible part-time hours are available.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": true
   },
   {
     "id": "relevant-associate-coach-platform",
@@ -87,7 +88,8 @@
     "location": "Remote, Global",
     "is_remote": true,
     "description": "MindPath is a digital coaching platform serving employees of large organisations. We are expanding our network of associate coaches who deliver confidential one-to-one wellbeing and personal development sessions by video. You will support clients with stress management, work-life balance and career transitions following professional coaching standards and ethics. Applicants should hold a recognised coaching credential, have logged coaching hours, and be fluent in English. You choose your own availability.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": true
   },
   {
     "id": "relevant-corporate-ld-specialist",
@@ -97,7 +99,8 @@
     "location": "Dublin, Ireland",
     "is_remote": false,
     "description": "Aurora Financial Services is looking for a Learning and Development Specialist to design and deliver internal training programmes for around 800 employees. You will assess training needs with line managers, run workshops on communication and soft skills, coordinate external trainers, maintain the learning management system and measure programme impact. Experience in corporate training or HR development is required, a background in psychology or coaching is an advantage. Hybrid working, three days in the office.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": false
   },
   {
     "id": "relevant-career-advisor-university",
@@ -107,7 +110,8 @@
     "location": "Manchester, United Kingdom",
     "is_remote": false,
     "description": "The Careers Service at Riverside University is recruiting a Career Advisor to support students and recent graduates. You will deliver individual guidance appointments, run CV and interview workshops, help students explore career options and connect them with employers. We are looking for someone with excellent interpersonal skills, knowledge of the labour market and a qualification in career guidance, counselling or coaching. Experience of working with diverse and international student groups is welcome.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": true
   },
   {
     "id": "relevant-corporate-psychologist",
@@ -117,7 +121,8 @@
     "location": "Prague, Czechia",
     "is_remote": false,
     "description": "Vertex Logistics Group is hiring a Corporate Psychologist to strengthen employee wellbeing across our European offices. You will provide confidential one-to-one psychological support and short coaching conversations to staff, run workshops on stress resilience and communication, advise managers on team climate and support return-to-work plans after long absences. A university degree in psychology is required; coaching or counselling training is a strong plus. Hybrid arrangement with occasional remote days.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": true
   },
   {
     "id": "relevant-talent-development-specialist",
@@ -127,7 +132,8 @@
     "location": "Remote, Europe",
     "is_remote": true,
     "description": "Helix Consumer Brands is building a talent development team and needs a Talent Development Specialist to support employee growth. You will run career conversations, coordinate mentoring and internal coaching programmes, help managers create individual development plans, organise training calendars and report on participation and satisfaction. We value empathy, facilitation skills and a solid understanding of adult learning. Experience in HR, coaching or psychology is welcome. Fully remote within Europe.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": false
   },
   {
     "id": "relevant-internal-coach-people-team",
@@ -137,6 +143,7 @@
     "location": "Brussels, Belgium",
     "is_remote": false,
     "description": "Tandem Health Network is creating an internal coaching service for its staff and is looking for an Internal Coach in the People and Culture team. You will hold confidential one-to-one coaching sessions with employees on career development, resilience and work-life balance, maintain coaching records, and organise short group sessions on personal effectiveness. A recognised coaching qualification and the ability to work in English are required. Hybrid working with two office days per week.",
-    "expected": {"min": 6.0, "max": 10.0}
+    "expected": {"min": 6.0, "max": 10.0},
+    "direct_coaching": true
   }
 ]

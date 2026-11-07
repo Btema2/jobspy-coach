@@ -6,7 +6,7 @@ import time
 import pytest
 
 from src.evaluator import chain as chain_module
-from src.evaluator.chain import ProviderChainEvaluator
+from src.evaluator.chain import DIGEST_MAX_SCORE, ProviderChainEvaluator
 from src.evaluator.circuit_breaker import CircuitBreaker
 from src.evaluator.errors import (
     AuthenticationFailed,
@@ -535,7 +535,7 @@ def evaluate(job=None, bonus_enabled=True, **overrides):
 
 
 def test_score_clamped_into_range():
-    assert evaluate(score=14).score == 10.0
+    assert evaluate(score=14, role_is_direct_coaching=True).score == 10.0
     assert evaluate(score=-3, hard_reject=False).score <= 2.0
 
 
@@ -563,7 +563,9 @@ def test_persona_without_bonus_section_ignores_flag(monkeypatch):
 
 def test_persona_with_bonus_section_applies_bonus(monkeypatch):
     persona = "- Domain: Coaching\n\n## Bonus criteria\n- Something valued"
-    chain = _chain_from_persona(monkeypatch, persona, payload(score=7.0, matches_bonus_criteria=True))
+    chain = _chain_from_persona(
+        monkeypatch, persona, payload(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True)
+    )
     assert chain.evaluate_job(make_job()).score == 8.5
 
 
@@ -578,7 +580,10 @@ def test_explicit_kwarg_wins_over_persona(monkeypatch):
     off = ProviderChainEvaluator([FakeProvider("nim", [payload(score=7.0, matches_bonus_criteria=True)])], bonus_enabled=False)
     assert off.evaluate_job(make_job()).score == 7.0
     monkeypatch.setattr(chain_module, "load_candidate_persona", lambda: None)
-    on = ProviderChainEvaluator([FakeProvider("nim", [payload(score=7.0, matches_bonus_criteria=True)])], bonus_enabled=True)
+    on = ProviderChainEvaluator(
+        [FakeProvider("nim", [payload(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True)])],
+        bonus_enabled=True,
+    )
     assert on.evaluate_job(make_job()).score == 8.5
 
 
@@ -588,7 +593,7 @@ def test_explicit_system_prompt_without_kwarg_disables_bonus():
 
 
 def test_bonus_capped_at_ten():
-    assert evaluate(score=9.0, matches_bonus_criteria=True).score == 10.0
+    assert evaluate(score=9.0, matches_bonus_criteria=True, role_is_direct_coaching=True).score == 10.0
 
 
 def test_bonus_gate_blocks_mediocre_base():
@@ -597,7 +602,7 @@ def test_bonus_gate_blocks_mediocre_base():
 
 
 def test_bonus_applied_once_only():
-    assert evaluate(score=7.0, matches_bonus_criteria=True).score == 8.5
+    assert evaluate(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True).score == 8.5
 
 
 def test_no_bonus_flag_no_change():
@@ -632,7 +637,7 @@ def test_title_safety_net_ignores_bonus():
 
 
 def test_title_safety_net_leaves_clean_titles_alone():
-    assert evaluate(job=make_job(title="Career Coach"), score=9.0).score == 9.0
+    assert evaluate(job=make_job(title="Career Coach"), score=9.0, role_is_direct_coaching=True).score == 9.0
 
 
 def test_title_safety_net_does_not_raise_low_scores():
@@ -816,3 +821,56 @@ def test_parse_errors_do_not_embed_model_output():
     with pytest.raises(InvalidResponse) as exc_info:
         ProviderChainEvaluator._parse(f'["{marker}"]')
     assert marker not in str(exc_info.value)
+
+
+# ---------- WOW only for direct coaching ----------
+
+
+def test_non_direct_coaching_raw_nine_is_capped_at_digest_max():
+    result = evaluate(score=9.0, role_is_direct_coaching=False)
+    assert result.score == DIGEST_MAX_SCORE == 8.4
+
+
+def test_non_direct_coaching_bonus_cannot_lift_past_digest_max():
+    result = evaluate(score=8.0, matches_bonus_criteria=True, role_is_direct_coaching=False)
+    assert result.score == 8.4
+
+
+def test_non_direct_coaching_below_cap_is_unchanged():
+    assert evaluate(score=7.0, role_is_direct_coaching=False).score == 7.0
+    assert evaluate(score=6.0, matches_bonus_criteria=True, role_is_direct_coaching=False).score == 7.5
+
+
+def test_direct_coaching_with_bonus_reaches_wow_band():
+    result = evaluate(score=8.0, matches_bonus_criteria=True, role_is_direct_coaching=True)
+    assert result.score == 9.5
+
+
+def test_direct_coaching_is_not_capped():
+    assert evaluate(score=9.0, role_is_direct_coaching=True).score == 9.0
+
+
+def test_hard_reject_still_wins_over_direct_coaching():
+    result = evaluate(score=9.0, hard_reject=True, role_is_direct_coaching=True, matches_bonus_criteria=True)
+    assert result.score == 2.0
+
+
+def test_missing_direct_coaching_flag_is_treated_as_false_and_capped():
+    data = json.loads(payload(score=9.2))
+    del data["role_is_direct_coaching"]
+    result = make_chain(FakeProvider("nim", [json.dumps(data)])).evaluate_job(make_job())
+    assert result.role_is_direct_coaching is False
+    assert result.score == 8.4
+
+
+def test_cap_is_logged_with_title_raw_and_final_score(caplog):
+    with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
+        evaluate(job=make_job(title="Training Lead"), score=9.0, role_is_direct_coaching=False)
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+    assert any("Training Lead" in m and "9.0" in m and "8.4" in m for m in messages)
+
+
+def test_cap_is_silent_when_it_does_not_bite(caplog):
+    with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
+        evaluate(score=7.0, role_is_direct_coaching=False)
+    assert not any("capped" in r.getMessage().lower() for r in caplog.records)

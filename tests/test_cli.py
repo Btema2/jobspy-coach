@@ -198,3 +198,34 @@ def test_main_entrypoint(monkeypatch):
     assert exc.value.code == 0
     assert mock_start.called
 
+
+def test_cli_rehash_command(monkeypatch):
+    mock_rehash = MagicMock(return_value={"total": 5, "rehashed": 3, "merged": 1, "kept_twins": 0})
+    monkeypatch.setattr("src.storage.db.Database.rehash_all", mock_rehash)
+
+    result = runner.invoke(app, ["rehash"])
+
+    assert result.exit_code == 0
+    mock_rehash.assert_called_once_with(dry_run=False)
+    assert "merged" in result.stdout.lower()
+
+
+def test_cli_rehash_dry_run_flag(monkeypatch):
+    mock_rehash = MagicMock(return_value={"total": 5, "rehashed": 3, "merged": 1, "kept_twins": 0})
+    monkeypatch.setattr("src.storage.db.Database.rehash_all", mock_rehash)
+
+    result = runner.invoke(app, ["rehash", "--dry-run"])
+
+    assert result.exit_code == 0
+    mock_rehash.assert_called_once_with(dry_run=True)
+
+
+def test_cli_cleanup_empty_deletes_empty_description_stubs(monkeypatch):
+    mock_delete = MagicMock(return_value=4)
+    monkeypatch.setattr("src.storage.db.Database.delete_empty_description_jobs", mock_delete)
+
+    result = runner.invoke(app, ["cleanup-empty"])
+
+    assert result.exit_code == 0
+    mock_delete.assert_called_once_with("linkedin")
+    assert "4" in result.stdout
