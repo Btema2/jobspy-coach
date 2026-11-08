@@ -154,25 +154,45 @@ def test_country_agnostic_boards_run_without_country_and_get_no_country_kwarg(mo
 
 def test_indeed_passes_hours_old_and_remote_together(mock_scrape):
     """python-jobspy >= 1.4 ANDs the Indeed filters (verified live), so no filter group is dropped."""
-    _scraper(hours_old=48).scrape_board("indeed", _query(is_remote=True))
+    _scraper(hours_old=720).scrape_board("indeed", _query(is_remote=True))
     kwargs = mock_scrape.call_args.kwargs
-    assert kwargs["hours_old"] == 48
+    assert kwargs["hours_old"] == 720
     assert kwargs["is_remote"] is True
 
 
-def test_indeed_remote_strips_double_quotes_from_search_term(mock_scrape):
-    _scraper().scrape_board("indeed", _query(search_term='"Career Coach"', is_remote=True))
+@pytest.mark.parametrize("is_remote", [True, False])
+def test_indeed_always_strips_double_quotes_from_search_term(mock_scrape, is_remote):
+    _scraper().scrape_board("indeed", _query(search_term='"Career  Coach"', is_remote=is_remote))
     assert mock_scrape.call_args.kwargs["search_term"] == "Career Coach"
 
 
-def test_indeed_non_remote_keeps_quoted_phrase(mock_scrape):
-    _scraper().scrape_board("indeed", _query(search_term='"Career Coach"', is_remote=False))
+def test_indeed_strips_quotes_inside_a_term(mock_scrape):
+    _scraper().scrape_board("indeed", _query(search_term='"Career" Coach', is_remote=False))
+    assert mock_scrape.call_args.kwargs["search_term"] == "Career Coach"
+
+
+@pytest.mark.parametrize("board", ["linkedin", "google"])
+@pytest.mark.parametrize("is_remote", [True, False])
+def test_other_boards_keep_quoted_search_term(mock_scrape, board, is_remote):
+    q = _query(search_term='"Career Coach"', is_remote=is_remote, site_names=[board], country_code=None)
+    _scraper().scrape_board(board, q)
     assert mock_scrape.call_args.kwargs["search_term"] == '"Career Coach"'
 
 
-def test_other_boards_keep_quoted_search_term_with_remote(mock_scrape):
-    _scraper().scrape_board("linkedin", _query(search_term='"Career Coach"', is_remote=True, site_names=["linkedin"]))
-    assert mock_scrape.call_args.kwargs["search_term"] == '"Career Coach"'
+def test_indeed_hours_old_has_a_168h_floor(mock_scrape):
+    _scraper(hours_old=48).scrape_board("indeed", _query())
+    assert mock_scrape.call_args.kwargs["hours_old"] == 168
+
+
+def test_indeed_hours_old_keeps_a_wider_window(mock_scrape):
+    _scraper(hours_old=720).scrape_board("indeed", _query())
+    assert mock_scrape.call_args.kwargs["hours_old"] == 720
+
+
+@pytest.mark.parametrize("board", ["linkedin", "google"])
+def test_other_boards_hours_old_unchanged(mock_scrape, board):
+    _scraper(hours_old=48).scrape_board(board, _query(site_names=[board], country_code=None))
+    assert mock_scrape.call_args.kwargs["hours_old"] == 48
 
 
 # ---------------------------------------------------------------- loader

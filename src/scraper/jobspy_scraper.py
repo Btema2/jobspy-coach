@@ -34,6 +34,10 @@ TRACKING_QUERY_PARAMS = {
 # Boards whose python-jobspy scraper is bound to a country (the ``country_indeed`` argument).
 COUNTRY_BOUND_BOARDS = {"indeed", "glassdoor"}
 
+# Narrow windows starve niche Indeed queries (live: 8 rows at 48h vs 10 at 168h+); dedup hashes make
+# re-seen postings harmless, so Indeed never uses a window shorter than this.
+INDEED_MIN_HOURS_OLD = 168
+
 
 def build_google_search_term(query: SearchQuery, hours_old: int) -> str:
     """Builds the Google Jobs query string (same shape python-jobspy documents:
@@ -159,16 +163,20 @@ class JobSpyScraper:
     def _build_scrape_kwargs(self, site_name: str, query: SearchQuery) -> dict:
         board = site_name.lower()
         search_term = query.search_term
-        if board == "indeed" and query.is_remote and '"' in search_term:
-            # Indeed returns 0 rows for a quoted phrase combined with the remote filter (verified live).
-            search_term = " ".join(search_term.replace('"', " ").split())
+        hours_old = self.hours_old
+        if board == "indeed":
+            # Quoted phrases cut Indeed's yield 5-8x even without the remote filter, and to 0 with it
+            # (verified live), so quotes are always stripped for Indeed (other boards keep them).
+            if '"' in search_term:
+                search_term = " ".join(search_term.replace('"', " ").split())
+            hours_old = max(self.hours_old, INDEED_MIN_HOURS_OLD)
 
         kwargs: dict = {
             "site_name": [site_name],
             "search_term": search_term,
             "location": query.location,
             "results_wanted": self.results_per_query,
-            "hours_old": self.hours_old,
+            "hours_old": hours_old,
             "is_remote": query.is_remote,
             "proxies": self.proxies,
             "fetch_description": self.fetch_description,
