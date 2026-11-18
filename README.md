@@ -62,12 +62,12 @@ The daemon operates autonomously around the clock, continuously scraping configu
    - Evaluates vacancies against the target candidate persona through a **provider chain**: NVIDIA NIM first, then OpenRouter (pinned free models) as fallback.
    - Worker threads (`EVAL_MAX_WORKERS`) evaluate jobs concurrently while a sliding-window limiter caps NIM at `NVIDIA_RPM_LIMIT` requests per minute (default 30) **per process**.
    - Per-call retry with backoff, a circuit breaker per provider, and an OpenRouter daily budget. If every provider fails, the job simply stays `unprocessed` and is retried next cycle (`EVAL_MAX_ATTEMPTS` bounds repeated job-specific failures).
-   - Generates scores from 1.0 to 10.0, concise executive summaries (`summary_uk`), rationale (`reasoning`), extracted language requirements, and pros/cons. Hard-reject and bonus-criteria adjustments are applied in code, not by the model; the model that actually answered is stored per job (`eval_model`). The language of `summary_uk` is set by the output language stated in your persona (English if none is stated). The persona lives in the stored profile: a legacy `.candidate_profile.md` is imported once, and later edits to that file no longer change scoring (change the profile with `profile export` / `profile import`). The bonus only applies when the profile has bonus criteria (imported from a "Bonus criteria" section or a line mentioning "bonus"); without them the model's bonus flag is ignored. The bonus switch is fixed when the daemon first builds its evaluator, so restart the daemon after a profile change that adds or removes bonus criteria. The model sets the bonus flag only when the posting text itself asks for or values a bonus criterion. WOW requires direct coaching: roles that are not flagged `role_is_direct_coaching` (corporate trainer, L&D, leadership-development and programme roles) are capped at 8.4 after the bonus, so they land in the digest, never in an instant alert.
+   - Generates scores from 1.0 to 10.0, concise executive summaries (`summary`), rationale (`reasoning`), extracted language requirements, and pros/cons. Hard-reject and bonus adjustments are applied in code, not by the model; the model that actually answered is stored per job (`eval_model`). The scoring rubric is a template filled from your stored profile: the persona, the core-role and adjacent-role definitions, the dealbreakers, the bonus criteria and points, the output language and the WOW / digest thresholds all live in the profile and are applied per cycle, so a profile change takes effect on the next cycle without restarting the daemon. The persona lives in the stored profile: a legacy `.candidate_profile.md` is imported once, and later edits to that file no longer change scoring (change the profile with `profile export` / `profile import`). The bonus applies only when the profile has bonus criteria; the model sets the bonus flag only when the posting text itself asks for or values one. WOW requires a core role (the profile's core-role definition): other roles are capped just below the WOW threshold (8.4 with the default threshold) after the bonus, so they land in the digest, never in an instant alert; with no core-role definition the cap is off. Without a stored profile the fallback prompt is built from `.candidate_profile.md` and the bonus is off, even if that prompt still lists bonus criteria. Models that answer with the older `summary_uk` / `role_is_direct_coaching` keys are still accepted.
 
 5. **Two-Tier Telegram Dispatching**:
-   - **Instant WOW Alerts**: Vacancies whose final score is $\ge 8.5$ (`WOW_SCORE_THRESHOLD`; reachable only by direct 1-on-1 coaching / psychological-support roles) trigger immediate Telegram push alerts with inline application buttons. WOW status is derived from the final score by the daemon; the model does not decide it.
-   - **Daily Morning Digest**: Every day at the configured digest time (`DIGEST_TIME_CET`), qualifying vacancies ($6.5 \le \text{score} < 8.5$) are batched and delivered in formatted digest messages.
-   - **Immediate Low-Score Dismissal**: Vacancies scoring $< 6.5$ (`DIGEST_SCORE_THRESHOLD`) are immediately marked `dismissed` to keep queues clean.
+   - **Instant WOW Alerts**: Vacancies whose final score is at or above the profile's WOW threshold (default 8.5; reachable only by core roles, e.g. direct 1-on-1 coaching) trigger immediate Telegram push alerts with inline application buttons. WOW status is derived from the final score by the daemon; the model does not decide it.
+   - **Daily Morning Digest**: Every day at the configured digest time (`DIGEST_TIME_CET`), qualifying vacancies (score from the profile's digest threshold, default 6.5, up) are batched and delivered in formatted digest messages.
+   - **Immediate Low-Score Dismissal**: Vacancies scoring below the profile's digest threshold (default 6.5) are immediately marked `dismissed` to keep queues clean.
    - **Stale Expiration**: Stale pending postings older than 7 days are automatically transitioned to `expired_dismissed`.
    - **Defensive Telegram Safety**: Automatic HTML entity escaping, message chunking ($\le 3,800$ chars), and summary/reasoning length guards ($\le 600$ and $\le 800$ chars) ensure messages never exceed Telegram's 4,096 character limit.
 
@@ -216,8 +216,8 @@ All settings are managed via environment variables (or defined in `.env`) and va
 | `SCRAPER_RESULTS_PER_QUERY` | `10` | Target number of raw postings requested per query from each board (keep below 25 for LinkedIn). |
 | `SCRAPER_ENABLED_BOARDS` | *(all configured)* | Optional comma-separated board allow-list. |
 | `SCRAPER_PROXIES` | *(none)* | Optional comma-separated proxy URLs (needed for LinkedIn on datacenter IPs). |
-| `WOW_SCORE_THRESHOLD` | `8.5` | Minimum final score (1-10) triggering an immediate WOW Telegram alert; additionally requires a direct-coaching role (other roles are capped at 8.4 and never alert instantly, even if this is set lower). |
-| `DIGEST_SCORE_THRESHOLD` | `6.5` | Minimum final score (1-10) for the morning digest; lower scores are dismissed. |
+| `WOW_SCORE_THRESHOLD` | `8.5` | Seed for the profile's WOW threshold at import (legacy import, `init`) and fallback when there is no profile. The live value is the profile's `wow_threshold` (`profile export` / `profile import`). |
+| `DIGEST_SCORE_THRESHOLD` | `6.5` | Seed for the profile's digest threshold at import and fallback when there is no profile. The live value is the profile's `digest_threshold`; lower scores are dismissed. |
 | `DIGEST_MAX_ITEMS` | `10` | Maximum number of top vacancies included in a single daily digest. |
 
 ### LLM Provider Chain
@@ -233,7 +233,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 
 Everything specific to you stays in git-ignored local files and is never committed:
 
-- `.env`: API keys, bot token, thresholds.
+- `.env`: API keys, bot token, and the import seeds for the thresholds (the stored profile's thresholds are what scoring uses).
 - `.candidate_profile.md` (legacy, optional): your private candidate persona. It is only read once, to import it into the stored profile; **after the import the persona lives in the profile in the SQLite database** (`data/jobs.db`, git-ignored; also in its last 10 stored profile versions), and editing the file no longer changes scoring. Edit the profile with `jobspy-coach profile export`, edit the YAML, `jobspy-coach profile import <file>` (a Telegram bot for this is planned). A generic template is used if the profile has no persona. Treat `data/jobs.db` as private data. Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details).
 - `queries.json` (legacy, optional): your former search queries (see `queries.example.json` for the format). It is only read once, to import it into the stored profile (1:1, as pinned queries); afterwards the stored profile is the source of truth and the file is no longer used. Per query, `country_code` is required for Indeed and Glassdoor (they search one country at a time; queries without it skip those boards with a logged warning, e.g. pan-regional "Europe" queries should list only LinkedIn/Google), and the optional `google_search_term` overrides the Google Jobs query string that is otherwise derived as `<search_term> jobs near <location> <time window> [remote]`. Note that Google Jobs currently returns no data to python-jobspy from some networks (it serves a JavaScript challenge page); the scraper logs this once instead of failing silently.
 - `local/profile-export.yaml` (`profile-export*.yaml` is git-ignored): the YAML export of your profile; it contains private data, so `profile export` refuses paths that git would not ignore unless you pass `--force`.
@@ -282,6 +282,7 @@ DIGEST_TIME_CET=09:00
 HOURS_OLD_WINDOW=48
 SCRAPER_RESULTS_PER_QUERY=10
 
+# Import seeds for the profile's thresholds (and the no-profile fallback); the stored profile decides afterwards
 WOW_SCORE_THRESHOLD=8.5
 DIGEST_SCORE_THRESHOLD=6.5
 DIGEST_MAX_ITEMS=10
@@ -306,7 +307,21 @@ jobspy-coach profile preview            # compiled queries, calls per cycle, est
 jobspy-coach profile export             # writes local/profile-export.yaml (--path PATH, --force)
 jobspy-coach profile import FILE.yaml   # validated, versioned (the last 10 versions are kept); prints the diff
 ```
-A paused profile stops scraping only; evaluation and digests continue. Thresholds, rules and role definitions stored in the profile are validated and versioned but not yet used for scoring: scoring still uses the `.env` thresholds.
+A paused profile stops scraping only; evaluation and digests continue. Thresholds, bonus, the non-core cap, role definitions, output language and the title rules stored in the profile are what scoring and the pre-filter use, per cycle; the `.env` thresholds only seed a new profile.
+
+**Title rules.** The profile's rules (`block`, `soft`, `seniority`, `rescue`; plus a seniority table built from your target level) drop titles before any LLM call: block rules always drop, a rescue term saves a soft or seniority hit. User terms are literal words (match mode `exact` or `prefix`, 3 to 60 characters, at most 500 rules); no domain terms ship for a new profile, and an imported legacy setup keeps today's rules. When `profile import` changes a rule, it prints a backtest against your stored job titles (how many would now be dropped or pass, with sample titles); with fewer than 200 stored jobs it says `backtest not meaningful` instead.
+
+Jobs dropped by the rules or dismissed by score keep their dedup hash, so a change never revives them by itself. Use `requeue` for that (see below).
+
+### 0b. `requeue`
+After changing rules or thresholds (stop the daemon first):
+```bash
+jobspy-coach requeue --dry-run              # re-run the rules over pre-filtered jobs, report only
+jobspy-coach requeue                        # jobs that now pass go back to the evaluation queue
+jobspy-coach requeue --thresholds --dry-run # re-score evaluated jobs under the profile thresholds, bonus and cap
+jobspy-coach requeue --thresholds
+```
+`requeue` only revives jobs created in the last 7 days (older ones would expire before any digest; they are counted as `too old`), and jobs with a stub description stay dropped. `requeue --thresholds` makes no LLM call: it recomputes the final score from the stored raw score and flags, skips and counts jobs evaluated before those were stored, never touches jobs that already got an alert or a digest, and never sends an instant alert (a job that now qualifies joins the next digest).
 
 ### 1. `test-telegram`
 Validates Telegram bot token, chat ID, and network connectivity by delivering a verification message.
