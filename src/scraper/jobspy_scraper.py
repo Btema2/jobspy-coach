@@ -9,6 +9,7 @@ import jobspy
 import pandas as pd
 
 from src.filters.pre_filter import classify_title, pre_filter_job
+from src.scraper.outcome import ScrapeOutcome
 from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries
 from src.storage.db import compute_dedup_hash
 from src.storage.models import JobPosting
@@ -285,15 +286,30 @@ class JobSpyScraper:
     def _totals(self, board: str) -> Optional[_BoardTotals]:
         return self._cycle.totals.setdefault(board, _BoardTotals()) if self._cycle else None
 
+    @staticmethod
+    def _board_error(df: Optional[pd.DataFrame], board: str) -> Optional[str]:
+        """The error python-jobspy recorded for ``board`` in ``df.attrs["errors"]``, if any. Keys may be
+        enum-like (``Site.LINKEDIN``), so they are normalised to the lowercase board name."""
+        if not isinstance(df, pd.DataFrame):
+            return None
+        errors = df.attrs.get("errors") or {}
+        for key, err in errors.items():
+            if str(getattr(key, "value", key)).lower() == board and err:
+                return str(err)
+        return None
+
     def scrape_board(self, site_name: str, query: SearchQuery) -> List[JobPosting]:
+        return self.scrape_board_outcome(site_name, query).postings
+
+    def scrape_board_outcome(self, site_name: str, query: SearchQuery) -> ScrapeOutcome:
         board = site_name.lower()
         reason = self.board_skip_reason(site_name, query)
         if reason == "disabled":
             logger.debug("Skipping board '%s' as it is not in enabled_boards", site_name)
-            return []
+            return ScrapeOutcome(postings=[], rows=0, status="skipped", skip_reason="disabled")
         if reason == "no_country":
             self._warn_missing_country_once(site_name, query, 1)
-            return []
+            return ScrapeOutcome(postings=[], rows=0, status="skipped", skip_reason="no_country")
 
         # Every real request is logged here (not in a caller) so that the CLI `scrape`, the daemon and
         # scrape_query/scrape_all_queries, which all end up in scrape_board, show the same progress.
@@ -312,11 +328,13 @@ class JobSpyScraper:
         t0 = time.time()
         df: Optional[pd.DataFrame] = None
         failed = False
+        last_error: Optional[str] = None
         for attempt in range(1, 4):
             try:
                 df = scrape_jobs(**self._build_scrape_kwargs(site_name, query))
                 break
             except Exception as e:
+                last_error = str(e)
                 if attempt < 3:
                     backoff = (2 ** attempt) * 3
                     logger.warning(
@@ -337,7 +355,7 @@ class JobSpyScraper:
                 totals.calls += 1
                 totals.failed += 1
                 totals.seconds += seconds
-            return []
+            return ScrapeOutcome(postings=[], rows=0, status="failed", error=last_error)
 
         if isinstance(df, pd.DataFrame):
             self._warn_board_errors_once(df)
@@ -371,7 +389,22 @@ class JobSpyScraper:
             totals.prefiltered += prefiltered
             totals.skipped_empty += skipped_empty
             totals.seconds += seconds
-        return postings
+
+        board_error = self._board_error(df, board)
+        if board_error and rows == 0:
+            status = "failed"
+        elif rows == 0:
+            status = "empty"
+        else:
+            status = "ok"
+        return ScrapeOutcome(
+            postings=postings,
+            rows=rows,
+            status=status,
+            error=board_error,
+            prefiltered=prefiltered,
+            skipped_empty=skipped_empty,
+        )
 
     def _rows_to_postings(
         self, df: pd.DataFrame, site_name: str, query: SearchQuery

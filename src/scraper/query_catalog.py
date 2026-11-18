@@ -19,6 +19,11 @@ class SearchQuery:
     google_search_term: Optional[str] = None
 
 
+def query_key(query: SearchQuery, board: str) -> str:
+    """Stable identifier of one (query, board) pair, used to key per-query scrape history."""
+    return f"{query.query_id}|{board.lower()}"
+
+
 # Location-neutral defaults. Personal / regional targets belong in the git-ignored queries.json.
 DEFAULT_QUERY_CATALOG: List[SearchQuery] = [
     SearchQuery(
