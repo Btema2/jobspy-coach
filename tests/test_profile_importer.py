@@ -275,10 +275,11 @@ def test_queries_only_import_is_unpaused_with_generic_persona(store: ProfileStor
 
 
 def test_import_thresholds_from_settings_and_invalid_fallback():
-    snap, notes = build_imported_snapshot((), "", wow_threshold=8.0, digest_threshold=6.0)
+    queries = (PinnedQuery("Q1", "<ROLE>", "<MARKET>", ("linkedin",)),)
+    snap, notes = build_imported_snapshot(queries, "", wow_threshold=8.0, digest_threshold=6.0)
     assert (snap.fields.wow_threshold, snap.fields.digest_threshold, notes) == (8.0, 6.0, [])
 
-    snap, notes = build_imported_snapshot((), "", wow_threshold=6.0, digest_threshold=7.0)
+    snap, notes = build_imported_snapshot(queries, "", wow_threshold=6.0, digest_threshold=7.0)
     assert (snap.fields.wow_threshold, snap.fields.digest_threshold) == (8.5, 6.5)
     assert len(notes) == 1 and "8.5" in notes[0] and "6.5" in notes[0]
 
@@ -653,3 +654,92 @@ def test_export_refuses_tracked_path_without_force(store: ProfileStore, legacy_d
         export_profile(store, target)
 
     assert target.read_text(encoding="utf-8") == "old"
+
+
+# --- final review fixes ------------------------------------------------------------------------
+
+
+def _write_queries(path: Path, entries: list) -> Path:
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    return path
+
+
+def _entry(query_id: str, **kw) -> dict:
+    base = {"query_id": query_id, "search_term": "<ROLE>", "location": "<MARKET>", "site_names": ["linkedin"]}
+    base.update(kw)
+    return base
+
+
+@pytest.mark.parametrize(
+    "legacy, canonical",
+    [("us", "usa"), ("United States", "usa"), ("united kingdom", "uk"), ("czechia", "czech republic"),
+     ("turkey", "türkiye"), ("UAE", "united arab emirates")],
+)
+def test_legacy_queries_json_with_country_aliases_imports(store: ProfileStore, tmp_path: Path, legacy, canonical):
+    base = tmp_path / "alias"
+    base.mkdir()
+    _write_queries(base / "queries.json", [_entry("Q1", country_code=legacy, site_names=["linkedin", "indeed"])])
+
+    result = _import(store, base)
+
+    assert result is not None
+    snap = store.read_snapshot()
+    assert snap.pinned_queries[0].country == canonical
+
+
+def test_legacy_alias_country_counts_for_glassdoor_support(store: ProfileStore, tmp_path: Path):
+    base = tmp_path / "gd"
+    base.mkdir()
+    _write_queries(base / "queries.json", [_entry("Q1", country_code="united kingdom", site_names=["glassdoor"])])
+
+    result = _import(store, base)
+
+    assert result is not None and not any("glassdoor" in w for w in result.warnings)
+
+
+def test_import_preserves_query_ids_exactly(store: ProfileStore, tmp_path: Path):
+    base = tmp_path / "ids"
+    base.mkdir()
+    ids = [" Q-A ", "Q-b", "q-B"]  # padding kept; case-only twin gets a deterministic distinct id
+    _write_queries(base / "queries.json", [_entry(i) for i in ids])
+
+    result = _import(store, base)
+
+    assert result is not None
+    got = [q.query_id for q in store.read_snapshot().pinned_queries]
+    assert got[0] == " Q-A " and got[1] == "Q-b"
+    assert got[2] != "q-B" and got[2].casefold() != "q-b" and got[2].startswith("q-B")
+    assert len({g.casefold() for g in got}) == 3
+    assert any("q-B" in w for w in result.warnings)  # the renamed id is reported
+
+
+def test_case_twin_disambiguation_is_deterministic_and_avoids_existing_ids():
+    queries = [PinnedQuery(i, "<ROLE>", "<MARKET>", ("linkedin",)) for i in ("A", "a", "a~2", "a")]
+    snap1, notes1 = build_imported_snapshot(queries, "", wow_threshold=8.5, digest_threshold=6.5)
+    snap2, _ = build_imported_snapshot(queries, "", wow_threshold=8.5, digest_threshold=6.5)
+
+    ids = [q.query_id for q in snap1.pinned_queries]
+    assert ids == [q.query_id for q in snap2.pinned_queries]
+    assert ids[0] == "A" and ids[2] == "a~2"  # non-colliding / first ids unchanged
+    assert len({i.casefold() for i in ids}) == 4
+    assert len(notes1) == 2
+
+
+def test_persona_without_queries_prints_a_paused_note(store: ProfileStore, tmp_path: Path):
+    base = tmp_path / "note"
+    base.mkdir()
+    (base / ".candidate_profile.md").write_text("<PERSONA>\n", encoding="utf-8")
+
+    result = _import(store, base)
+
+    assert any("paused" in w and "no search queries" in w for w in result.warnings)
+
+
+def test_estimate_is_computed_after_normalising_boards():
+    entries = [PinnedQuery(f"Q{i}", "<ROLE>", "<MARKET>", ("LinkedIn ", "INDEED"), country="Poland")
+               for i in range(60)]  # 120 calls once normalised
+
+    snap, notes = build_imported_snapshot(entries, "", wow_threshold=8.5, digest_threshold=6.5)
+
+    assert snap.fields.max_calls_per_cycle == 120
+    assert any("max_calls_per_cycle raised to 120" in n for n in notes)

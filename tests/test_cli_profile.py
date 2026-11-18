@@ -191,6 +191,7 @@ def test_profile_export_default_path(tmp_path):
     assert (tmp_path / "local" / "profile-export.yaml").is_file()
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_profile_export_refuses_unignored_path_in_git_repo(tmp_path):
     _legacy_queries(tmp_path)
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
@@ -224,7 +225,7 @@ roles:
 markets:
   - name: "<MARKET>"
     location: "<MARKET>"
-    countries: ["poland"]
+    countries: ["usa"]
     languages: ["en"]
 """
 
@@ -261,3 +262,86 @@ def test_profile_import_missing_file_exits_nonzero(tmp_path):
 
     assert result.exit_code == 1
     assert "nope.yaml" in result.output
+
+
+# --- final review fixes ------------------------------------------------------------------------
+
+
+def test_init_with_invalid_env_thresholds_falls_back_with_a_note(isolated, monkeypatch):
+    from src.config import get_settings
+
+    monkeypatch.setenv("WOW_SCORE_THRESHOLD", "5.0")
+    monkeypatch.setenv("DIGEST_SCORE_THRESHOLD", "9.0")
+    get_settings.cache_clear()
+
+    result = runner.invoke(app, ["init"])
+
+    assert result.exit_code == 0, result.output
+    snapshot = _store(isolated).read_snapshot()
+    assert (snapshot.fields.wow_threshold, snapshot.fields.digest_threshold) == (8.5, 6.5)
+    assert "8.5" in result.output and "6.5" in result.output
+
+
+def test_persona_only_legacy_import_prints_paused_note(tmp_path):
+    (tmp_path / ".candidate_profile.md").write_text("<PERSONA>\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["stats"])
+
+    assert result.exit_code == 0, result.output
+    assert "Imported legacy profile" in result.output
+    assert "paused" in result.output and "no search queries" in result.output
+
+
+def test_preview_escapes_markup_in_user_text(tmp_path, isolated):
+    entries = [{"query_id": "Q-[/x]", "search_term": "<ROLE> [/y]", "location": "<M> [bold]",
+                "site_names": ["linkedin"]}]
+    (tmp_path / "queries.json").write_text(json.dumps(entries), encoding="utf-8")
+
+    result = runner.invoke(app, ["profile", "preview"])
+
+    assert result.exit_code == 0, result.output
+    assert "Q-[/x]" in result.output and "[/y]" in result.output
+
+
+def test_profile_export_oserror_is_a_one_line_message(tmp_path):
+    _legacy_queries(tmp_path)
+    (tmp_path / "adir").mkdir()
+
+    result = runner.invoke(app, ["profile", "export", "--path", str(tmp_path / "adir")])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "cannot write" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+@pytest.mark.parametrize("args", [["--help"], ["init", "--help"], ["profile", "--help"], ["profile", "preview", "--help"]])
+def test_help_does_not_touch_the_database_or_import(tmp_path, isolated, args):
+    _legacy_queries(tmp_path)
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert not isolated.exists()
+
+
+def test_concurrent_init_loser_reports_already_exists(isolated, monkeypatch):
+    from src.profile.errors import VersionConflict
+
+    real = ProfileStore.read_snapshot
+    calls = {"n": 0}
+
+    def racing(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # init's pre-check sees no profile ...
+        return real(self)
+
+    monkeypatch.setattr(ProfileStore, "read_snapshot", racing)
+    runner.invoke(app, ["init"])  # ... but a concurrent init has created it by now
+    calls["n"] = 0
+
+    result = runner.invoke(app, ["init"])
+
+    assert result.exit_code == 0, result.output
+    assert "already exists" in result.output

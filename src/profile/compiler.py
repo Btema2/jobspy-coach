@@ -38,6 +38,24 @@ KNOWN_COUNTRIES = frozenset({
     "usa", "venezuela", "vietnam",
 })
 
+# python-jobspy 1.4.0 `country_aliases` (guarded by a test against the installed package): spellings the
+# library resolves to a canonical `Country` value. They are normalised to the canonical value on write.
+COUNTRY_ALIASES = {
+    "czechia": "czech republic",
+    "turkey": "türkiye",
+    "uae": "united arab emirates",
+    "united kingdom": "uk",
+    "us": "usa",
+    "united states": "usa",
+}
+
+
+def canonical_country(value: str) -> str:
+    """Trimmed, lower-cased country with python-jobspy's aliases mapped to the canonical value."""
+    name = value.strip().lower()
+    return COUNTRY_ALIASES.get(name, name)
+
+
 GLASSDOOR_COUNTRIES = frozenset({
     "argentina", "australia", "austria", "belgium", "brazil", "canada", "france", "germany", "hong kong",
     "india", "ireland", "italy", "malaysia", "mexico", "netherlands", "new zealand", "singapore", "spain",

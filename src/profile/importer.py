@@ -32,7 +32,8 @@ from src.profile.ops import (
     ApplyResult,
     ReplaceProfile,
     apply_changes,
-    threshold_problems,
+    normalise_snapshot,
+    resolve_thresholds,
 )
 from src.profile.snapshot import (
     PinnedQuery,
@@ -44,8 +45,6 @@ from src.profile.snapshot import (
 from src.profile.store import ProfileStore
 
 DEFAULT_EXPORT_PATH = Path("local/profile-export.yaml")
-FALLBACK_WOW_THRESHOLD = 8.5
-FALLBACK_DIGEST_THRESHOLD = 6.5
 DEFAULT_MAX_CALLS = 100
 
 _QUERIES_CANDIDATES = ("queries.json", "config/queries.json")
@@ -164,6 +163,29 @@ def extract_bonus_criteria(persona: str) -> str:
     return "\n".join(line.rstrip() for line in lines if "bonus" in line.lower())
 
 
+def _distinct_query_ids(queries: Sequence[PinnedQuery], notes: List[str]) -> Tuple[PinnedQuery, ...]:
+    """Keep every ``query_id`` exactly as written; case-only twins (valid in a legacy file, but ops treats
+    ids case-insensitively) get a deterministic ``~N`` suffix. Ids that do not collide never change."""
+    taken = {q.query_id.casefold() for q in queries}
+    seen: set = set()
+    result: List[PinnedQuery] = []
+    for q in queries:
+        folded = q.query_id.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            result.append(q)
+            continue
+        n = 2
+        while f"{q.query_id}~{n}".casefold() in taken:
+            n += 1
+        new_id = f"{q.query_id}~{n}"
+        taken.add(new_id.casefold())
+        seen.add(new_id.casefold())
+        notes.append(f"query_id '{q.query_id}' differs only by case from an earlier query; imported as '{new_id}'")
+        result.append(replace(q, query_id=new_id))
+    return tuple(result)
+
+
 def build_imported_snapshot(
     queries: Sequence[PinnedQuery],
     persona: str,
@@ -181,13 +203,15 @@ def build_imported_snapshot(
             f"{prefix} is {len(persona)} characters; the limit is {MAX_TEXT_CHARS}. "
             "Shorten it and run again."
         )
-    if threshold_problems(wow_threshold, digest_threshold):
+    wow_threshold, digest_threshold, threshold_note = resolve_thresholds(wow_threshold, digest_threshold)
+    if threshold_note:
+        notes.append(threshold_note)
+    queries = _distinct_query_ids(queries, notes)
+    if not queries:
         notes.append(
-            f"thresholds wow={wow_threshold:g} / digest={digest_threshold:g} are not valid "
-            f"(need 3.0 < digest <= wow - 0.1 and wow <= 10); using {FALLBACK_WOW_THRESHOLD:g} and "
-            f"{FALLBACK_DIGEST_THRESHOLD:g}"
+            "the profile has no search queries, so it starts paused (no scraping); add roles and "
+            "markets: `jobspy-coach profile export`, edit the file, `jobspy-coach profile import <file>`"
         )
-        wow_threshold, digest_threshold = FALLBACK_WOW_THRESHOLD, FALLBACK_DIGEST_THRESHOLD
     fields = ProfileFields(
         persona=persona,
         core_role_definition=LEGACY_CORE_ROLE_DEFINITION,
@@ -202,7 +226,7 @@ def build_imported_snapshot(
     )
     snapshot = ProfileSnapshot(fields, pinned_queries=tuple(queries), rules=seed_rules())
     try:
-        calls = compile_profile(snapshot).estimate.total_calls
+        calls = compile_profile(normalise_snapshot(snapshot)).estimate.total_calls
     except ProfileCompileError:
         calls = 0  # reported with the file's own wording by validation when the import is applied
     if calls > DEFAULT_MAX_CALLS:

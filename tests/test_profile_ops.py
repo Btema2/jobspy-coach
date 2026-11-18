@@ -714,3 +714,57 @@ def test_restore_only_maps_a_missing_version_to_a_validation_error(started: Prof
 
     with pytest.raises(KeyError):
         restore(started, 1)
+
+
+# --- country aliases accepted by python-jobspy -------------------------------------------------
+
+
+def _jobspy_country_inputs():
+    from jobspy.model import Country, country_aliases
+
+    canonical = [c.value for c in Country]
+    return canonical, dict(country_aliases)
+
+
+def test_every_jobspy_country_alias_and_value_is_accepted_and_normalised(started: ProfileStore):
+    canonical, aliases = _jobspy_country_inputs()
+    from jobspy.model import Country
+
+    spellings = list(canonical) + list(aliases)
+    assert {"us", "united states", "united kingdom", "czechia", "turkey", "uae"} <= set(aliases)
+    for spelling in spellings:
+        for variant in (spelling, spelling.upper(), f" {spelling} "):
+            expected = Country(spelling).value  # what the scraper / python-jobspy resolves it to
+            apply_changes(
+                started,
+                [AddPinnedQuery(_pinned(query_id="Q-ALIAS", country=variant)),
+                 AddMarket(_market(name="<M-ALIAS>", countries=(variant,)))],
+                label="alias",
+            )
+            snap = started.read_snapshot()
+            assert snap.pinned_queries[0].country == expected, variant
+            assert snap.markets[0].countries == (expected,), variant
+            apply_changes(started, [RemovePinnedQuery("Q-ALIAS"), RemoveMarket("<M-ALIAS>")], label="clean")
+
+
+def test_alias_table_equals_the_installed_jobspy_aliases():
+    from jobspy.model import country_aliases
+    from src.profile.compiler import COUNTRY_ALIASES
+
+    assert COUNTRY_ALIASES == country_aliases
+
+
+def test_query_id_is_not_stripped_by_normalisation(started: ProfileStore):
+    apply_changes(started, [AddPinnedQuery(_pinned(query_id=" Q-SP "))], label="x")
+
+    snap = started.read_snapshot()
+    assert snap is not None and snap.pinned_queries[0].query_id == " Q-SP "
+
+
+def test_starter_profile_with_invalid_thresholds_falls_back_with_a_note(store: ProfileStore):
+    result = create_starter_profile(store, wow_threshold=5.0, digest_threshold=9.0)
+
+    snap = store.read_snapshot()
+    assert snap is not None
+    assert (snap.fields.wow_threshold, snap.fields.digest_threshold) == (8.5, 6.5)
+    assert any("8.5" in w and "6.5" in w for w in result.warnings)

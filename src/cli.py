@@ -2,6 +2,7 @@ import importlib.metadata
 from pathlib import Path
 from typing import Optional
 import typer
+from typer.core import TyperGroup
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -16,6 +17,7 @@ from src.profile.errors import (
     ProfileCompileError,
     ProfileError,
     ProfileValidationError,
+    VersionConflict,
 )
 from src.profile.importer import DEFAULT_EXPORT_PATH, auto_import, export_profile, load_profile_yaml
 from src.profile.ops import ReplaceProfile, apply_changes, create_starter_profile
@@ -24,7 +26,18 @@ from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
 
-app = typer.Typer(help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
+_SUBCOMMAND_ARGS = "jobspy_coach.subcommand_args"
+
+
+class _RecordingGroup(TyperGroup):
+    """Remembers the arguments of the subcommand: Click only parses them after the group callback ran."""
+
+    def resolve_command(self, ctx, args):
+        ctx.meta[_SUBCOMMAND_ARGS] = list(args)
+        return super().resolve_command(ctx, args)
+
+
+app = typer.Typer(cls=_RecordingGroup, help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
 console = Console()
 
 configure_logging()
@@ -62,9 +75,16 @@ _LEGACY_HINT = (
 )
 
 
+def _help_requested(ctx: typer.Context) -> bool:
+    """True when the remaining arguments ask for help (`<command> --help`): no database work for that."""
+    return ctx.resilient_parsing or "--help" in ctx.meta.get(_SUBCOMMAND_ARGS, [])
+
+
 @app.callback()
-def main() -> None:
+def main(ctx: typer.Context) -> None:
     """Open the database and import the legacy queries.json / .candidate_profile.md once, before any command."""
+    if _help_requested(ctx):
+        return
     settings = get_settings()
     store = _profile_store()
     try:
@@ -117,9 +137,18 @@ def init() -> None:
             wow_threshold=settings.wow_score_threshold,
             digest_threshold=settings.digest_score_threshold,
         )
+    except VersionConflict:  # a concurrent `init` (or import) won the race
+        current = store.read_snapshot()
+        console.print(
+            f"Profile already exists (version {current.version if current else '?'}); nothing to do.",
+            markup=False,
+        )
+        return
     except ProfileError as exc:
         raise _fail_profile_error(exc) from None
     console.print(f"Created an empty starter profile (version {result.version}); it is paused.", markup=False)
+    for note in result.warnings:
+        console.print(f"- {note}", style="yellow", markup=False, highlight=False)
     console.print(
         "Fill it in: run `jobspy-coach profile export`, edit the YAML file, then run "
         "`jobspy-coach profile import <file>`.",
@@ -148,11 +177,11 @@ def profile_preview() -> None:
     table.add_column("Remote")
     for q in compiled.queries:
         table.add_row(
-            q.query_id,
+            escape(q.query_id),
             escape(q.search_term),
             escape(q.location),
-            q.country_code or "-",
-            ", ".join(q.site_names),
+            escape(q.country_code or "-"),
+            escape(", ".join(q.site_names)),
             "yes" if q.is_remote else "no",
         )
     console.print(table)
@@ -181,6 +210,8 @@ def profile_export(
         written = export_profile(store, path, force=force)
     except ProfileError as exc:  # includes ExportRefused
         raise _fail(str(exc)) from None
+    except OSError as exc:
+        raise _fail(f"cannot write {path} ({type(exc).__name__}: {exc.strerror or 'error'})") from None
     console.print(f"Exported the profile to {written} (private data, file mode 0600).", markup=False)
 
 

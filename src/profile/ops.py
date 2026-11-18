@@ -4,7 +4,8 @@ Every change is "read snapshot -> pure operations -> normalise -> validate (incl
 write the whole snapshot in one transaction guarded by an optimistic version check". Nothing is written
 when validation fails. ``validate_snapshot`` is pure and strict (it does not normalise); ``apply_changes``
 normalises text that has one obvious canonical form (case and surrounding spaces of countries, languages
-and board names) before validating, so a value such as ``"USA "`` is stored as ``"usa"`` while a typo such
+and board names; python-jobspy country aliases such as ``us`` map to their canonical value; ``query_id`` is
+never changed, because it is part of the stored scrape keys) before validating, so a value such as ``"USA "`` is stored as ``"usa"`` while a typo such
 as ``"polnad"`` is rejected instead of silently losing the country-bound boards.
 """
 import math
@@ -17,6 +18,7 @@ from src.profile.compiler import (
     RULE_KINDS,
     RULE_MODES,
     SUPPORTED_BOARDS,
+    canonical_country,
     compile_profile,
 )
 from src.profile.errors import (
@@ -48,6 +50,8 @@ MAX_RULES = 500
 MAX_BONUS_POINTS = 5.0
 MIN_DIGEST_EXCLUSIVE = 3.0
 MAX_WOW = 10.0
+FALLBACK_WOW_THRESHOLD = 8.5
+FALLBACK_DIGEST_THRESHOLD = 6.5
 
 RULE_SOURCES = frozenset({"user", "llm", "import", "seed"})
 _TEXT_FIELDS = (
@@ -275,7 +279,7 @@ def _norm_token(value: str) -> str:
     return value.strip().lower()
 
 
-def _normalise(snap: ProfileSnapshot) -> ProfileSnapshot:
+def normalise_snapshot(snap: ProfileSnapshot) -> ProfileSnapshot:
     """Canonical form of values that have one obvious spelling (see the module docstring)."""
     roles = tuple(
         replace(
@@ -293,7 +297,7 @@ def _normalise(snap: ProfileSnapshot) -> ProfileSnapshot:
             m,
             name=m.name.strip(),
             location=m.location.strip(),
-            countries=tuple(_norm_token(c) for c in m.countries),
+            countries=tuple(canonical_country(c) for c in m.countries),
             languages=tuple(_norm_token(x) for x in m.languages),
         )
         for m in snap.markets
@@ -301,9 +305,8 @@ def _normalise(snap: ProfileSnapshot) -> ProfileSnapshot:
     pinned = tuple(
         replace(
             q,
-            query_id=q.query_id.strip(),
             boards=tuple(_norm_token(b) for b in q.boards),
-            country=_norm_token(q.country) if q.country is not None else None,
+            country=canonical_country(q.country) if q.country is not None else None,
         )
         for q in snap.pinned_queries
     )
@@ -594,7 +597,7 @@ def apply_changes(
     new = base
     for op in ops:
         new = apply_operation(new, op)
-    new = _normalise(new)
+    new = normalise_snapshot(new)
     problems = validate_snapshot(new, current)
     if problems:
         raise ProfileValidationError(problems)
@@ -642,13 +645,30 @@ def restore(store: ProfileStore, version: int) -> ApplyResult:
     )
 
 
+def resolve_thresholds(wow: float, digest: float) -> Tuple[float, float, Optional[str]]:
+    """The thresholds to store: the given ones when valid, else the fallbacks and a note saying so."""
+    if not threshold_problems(wow, digest):
+        return wow, digest, None
+    note = (
+        f"thresholds wow={wow:g} / digest={digest:g} are not valid "
+        f"(need 3.0 < digest <= wow - 0.1 and wow <= 10); using {FALLBACK_WOW_THRESHOLD:g} and "
+        f"{FALLBACK_DIGEST_THRESHOLD:g}"
+    )
+    return FALLBACK_WOW_THRESHOLD, FALLBACK_DIGEST_THRESHOLD, note
+
+
 def create_starter_profile(
     store: ProfileStore, *, wow_threshold: float, digest_threshold: float
 ) -> ApplyResult:
-    """An empty, paused profile (used by ``init`` when no legacy files exist)."""
-    snapshot = ProfileSnapshot(
-        ProfileFields(paused=True, wow_threshold=wow_threshold, digest_threshold=digest_threshold)
-    )
-    return apply_changes(
+    """An empty, paused profile (used by ``init`` when no legacy files exist).
+
+    Invalid ``.env`` thresholds fall back to the defaults with a note in ``warnings`` (like the import).
+    """
+    wow, digest, note = resolve_thresholds(wow_threshold, digest_threshold)
+    snapshot = ProfileSnapshot(ProfileFields(paused=True, wow_threshold=wow, digest_threshold=digest))
+    result = apply_changes(
         store, [ReplaceProfile(snapshot)], label="init starter profile", expected_version=0
     )
+    if note:
+        result.warnings = [note] + result.warnings
+    return result
