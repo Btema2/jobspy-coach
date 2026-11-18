@@ -163,3 +163,17 @@ def test_seniority_rule_shape_and_languages():
 def test_seniority_rules_rescued():
     rules = seniority_rules("mid", ["en"]) + (_rule("rescue", "<ROLE>"),)
     assert classify_title("Senior <ROLE>", rules=rules) is None
+
+
+@pytest.mark.parametrize("mode", ["exact", "prefix", "pattern"])
+@pytest.mark.parametrize("term", ["", "   ", "\t"])
+def test_compile_rule_rejects_an_empty_term(mode, term):
+    with pytest.raises(ValueError, match="empty"):
+        compile_rule("block", term, mode, "USER", "user")
+
+
+def test_seniority_rules_have_unique_keys():
+    from src.filters.seniority import seniority_rules
+
+    keys = [r.key for r in seniority_rules("junior", ["en", "EN", "xx"])]
+    assert keys and len(keys) == len(set(keys))

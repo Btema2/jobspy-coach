@@ -33,13 +33,9 @@ def seniority_rules(target_level: "str | None", languages: Iterable[str]) -> Tup
         if lang in SENIORITY_TERMS and lang not in langs:
             langs.append(lang)
     rules: List[CompiledRule] = []
-    seen = set()
     for lang in langs:
         for level in above:
             for term in SENIORITY_TERMS[lang].get(level, ()):
                 key = f"level:{level}:{term}"
-                if key in seen:
-                    continue
-                seen.add(key)
                 rules.append(compile_rule("seniority", term, "exact", "EXCLUDED_SENIORITY", "level", key=key))
     return tuple(rules)

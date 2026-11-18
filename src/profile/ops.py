@@ -317,7 +317,11 @@ def normalise_snapshot(snap: ProfileSnapshot) -> ProfileSnapshot:
     rules = tuple(
         replace(r, term=r.term.strip()) if r.match_mode != "pattern" else r for r in snap.rules
     )
-    return replace(snap, roles=roles, markets=markets, pinned_queries=pinned, rules=rules)
+    level = snap.fields.target_level
+    fields = snap.fields
+    if level is not None:
+        fields = replace(fields, target_level=level.strip().lower() or None)
+    return replace(snap, fields=fields, roles=roles, markets=markets, pinned_queries=pinned, rules=rules)
 
 
 # --- validation --------------------------------------------------------------------------------
@@ -343,7 +347,7 @@ def _name_problems(kind: str, names: List[str], problems: List[str]) -> None:
     seen: set = set()
     for name in names:
         if _ID_SEPARATOR_RE.search(name):
-            problems.append(f"{kind} name '{name[:20]}' must not contain ';' or '='")
+            problems.append(f"{kind} name '{name[:20]}' must not contain ';' or '='; rename the item")
         if not 1 <= len(name.strip()) <= MAX_NAME_CHARS:
             problems.append(f"{kind} name '{name[:20]}' must be 1-{MAX_NAME_CHARS} characters")
         key = name.strip().casefold()
@@ -386,7 +390,7 @@ def _validate_roles(snap: ProfileSnapshot, problems: List[str]) -> None:
                     "expected a 2-3 letter lowercase code"
                 )
             if _ID_SEPARATOR_RE.search(t.term):
-                problems.append(f"role '{role.name}': term '{t.term[:20]}' must not contain ';' or '='")
+                problems.append(f"role '{role.name}': term '{t.term[:20]}' must not contain ';' or '='; rename the item")
             key = (t.term.strip().casefold(), t.language)
             if key in seen:
                 problems.append(f"role '{role.name}': duplicate term '{t.term}'")

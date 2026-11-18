@@ -49,9 +49,11 @@ def _literal(term: str) -> str:
 def compile_rule(
     kind: str, term: str, match_mode: str, reason: str, source: str, key: Optional[str] = None
 ) -> CompiledRule:
-    """Compile one rule; raises ``ValueError`` on an unknown kind or mode or an invalid regex."""
+    """Compile one rule; raises ``ValueError`` on an unknown kind or mode, an empty term or an invalid regex."""
     if kind not in RULE_KINDS:
         raise ValueError(f"unknown kind '{kind}'")
+    if not term.strip():
+        raise ValueError("empty term")
     if match_mode == "exact":
         pattern = rf"(?<!\w){_literal(term)}(?!\w)"
     elif match_mode == "prefix":

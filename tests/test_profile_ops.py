@@ -814,3 +814,45 @@ def test_names_reject_semicolon_and_equals(started: ProfileStore):
     with pytest.raises(ProfileValidationError) as exc:
         apply_changes(started, [AddMarket(_market(name="m;n"))], label="x")
     assert "m;n" in _messages(exc)
+
+
+@pytest.mark.parametrize("raw,expected", [("  Senior ", "senior"), ("MID", "mid"), ("", None), ("   ", None), (None, None)])
+def test_target_level_is_normalised(started: ProfileStore, raw, expected):
+    apply_changes(started, [SetField("target_level", raw)], label="level")
+    assert started.read_snapshot().fields.target_level == expected
+
+
+def test_target_level_still_rejects_unknown_values(started: ProfileStore):
+    with pytest.raises(ProfileValidationError, match="target_level"):
+        apply_changes(started, [SetField("target_level", "boss")], label="level")
+
+
+def test_separator_name_error_says_to_rename(started: ProfileStore):
+    with pytest.raises(ProfileValidationError) as exc_info:
+        apply_changes(started, [AddRole("a;b")], label="bad role")
+    assert "must not contain ';' or '='" in _messages(exc_info) and "rename" in _messages(exc_info)
+    with pytest.raises(ProfileValidationError) as exc_info:
+        apply_changes(started, [AddRole("ok"), AddRoleTerm("ok", "x=y", None)], label="bad term")
+    assert "rename" in _messages(exc_info)
+
+
+def test_restoring_a_schema_1_version_yields_the_current_seed_text(started: ProfileStore):
+    import json
+    from src.profile import legacy_seed
+
+    apply_changes(started, [SetField("core_role_definition", "<TEXT>")], label="edit")
+    with started._db._get_connection() as conn:  # an old (stamp 1) stored snapshot holding the V1 seed text
+        raw = json.loads(conn.execute("SELECT snapshot FROM profile_versions WHERE version = 2").fetchone()[0])
+        raw["snapshot_schema"] = 1
+        raw["profile"]["core_role_definition"] = legacy_seed.LEGACY_V1_CORE_ROLE_DEFINITION
+        raw["profile"]["adjacent_role_definition"] = legacy_seed.LEGACY_V1_ADJACENT_ROLE_DEFINITION + " Mine."
+        conn.execute("UPDATE profile_versions SET snapshot = ?, snapshot_schema = 1 WHERE version = 2", (json.dumps(raw),))
+        conn.commit()
+    apply_changes(started, [SetField("persona", "<P>")], label="later")
+
+    result = restore(started, 2)
+
+    fields = started.read_snapshot().fields
+    assert fields.core_role_definition == legacy_seed.LEGACY_CORE_ROLE_DEFINITION
+    assert fields.adjacent_role_definition == legacy_seed.LEGACY_V1_ADJACENT_ROLE_DEFINITION + " Mine."  # edited
+    assert result.version == 4
