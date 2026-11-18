@@ -351,7 +351,7 @@ class JobSpyScraper:
                     df = scrape_jobs(**self._build_scrape_kwargs(site_name, query))
                     break
                 except Exception as e:
-                    last_error = str(e)
+                    last_error = str(e) or type(e).__name__
                     if attempt < 3:
                         backoff = (2 ** attempt) * 3
                         logger.warning(

@@ -439,7 +439,9 @@ class DaemonService:
                 except Exception as e:
                     duration = time.time() - t0
                     safe_error = sanitize_error_message(str(e))
-                    logger.error(f"Failed scrape cycle for board '{site}' query '{q.query_id}': {safe_error}")
+                    logger.error(
+                        f"Failed scrape cycle for board '{site}' query '{q.query_id}': {redact_secrets(str(e))}"
+                    )
                     if not dry_run:
                         self.db.record_scrape_run(
                             board=site,

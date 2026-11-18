@@ -766,3 +766,24 @@ def test_exception_message_with_proxy_url_is_redacted_before_storing(tmp_path):
     assert "s3cretpw" not in stored
     assert "scrapeuser" not in stored
     assert "tunnel failed" in stored
+
+
+def test_exception_log_keeps_full_redacted_text_while_stored_value_is_truncated(tmp_path, caplog):
+    import logging
+
+    tail = "DIAGNOSTIC-TAIL-MARKER"
+    mock_scraper = MagicMock()
+    mock_scraper.scrape_board.side_effect = RuntimeError(
+        "tunnel failed via socks5://scrapeuser:s3cretpw@proxy.example.com:1080 " + "x" * 400 + " " + tail
+    )
+    daemon = DaemonService(db_path=tmp_path / "d.db", scraper=mock_scraper)
+    with caplog.at_level(logging.ERROR):
+        daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    assert "Failed scrape cycle" in caplog.text
+    assert tail in caplog.text
+    assert "s3cretpw" not in caplog.text
+    assert "scrapeuser" not in caplog.text
+    stored = _runs(daemon)[0]["error_message"]
+    assert len(stored) <= 300
+    assert tail not in stored
+    assert "s3cretpw" not in stored

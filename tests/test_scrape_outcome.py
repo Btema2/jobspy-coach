@@ -64,6 +64,14 @@ def test_exception_after_retries_is_failed(mock_scrape):
     assert mock_scrape.call_count == 3
 
 
+def test_exception_with_empty_message_falls_back_to_type_name(mock_scrape):
+    mock_scrape.side_effect = TimeoutError()
+    out = _scraper().scrape_board_outcome("linkedin", _query())
+    assert out.status == "failed"
+    assert out.error == "TimeoutError"
+    assert mock_scrape.call_count == 3
+
+
 def test_block_in_attrs_errors_is_failed(mock_scrape):
     msg = "unexpected page with no jobs (blocked?)"
     mock_scrape.return_value = _frame([], {"errors": {"linkedin": msg}})
