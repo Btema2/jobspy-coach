@@ -156,7 +156,7 @@ def test_snapshot_dict_roundtrip():
     snap = _snapshot()
     data = snapshot_to_dict(snap)
 
-    assert data["snapshot_schema"] == 1
+    assert data["snapshot_schema"] == 2
     assert set(data) == {"snapshot_schema", "profile", "roles", "markets", "pinned_queries", "rules"}
     assert "version" not in data
     assert snapshot_from_dict(data, version=7) == replace(snap, version=7)

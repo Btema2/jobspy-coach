@@ -459,7 +459,7 @@ def test_export_yaml_roundtrip(store: ProfileStore, legacy_dir: Path, tmp_path: 
     loaded = load_profile_yaml(out)
     assert replace(loaded, version=0) == replace(snap, version=0)
     text = out.read_text(encoding="utf-8")
-    assert text.startswith("snapshot_schema: 1")  # key order preserved, not sorted
+    assert text.startswith("snapshot_schema: 2")  # key order preserved, not sorted
 
 
 def test_export_default_path():

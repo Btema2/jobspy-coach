@@ -5,7 +5,7 @@ from src.evaluator.schemas import JobEvaluationResult
 
 BASE = {
     "score": 7.0,
-    "summary_uk": "Коротке резюме вакансії для кандидата.",
+    "summary": "Коротке резюме вакансії для кандидата.",
     "reasoning": "Reasonable fit.",
 }
 
@@ -48,14 +48,14 @@ def test_generic_flags_default_false():
     result = JobEvaluationResult.model_validate(BASE)
     assert result.hard_reject is False
     assert result.matches_bonus_criteria is False
-    assert result.role_is_direct_coaching is False
+    assert result.is_core_role is False
 
 
 def test_generic_flags_can_be_set():
     result = JobEvaluationResult.model_validate(
-        {**BASE, "hard_reject": True, "matches_bonus_criteria": True, "role_is_direct_coaching": True}
+        {**BASE, "hard_reject": True, "matches_bonus_criteria": True, "is_core_role": True}
     )
-    assert result.hard_reject and result.matches_bonus_criteria and result.role_is_direct_coaching
+    assert result.hard_reject and result.matches_bonus_criteria and result.is_core_role
 
 
 def test_eval_model_assignable_after_validation():
@@ -63,3 +63,25 @@ def test_eval_model_assignable_after_validation():
     assert result.eval_model is None
     result.eval_model = "some/model"
     assert result.eval_model == "some/model"
+
+
+def test_old_keys_accepted():
+    data = {k: v for k, v in BASE.items() if k != "summary"}
+    data.update({"summary_uk": "Старий ключ резюме вакансії.", "role_is_direct_coaching": True})
+    result = JobEvaluationResult.model_validate(data)
+    assert result.summary == "Старий ключ резюме вакансії."
+    assert result.is_core_role is True
+
+
+def test_new_key_wins_when_both_present():
+    result = JobEvaluationResult.model_validate(
+        {
+            **BASE,
+            "summary": "Нове резюме вакансії тут.",
+            "summary_uk": "Старе резюме вакансії тут.",
+            "is_core_role": False,
+            "role_is_direct_coaching": True,
+        }
+    )
+    assert result.summary == "Нове резюме вакансії тут."
+    assert result.is_core_role is False

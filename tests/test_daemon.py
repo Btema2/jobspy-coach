@@ -27,7 +27,7 @@ def test_daemon_pipeline_cycle(monkeypatch, tmp_path):
     mock_eval_result = MagicMock()
     mock_eval_result.score = 9.5
     mock_eval_result.is_wow = True
-    mock_eval_result.summary_uk = "Чудова роль executive коуча."
+    mock_eval_result.summary = "Чудова роль executive коуча."
     mock_eval_result.reasoning = "Top fit"
     mock_eval_result.language_requirements = ["English"]
     mock_eval_result.pros = []
@@ -400,7 +400,7 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     eval_low = MagicMock()
     eval_low.score = 4.5
     eval_low.is_wow = False
-    eval_low.summary_uk = "Low match"
+    eval_low.summary = "Low match"
     eval_low.reasoning = "Not relevant"
     eval_low.language_requirements = []
     eval_low.pros = []
@@ -412,7 +412,7 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     eval_high = MagicMock()
     eval_high.score = 7.5
     eval_high.is_wow = False
-    eval_high.summary_uk = "High match"
+    eval_high.summary = "High match"
     eval_high.reasoning = "Good fit"
     eval_high.language_requirements = []
     eval_high.pros = []

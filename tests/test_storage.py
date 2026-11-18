@@ -64,7 +64,7 @@ def test_database_init_and_job_lifecycle(tmp_path: Path):
     eval_res = JobEvaluationResult(
         score=9.2,
         is_wow=True,
-        summary_uk="Чудова вакансія для лідерського коучингу.",
+        summary="Чудова вакансія для лідерського коучингу.",
         reasoning="Strong match for executive coach persona",
         language_requirements=["English", "Polish"],
         pros=["High autonomy"],
@@ -140,7 +140,7 @@ def test_database_pending_digest_jobs(tmp_path: Path):
         eval_result=JobEvaluationResult(
             score=8.0,
             is_wow=False,
-            summary_uk="Робота в Варшаві.",
+            summary="Робота в Варшаві.",
             reasoning="Good",
             language_requirements=["Polish"],
             pros=[],
@@ -165,7 +165,7 @@ def test_database_pending_digest_jobs(tmp_path: Path):
         eval_result=JobEvaluationResult(
             score=4.5,
             is_wow=False,
-            summary_uk="Низький бал.",
+            summary="Низький бал.",
             reasoning="Poor fit",
             language_requirements=[],
             pros=[],
@@ -382,7 +382,7 @@ def test_database_update_evaluation_with_notification_status(tmp_path: Path):
     eval_res = JobEvaluationResult(
         score=4.0,
         is_wow=False,
-        summary_uk="Низька оцінка.",
+        summary="Низька оцінка.",
         reasoning="Irrelevant",
     )
     db.update_evaluation(job_id=job_id, eval_result=eval_res, notification_status="dismissed")
@@ -597,7 +597,7 @@ def test_update_evaluation_persists_eval_model(tmp_path: Path):
     job_id, _ = db.save_job(_mk_job("a"))
     db.update_evaluation(
         job_id,
-        JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r", eval_model="vendor/model-x"),
+        JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r", eval_model="vendor/model-x"),
     )
     assert db.get_job_by_id(job_id).eval_model == "vendor/model-x"
 
@@ -607,7 +607,7 @@ def test_update_evaluation_tolerates_non_string_eval_model(tmp_path: Path):
     db = Database(tmp_path / "mm.db")
     db.init_db()
     job_id, _ = db.save_job(_mk_job("b"))
-    result = JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r")
+    result = JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r")
     result.eval_model = MagicMock()
     db.update_evaluation(job_id, result, notification_status="pending")
     assert db.get_job_by_id(job_id).eval_model is None
@@ -652,7 +652,7 @@ def test_record_eval_attempt_ignores_non_unprocessed_jobs(tmp_path: Path):
     db.init_db()
     job_id, _ = db.save_job(_mk_job("g"))
     db.update_evaluation(
-        job_id, JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r")
+        job_id, JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r")
     )
 
     assert db.record_eval_attempt(job_id, "late failure", max_attempts=1) == 0
@@ -669,7 +669,7 @@ def test_get_stats_custom_pending_threshold(tmp_path: Path):
     for name, score in (("lo", 6.2), ("mid", 6.7), ("hi", 8.0)):
         job_id, _ = db.save_job(_mk_job(name))
         db.update_evaluation(
-            job_id, JobEvaluationResult(score=score, is_wow=False, summary_uk="s", reasoning="r")
+            job_id, JobEvaluationResult(score=score, is_wow=False, summary="s", reasoning="r")
         )
     assert db.get_stats()["pending_digest"] == 3  # default 6.0
     assert db.get_stats(pending_threshold=6.5)["pending_digest"] == 2
@@ -720,8 +720,8 @@ def test_update_evaluation_persists_raw_fields(tmp_path: Path, notification_stat
     db.init_db()
     job_id, _ = db.save_job(_mk_job("raw"))
     result = PydanticResult(
-        score=7.0, summary_uk="A valid summary text.", reasoning="r", raw_score=7.0,
-        role_is_direct_coaching=True, matches_bonus_criteria=False, hard_reject=False,
+        score=7.0, summary="A valid summary text.", reasoning="r", raw_score=7.0,
+        is_core_role=True, matches_bonus_criteria=False, hard_reject=False,
     )
     db.update_evaluation(job_id, result, notification_status=notification_status)
     loaded = db.get_job_by_id(job_id)
@@ -740,7 +740,7 @@ def test_update_evaluation_without_raw_fields_leaves_null(tmp_path: Path, notifi
     job_id, _ = db.save_job(_mk_job("noraw"))
     db.update_evaluation(
         job_id,
-        JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r"),
+        JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r"),
         notification_status=notification_status,
     )
     loaded = db.get_job_by_id(job_id)
@@ -748,3 +748,16 @@ def test_update_evaluation_without_raw_fields_leaves_null(tmp_path: Path, notifi
     assert loaded.eval_is_core_role is None
     assert loaded.eval_bonus_flag is None
     assert loaded.eval_hard_reject is None
+
+
+def test_update_evaluation_stores_is_core_role(tmp_path: Path):
+    from src.evaluator.schemas import JobEvaluationResult as PydanticResult
+    db = Database(tmp_path / "core.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("core"))
+    # An old-key payload still lands in the non-NULL column (NULL would hide the row from re-bucketing).
+    result = PydanticResult.model_validate(
+        {"score": 7.0, "summary_uk": "A valid summary text.", "reasoning": "r", "role_is_direct_coaching": True}
+    )
+    db.update_evaluation(job_id, result)
+    assert db.get_job_by_id(job_id).eval_is_core_role is True

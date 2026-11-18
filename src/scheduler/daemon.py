@@ -368,12 +368,12 @@ class DaemonService:
                 )
 
                 # The alert decision lives here, from settings, once.
-                # WOW additionally requires a direct-coaching role, so a lowered WOW_SCORE_THRESHOLD can never
+                # WOW additionally requires a core role, so a lowered WOW_SCORE_THRESHOLD can never
                 # promote capped (<= 8.4) non-coaching roles into instant alerts.
                 eval_res.is_wow = bool(
                     eval_res.score >= settings.wow_score_threshold
                     and not eval_res.hard_reject
-                    and eval_res.role_is_direct_coaching
+                    and eval_res.is_core_role
                 )
                 if dry_run:
                     evaluated_count += 1
@@ -395,7 +395,7 @@ class DaemonService:
                 if eval_res.is_wow:
                     job.eval_score = eval_res.score
                     job.eval_is_wow = eval_res.is_wow
-                    job.eval_summary_uk = eval_res.summary_uk
+                    job.eval_summary_uk = eval_res.summary
                     job.eval_reasoning = eval_res.reasoning
                     job.eval_languages = eval_res.language_requirements
                     job.eval_pros = eval_res.pros

@@ -115,7 +115,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             return JobEvaluationResult(
                 score=5.0,
                 is_wow=False,
-                summary_uk="Змішана роль рекрутера з мінімальним коучингом.",
+                summary="Змішана роль рекрутера з мінімальним коучингом.",
                 reasoning="Heavy recruitment focus",
                 language_requirements=["Polish"],
                 pros=[],
@@ -125,7 +125,7 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             return JobEvaluationResult(
                 score=7.5,
                 is_wow=False,
-                summary_uk="Індивідуальний кар'єрний коучинг для ІТ спеціалістів.",
+                summary="Індивідуальний кар'єрний коучинг для ІТ спеціалістів.",
                 reasoning="Strong alignment with career coaching domain",
                 language_requirements=["Polish", "English"],
                 pros=["Remote", "Good culture"],
@@ -135,8 +135,8 @@ def test_full_pipeline_end_to_end(tmp_path, monkeypatch):
             return JobEvaluationResult(
                 score=9.6,
                 is_wow=True,
-                role_is_direct_coaching=True,
-                summary_uk="Топ-вакансія executive коуча для роботи з керівниками банку.",
+                is_core_role=True,
+                summary="Топ-вакансія executive коуча для роботи з керівниками банку.",
                 reasoning="Dream role with international exposure and professional growth opportunity",
                 language_requirements=["English"],
                 pros=["High salary", "C-suite client base"],
@@ -288,8 +288,8 @@ def test_e2e_dry_run_pipeline_cycle(tmp_path):
     mock_evaluator.evaluate_job.return_value = JobEvaluationResult(
         score=9.5,
         is_wow=True,
-        role_is_direct_coaching=True,
-        summary_uk="Тестова dry-run вакансія.",
+        is_core_role=True,
+        summary="Тестова dry-run вакансія.",
         reasoning="Dry-run fit",
         language_requirements=["English"],
         pros=[],
@@ -358,8 +358,8 @@ def test_e2e_evaluator_retry_and_recovery(tmp_path):
         JobEvaluationResult(
             score=9.2,
             is_wow=True,
-            role_is_direct_coaching=True,
-            summary_uk="Executive коучинг після успішного retry.",
+            is_core_role=True,
+            summary="Executive коучинг після успішного retry.",
             reasoning="Passed on retry",
             language_requirements=["English"],
             pros=["Great role"],

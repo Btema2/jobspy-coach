@@ -342,13 +342,13 @@ class Database:
                 updated_at = ?
             WHERE id = ?
             """, (
-                eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
+                eval_result.score, int(eval_result.is_wow), eval_result.summary, eval_result.reasoning,
                 json.dumps(eval_result.language_requirements, ensure_ascii=False),
                 json.dumps(eval_result.pros, ensure_ascii=False),
                 json.dumps(eval_result.cons, ensure_ascii=False),
                 eval_model,
                 float(raw_score) if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool) else None,
-                _opt_int(getattr(eval_result, "role_is_direct_coaching", None)),
+                _opt_int(getattr(eval_result, "is_core_role", None)),
                 _opt_int(getattr(eval_result, "matches_bonus_criteria", None)),
                 _opt_int(getattr(eval_result, "hard_reject", None)),
                 notification_status,

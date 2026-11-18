@@ -355,6 +355,8 @@ def _validate_fields(f: ProfileFields, problems: List[str]) -> None:
         problems.append(
             f"target_level '{f.target_level[:20]}' must be one of {', '.join(SENIORITY_LEVELS)} or unset"
         )
+    if f.output_language is not None and not _LANGUAGE_RE.fullmatch(f.output_language):
+        problems.append(f"output_language '{f.output_language[:20]}' must be a language code such as 'en' or unset")
     for name in _TEXT_FIELDS:
         value = getattr(f, name)
         if value is not None and len(value) > MAX_TEXT_CHARS:

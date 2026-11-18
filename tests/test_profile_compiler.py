@@ -5,9 +5,10 @@ from pathlib import Path
 import pytest
 
 from src.evaluator.prompts import DEFAULT_CANDIDATE_PERSONA, build_system_prompt
-from src.profile import compiler
+from src.profile import compiler, legacy_seed
 from src.profile.compiler import compile_profile, expanded_query_id
 from src.profile.errors import ProfileCompileError
+from src.profile.importer import extract_bonus_criteria
 from src.profile.snapshot import (
     Market,
     PinnedQuery,
@@ -202,17 +203,64 @@ def test_unknown_board_raises_compile_error():
         compile_profile(_snap(pinned_queries=pinned))
 
 
-def test_compiled_prompt_equals_todays_prompt():
-    persona = (FIXTURES / "legacy_persona.md").read_text(encoding="utf-8")
-    compiled = compile_profile(_snap(fields=ProfileFields(persona=persona)))
-    assert compiled.system_prompt == build_system_prompt(persona.strip())
+def test_compiled_prompt_equals_fallback_prompt_for_legacy_fields():
+    persona = (FIXTURES / "legacy_persona.md").read_text(encoding="utf-8").strip()
+    fields = ProfileFields(
+        persona=persona,
+        core_role_definition=legacy_seed.LEGACY_CORE_ROLE_DEFINITION,
+        adjacent_role_definition=legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION,
+        dealbreakers=legacy_seed.LEGACY_DEALBREAKERS,
+        bonus_criteria=extract_bonus_criteria(persona),
+    )
+    compiled = compile_profile(_snap(fields=fields))
+    assert compiled.system_prompt == build_system_prompt(persona)
+    assert compiled.system_prompt == (FIXTURES / "system_prompt_legacy.txt").read_text(encoding="utf-8")
 
 
-def test_empty_persona_matches_frozen_generic_prompt():
+def test_empty_persona_uses_default_persona():
     compiled = compile_profile(_snap(fields=ProfileFields(persona="   ")))
-    frozen = (FIXTURES / "system_prompt_generic.txt").read_text(encoding="utf-8")
-    assert compiled.system_prompt == frozen
-    assert DEFAULT_CANDIDATE_PERSONA in compiled.system_prompt
+    assert DEFAULT_CANDIDATE_PERSONA.strip() in compiled.system_prompt
+
+
+def test_scoring_policy_from_profile():
+    fields = ProfileFields(
+        core_role_definition="<CORE>", bonus_criteria="<BONUS>", bonus_points=2.0,
+        wow_threshold=8.25, digest_threshold=8.15,
+    )
+    compiled = compile_profile(_snap(fields=fields))
+    policy = compiled.scoring
+    assert compiled.bonus_points == 2.0 and compiled.core_cap == 8.15
+    assert (policy.wow_threshold, policy.digest_threshold) == (8.25, 8.15)
+    assert (policy.bonus_enabled, policy.bonus_points, policy.core_cap) == (True, 2.0, 8.15)
+    assert policy.system_prompt == compiled.system_prompt
+    assert policy.rules == compiled.rules
+
+
+def test_no_core_definition_means_cap_off_and_bonus_off_without_criteria():
+    compiled = compile_profile(_snap(fields=ProfileFields(core_role_definition="  ")))
+    assert compiled.core_cap is None and compiled.scoring.core_cap is None
+    assert compiled.scoring.bonus_enabled is False
+
+
+def test_remote_filter_query_ids_cover_remote_only_markets():
+    roles = (Role("<ROLE>", terms=(RoleTerm("<TERM>"),)),)
+    markets = (
+        _usa_market(name="<REMOTE>", remote_only=True),
+        _usa_market(name="<ONSITE>", remote=True),
+        _usa_market(name="<OFF>", remote_only=True, enabled=False),
+    )
+    compiled = compile_profile(_snap(roles=roles, markets=markets))
+    expected = {q.query_id for q in compiled.queries if "market=<REMOTE>" in q.query_id}
+    assert expected  # linkedin/google call and the per-country call
+    assert compiled.scoring.remote_filter_query_ids == frozenset(expected)
+    assert "found with the remote filter" in compiled.system_prompt
+
+
+def test_no_remote_only_market_leaves_remote_clause_out():
+    roles = (Role("<ROLE>"),)
+    compiled = compile_profile(_snap(roles=roles, markets=(_usa_market(),)))
+    assert compiled.scoring.remote_filter_query_ids == frozenset()
+    assert "found with the remote filter" not in compiled.system_prompt
 
 
 def test_bonus_enabled_follows_bonus_criteria():

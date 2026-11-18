@@ -44,10 +44,10 @@ def make_settings(**overrides) -> Settings:
 
 
 def make_result(score: float, model: str = "vendor/model", **extra) -> JobEvaluationResult:
-    extra.setdefault("role_is_direct_coaching", True)  # WOW needs it; tests opt out explicitly
+    extra.setdefault("is_core_role", True)  # WOW needs it; tests opt out explicitly
     return JobEvaluationResult(
         score=score,
-        summary_uk="A sufficiently long summary.",
+        summary="A sufficiently long summary.",
         reasoning="Because.",
         eval_model=model,
         **extra,
@@ -538,7 +538,7 @@ class BlockingProvider:
         self.waiting.release()
         self.limiter.acquire()
         return CompletionResult(
-            content='{"score": 7.0, "summary_uk": "A sufficiently long summary.", "reasoning": "r"}',
+            content='{"score": 7.0, "summary": "A sufficiently long summary.", "reasoning": "r"}',
             model_used=self.model,
             latency=0.0,
             finish_reason="stop",
@@ -786,9 +786,9 @@ def test_non_direct_coaching_job_never_triggers_wow(tmp_path, direct, expect_wow
     content = json.dumps(
         {
             "score": 8.0,
-            "summary_uk": "A sufficiently long summary.",
+            "summary": "A sufficiently long summary.",
             "reasoning": "r",
-            "role_is_direct_coaching": direct,
+            "is_core_role": direct,
             "matches_bonus_criteria": True,
         }
     )
@@ -813,7 +813,7 @@ def test_wow_needs_direct_coaching_even_when_threshold_is_below_the_digest_cap(t
     notifier = MagicMock()
     notifier.send_wow_alert.return_value = True
     fake = FakeEvaluator(
-        lambda job: make_result(8.4, role_is_direct_coaching=("Direct" in job.title))
+        lambda job: make_result(8.4, is_core_role=("Direct" in job.title))
     )
     daemon = make_daemon(tmp_path, fake, notifier=notifier, WOW_SCORE_THRESHOLD=8.0)
     other_id = daemon.db.save_job(make_job(1, title="Programme Trainer"))[0]

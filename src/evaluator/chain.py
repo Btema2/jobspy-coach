@@ -2,7 +2,9 @@
 
 ``ProviderChainEvaluator.evaluate_job(job)`` is synchronous and thread-safe; one
 shared instance serves every worker thread. It takes no alert thresholds and
-never sets ``is_wow`` (the daemon derives that from the final score).
+never sets ``is_wow`` (the daemon derives that from the final score). Per-call behaviour (prompt, bonus,
+non-core cap, title rules, remote line) comes from an optional ``ScoringPolicy``; without one a lazily
+built no-profile default is used.
 
 Breaker accounting lives HERE and only here. For every provider the chain calls
 ``breaker.allow()`` once; only when that returned True does it settle the breaker,
@@ -52,11 +54,21 @@ from src.evaluator.errors import (
     TransientProviderError,
 )
 from src.evaluator.parsing import extract_json_payload
-from src.evaluator.prompts import build_job_user_prompt, build_system_prompt, load_candidate_persona
+from src.evaluator.prompts import build_job_user_prompt, build_system_prompt
 from src.evaluator.providers import NvidiaNimProvider, OpenRouterProvider, strip_think
 from src.evaluator.rate_limiter import SlidingWindowRateLimiter
 from src.evaluator.schemas import JobEvaluationResult
-from src.filters.pre_filter import classify_title
+from src.evaluator.scoring import (  # noqa: F401  (constants re-exported for existing importers)
+    BONUS_MIN_BASE_SCORE,
+    BONUS_POINTS,
+    DIGEST_MAX_SCORE,
+    REJECT_CAP,
+    ScoringPolicy,
+    final_score,
+    found_with_remote_filter,
+    remote_label,
+)
+from src.filters.rules import match_title
 from src.storage.models import JobPosting
 
 logger = logging.getLogger(__name__)
@@ -64,10 +76,6 @@ logger = logging.getLogger(__name__)
 INVALID_RETRIES_PER_PROVIDER = 1
 INVALID_STREAK_BREAKER_THRESHOLD = 3
 TRUNCATION_RETRY_FACTOR = 1.5
-BONUS_POINTS = 1.5
-BONUS_MIN_BASE_SCORE = 6.0
-REJECT_CAP = 2.0
-DIGEST_MAX_SCORE = 8.4  # ceiling for roles that are not direct coaching (WOW needs >= 8.5)
 
 _OK = "ok"
 _JOB_FAULT = "job"  # this provider judged the job unusable; not an outage
@@ -90,18 +98,12 @@ class ProviderChainEvaluator:
         self._invalid_streak_threshold = invalid_streak_threshold
         self._streak_lock = threading.Lock()
         self._invalid_streaks: Dict[str, int] = {}
-        # The +BONUS_POINTS only applies when the local profile defines bonus criteria
-        # (it mentions "bonus"); an explicit ``bonus_enabled`` always wins. With an explicit
-        # ``system_prompt`` and no flag the bonus stays off.
-        persona: Optional[str] = None
-        if system_prompt is None:
-            persona = load_candidate_persona()
-            logger.info("Local candidate profile %s", "found" if persona else "not found; using generic persona")
-            system_prompt = build_system_prompt(persona)
+        # Nothing is read from disk here: a fresh clone without a profile must construct. The no-profile
+        # default policy (``bonus_enabled`` as given, default off) is built on first use.
         self._system_prompt = system_prompt
-        if bonus_enabled is None:
-            bonus_enabled = persona is not None and "bonus" in persona.lower()
         self._bonus_enabled = bool(bonus_enabled)
+        self._default_policy: Optional[ScoringPolicy] = None
+        self._default_lock = threading.Lock()
 
     def stop(self) -> None:
         """Wake every blocked worker and make further evaluations raise StopRequested."""
@@ -109,19 +111,26 @@ class ProviderChainEvaluator:
 
     # ----- public -----
 
-    def evaluate_job(self, job: JobPosting, system_prompt: Optional[str] = None) -> JobEvaluationResult:
-        """Evaluate one job. ``system_prompt`` overrides the frozen prompt for this call only.
+    def evaluate_job(
+        self,
+        job: JobPosting,
+        system_prompt: Optional[str] = None,
+        policy: Optional[ScoringPolicy] = None,
+    ) -> JobEvaluationResult:
+        """Evaluate one job under ``policy`` (default: the no-profile policy).
 
-        The override is passed down as an argument and never stored, so concurrent workers
-        cannot see each other's prompt. ``None`` keeps the prompt built at construction.
+        Prompt precedence: ``system_prompt`` argument, then ``policy.system_prompt``. Both are passed down
+        as arguments and never stored, so concurrent workers cannot see each other's prompt or policy.
         """
         self._check_stop()
-        prompt = self._system_prompt if system_prompt is None else system_prompt
+        if policy is None:
+            policy = self._get_default_policy()
+        prompt = policy.system_prompt if system_prompt is None else system_prompt
         user_prompt = build_job_user_prompt(
             title=job.title,
             company=job.company,
             location=job.location,
-            is_remote=job.is_remote,
+            remote=remote_label(job.remote_status, found_with_remote_filter(job.source_query, policy)),
             description=job.description,
         )
         job_fault = False
@@ -133,7 +142,7 @@ class ProviderChainEvaluator:
             status, result, model_used, latency = self._try_provider(provider, user_prompt, prompt)
             if status == _OK:
                 result.eval_model = model_used
-                final = self._postprocess(result, job)
+                final = self._postprocess(result, job, policy)
                 logger.info(
                     "Evaluated via %s (model %s) in %.1fs -> score %.1f",
                     provider.name, model_used, latency, final.score,
@@ -146,6 +155,14 @@ class ProviderChainEvaluator:
         raise ProvidersUnavailable("no provider could evaluate the job")
 
     # ----- internals -----
+
+    def _get_default_policy(self) -> ScoringPolicy:
+        """The policy used when the caller passes none; built once, on first use."""
+        with self._default_lock:
+            if self._default_policy is None:
+                prompt = self._system_prompt if self._system_prompt is not None else build_system_prompt()
+                self._default_policy = ScoringPolicy(system_prompt=prompt, bonus_enabled=self._bonus_enabled)
+            return self._default_policy
 
     def _check_stop(self) -> None:
         if self.stop_event.is_set():
@@ -226,33 +243,44 @@ class ProviderChainEvaluator:
         except ValidationError as exc:
             raise InvalidResponse(f"schema-invalid payload ({exc.error_count()} errors)") from None
 
-    def _postprocess(self, result: JobEvaluationResult, job: JobPosting) -> JobEvaluationResult:
-        score = min(10.0, max(1.0, float(result.score)))
-        result.raw_score = score  # kept so scores can be re-bucketed later without another LLM call
-        if result.hard_reject or score <= REJECT_CAP:
-            score = min(score, REJECT_CAP)
-        elif result.matches_bonus_criteria and score >= BONUS_MIN_BASE_SCORE:
-            if self._bonus_enabled:
-                score = min(10.0, score + BONUS_POINTS)
-            else:
-                logger.debug("Model set matches_bonus_criteria but no bonus criteria are configured; bonus ignored")
-
-        title_reason = classify_title(job.title)
-        if title_reason and score > REJECT_CAP:
-            score = REJECT_CAP
+    def _postprocess(self, result: JobEvaluationResult, job: JobPosting, policy: ScoringPolicy) -> JobEvaluationResult:
+        raw = min(10.0, max(1.0, float(result.score)))
+        result.raw_score = raw  # kept so scores can be re-bucketed later without another LLM call
+        hit = match_title(job.title, policy.rules)
+        title_reason = hit.reason if hit else None
+        if result.matches_bonus_criteria and not policy.bonus_enabled:
+            logger.debug("Model set matches_bonus_criteria but no bonus criteria are configured; bonus ignored")
+        final = final_score(
+            raw,
+            hard_reject=result.hard_reject,
+            bonus_flag=result.matches_bonus_criteria,
+            is_core_role=result.is_core_role,
+            title_reason=title_reason,
+            policy=policy,
+        )
+        if title_reason and not result.hard_reject and raw > REJECT_CAP:
             result.reasoning = f"{result.reasoning} [Title safety net: {title_reason}; score capped at {REJECT_CAP}]"
 
-        # WOW is reserved for direct coaching: any other role stays in the digest band, however
-        # high the model scored it or however much the bonus lifted it. A missing flag counts as false.
-        if not result.role_is_direct_coaching and score > DIGEST_MAX_SCORE:
-            logger.info(
-                "Direct-coaching cap: %r raw model score %.1f, final score %.1f "
-                "(role_is_direct_coaching=false, capped at %.1f)",
-                job.title, float(result.score), DIGEST_MAX_SCORE, DIGEST_MAX_SCORE,
+        # WOW is reserved for core roles: any other role stays in the digest band, however high the model
+        # scored it or however much the bonus lifted it. A missing flag counts as false.
+        cap = policy.core_cap
+        if cap is not None and not result.is_core_role and final == cap:
+            uncapped = final_score(
+                raw,
+                hard_reject=result.hard_reject,
+                bonus_flag=result.matches_bonus_criteria,
+                is_core_role=True,
+                title_reason=title_reason,
+                policy=policy,
             )
-            score = DIGEST_MAX_SCORE
+            if uncapped > cap:
+                logger.info(
+                    "Core-role cap: %r raw model score %.1f, final score %.1f "
+                    "(is_core_role=false, capped at %.1f)",
+                    job.title, float(result.score), cap, cap,
+                )
 
-        result.score = round(score, 1)
+        result.score = final
         result.is_wow = False  # decided by the daemon from the final score, never by the model
         return result
 

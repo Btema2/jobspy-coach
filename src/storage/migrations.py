@@ -135,9 +135,22 @@ def _migration_2_profile_core(conn: sqlite3.Connection) -> None:
         conn.execute(ddl)
 
 
+def _migration_3_rules_and_rubric(conn: sqlite3.Connection) -> None:
+    from src.profile.legacy_seed import LEGACY_FIELD_UPGRADES  # tracked seed text, no other imports
+
+    ensure_column(conn, "jobs", "pre_filter_rule", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_prefiltered ON jobs(pre_filtered, id)")
+    # Unedited seed definitions get the current body (exact match only; the profile version is unchanged
+    # because the meaning is unchanged and an older process still reads valid text). The profile table may
+    # be empty, in which case nothing matches.
+    for field, (old, new) in LEGACY_FIELD_UPGRADES.items():
+        conn.execute(f"UPDATE profile SET {field} = ? WHERE {field} = ?", (new, old))
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "foundations", _migration_1_foundations),
     (2, "profile_core", _migration_2_profile_core),
+    (3, "rules_and_rubric", _migration_3_rules_and_rubric),
 ]
 
 

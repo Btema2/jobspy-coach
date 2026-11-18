@@ -72,7 +72,7 @@ class RecordingChain:
     def evaluate_job(self, job, system_prompt=None):
         self.prompts.append(system_prompt)
         return JobEvaluationResult(
-            score=7.0, summary_uk="A sufficiently long summary.", reasoning="Because.", eval_model="m/x"
+            score=7.0, summary="A sufficiently long summary.", reasoning="Because.", eval_model="m/x"
         )
 
 
@@ -85,7 +85,7 @@ class LegacyChain:
     def evaluate_job(self, job):
         self.jobs.append(job.title)
         return JobEvaluationResult(
-            score=7.0, summary_uk="A sufficiently long summary.", reasoning="Because.", eval_model="m/x"
+            score=7.0, summary="A sufficiently long summary.", reasoning="Because.", eval_model="m/x"
         )
 
 

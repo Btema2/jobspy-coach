@@ -6,9 +6,11 @@ boards expansion), compiled rules, the evaluator system prompt and a cost estima
 only what decides *which* (query, board) calls exist lives here.
 """
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from src.evaluator.prompts import DEFAULT_CANDIDATE_PERSONA, render_system_prompt
+from src.evaluator.prompts import DEFAULT_CANDIDATE_PERSONA
+from src.evaluator.rubric import RubricInputs, render_rubric
+from src.evaluator.scoring import ScoringPolicy
 from src.filters.rules import RULE_KINDS, RULE_MODES, CompiledRule, compile_rule
 from src.filters.seniority import seniority_rules
 from src.profile.errors import ProfileCompileError
@@ -81,6 +83,9 @@ class CompiledProfile:
     rules: Tuple[CompiledRule, ...]
     system_prompt: str
     bonus_enabled: bool
+    bonus_points: float
+    core_cap: Optional[float]
+    scoring: ScoringPolicy
     paused: bool
     wow_threshold: float
     digest_threshold: float
@@ -121,7 +126,9 @@ def _compile_rule(kind: str, term: str, mode: str, reason: str, source: str) -> 
         raise ProfileCompileError(f"rule '{term}': {exc}") from exc
 
 
-def _expand(snapshot: ProfileSnapshot, warnings: List[str]) -> List[SearchQuery]:
+def _expand(
+    snapshot: ProfileSnapshot, warnings: List[str], remote_only_ids: Set[str]
+) -> List[SearchQuery]:
     queries: List[SearchQuery] = []
     warned_markets: Set[str] = set()
     markets = [m for m in snapshot.markets if m.enabled]
@@ -147,6 +154,8 @@ def _expand(snapshot: ProfileSnapshot, warnings: List[str]) -> List[SearchQuery]
                     SearchQuery(expanded_query_id(role.name, term, market.name), term, market.location,
                                 base, None, remote)
                 )
+                if market.remote_only:
+                    remote_only_ids.add(queries[-1].query_id)
                 if not market.countries and market.name not in warned_markets:
                     warned_markets.add(market.name)
                     warnings.append(f"market '{market.name}': no country, Indeed and Glassdoor skipped")
@@ -157,6 +166,8 @@ def _expand(snapshot: ProfileSnapshot, warnings: List[str]) -> List[SearchQuery]
                         SearchQuery(expanded_query_id(role.name, term, market.name, country), term, location,
                                     boards, country, remote)
                     )
+                    if market.remote_only:
+                        remote_only_ids.add(queries[-1].query_id)
     return queries
 
 
@@ -182,7 +193,8 @@ def compile_profile(
             SearchQuery(p.query_id, p.term, p.location, list(p.boards), p.country, p.is_remote,
                         p.google_search_term)
         )
-    queries.extend(_expand(snapshot, warnings))
+    remote_only_ids: Set[str] = set()
+    queries.extend(_expand(snapshot, warnings, remote_only_ids))
 
     unique: Dict[str, SearchQuery] = {}
     for q in queries:
@@ -213,12 +225,42 @@ def compile_profile(
     rules = tuple(
         _compile_rule(r.kind, r.term, r.match_mode, r.reason, r.source) for r in snapshot.rules
     ) + seniority_rules(f.target_level, languages)
+    system_prompt = render_rubric(
+        RubricInputs(
+            persona=f.persona.strip() or DEFAULT_CANDIDATE_PERSONA,
+            core_role_definition=f.core_role_definition,
+            adjacent_role_definition=f.adjacent_role_definition,
+            dealbreakers=f.dealbreakers,
+            bonus_criteria=f.bonus_criteria,
+            output_language=f.output_language,
+            wow_threshold=f.wow_threshold,
+            digest_threshold=f.digest_threshold,
+            remote_only=any(m.enabled and m.remote_only for m in snapshot.markets),
+        )
+    )
+    bonus_enabled = bool(f.bonus_criteria.strip())
+    core_cap = round(f.wow_threshold - 0.1, 6) if f.core_role_definition.strip() else None
+    # Only queries of enabled remote-only markets are expanded, so every id collected is of such a market.
+    remote_filter_ids: FrozenSet[str] = frozenset(q.query_id for q in final if q.query_id in remote_only_ids)
+    scoring = ScoringPolicy(
+        system_prompt=system_prompt,
+        wow_threshold=f.wow_threshold,
+        digest_threshold=f.digest_threshold,
+        bonus_enabled=bonus_enabled,
+        bonus_points=f.bonus_points,
+        core_cap=core_cap,
+        rules=rules,
+        remote_filter_query_ids=remote_filter_ids,
+    )
     return CompiledProfile(
         version=snapshot.version,
         queries=final,
         rules=rules,
-        system_prompt=render_system_prompt(f.persona.strip() or DEFAULT_CANDIDATE_PERSONA),
-        bonus_enabled=bool(f.bonus_criteria.strip()),
+        system_prompt=system_prompt,
+        bonus_enabled=bonus_enabled,
+        bonus_points=f.bonus_points,
+        core_cap=core_cap,
+        scoring=scoring,
         paused=f.paused,
         wow_threshold=f.wow_threshold,
         digest_threshold=f.digest_threshold,

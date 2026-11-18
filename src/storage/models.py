@@ -7,7 +7,7 @@ from typing import List, Optional
 class JobEvaluationResult:
     score: float
     is_wow: bool
-    summary_uk: str
+    summary: str
     reasoning: str
     language_requirements: List[str] = field(default_factory=list)
     pros: List[str] = field(default_factory=list)

@@ -9,11 +9,11 @@ def test_extract_json_payload_is_reexported_from_package():
 
 
 def test_extract_json_payload_clean():
-    raw = '{"score": 9.5, "is_wow": true, "summary_uk": "Чудова позиція.", "reasoning": "Fits well", "language_requirements": ["EN"], "pros": [], "cons": []}'
+    raw = '{"score": 9.5, "is_wow": true, "summary": "Чудова позиція.", "reasoning": "Fits well", "language_requirements": ["EN"], "pros": [], "cons": []}'
     parsed = extract_json_payload(raw)
     assert parsed["score"] == 9.5
     assert parsed["is_wow"] is True
-    assert parsed["summary_uk"] == "Чудова позиція."
+    assert parsed["summary"] == "Чудова позиція."
 
 
 def test_extract_json_payload_markdown_and_noise():
@@ -22,7 +22,7 @@ def test_extract_json_payload_markdown_and_noise():
     {
       "score": 8.5,
       "is_wow": false,
-      "summary_uk": "Відмінна вакансія бізнес-тренера.",
+      "summary": "Відмінна вакансія бізнес-тренера.",
       "reasoning": "Strong corporate fit",
       "language_requirements": ["PL", "EN"],
       "pros": ["Good salary"],
@@ -33,7 +33,7 @@ def test_extract_json_payload_markdown_and_noise():
     parsed = extract_json_payload(raw)
     assert parsed["score"] == 8.5
     assert parsed["is_wow"] is False
-    assert parsed["summary_uk"] == "Відмінна вакансія бізнес-тренера."
+    assert parsed["summary"] == "Відмінна вакансія бізнес-тренера."
 
 
 def test_extract_json_payload_malformed_raises_value_error():
@@ -58,15 +58,26 @@ def test_extract_json_payload_none_raises_value_error():
 
 
 def test_extract_json_payload_outermost_json_without_fences():
-    raw = 'Sure, here is the result: {"score": 7.5, "is_wow": false, "summary_uk": "Звичайна вакансія.", "reasoning": "Ok", "language_requirements": [], "pros": [], "cons": []}. Hope this helps!'
+    raw = 'Sure, here is the result: {"score": 7.5, "is_wow": false, "summary": "Звичайна вакансія.", "reasoning": "Ok", "language_requirements": [], "pros": [], "cons": []}. Hope this helps!'
     parsed = extract_json_payload(raw)
     assert parsed["score"] == 7.5
-    assert parsed["summary_uk"] == "Звичайна вакансія."
+    assert parsed["summary"] == "Звичайна вакансія."
 
 
 def test_extract_json_payload_broken_fence_fallback_to_json_regex():
     # If code fence contains broken/invalid text, but outer JSON regex can locate a valid JSON block
-    raw = '```markdown\nBroken fence here\n```\nHere is valid JSON: {"score": 8.0, "is_wow": false, "summary_uk": "Тестова вакансія.", "reasoning": "Valid", "language_requirements": [], "pros": [], "cons": []}'
+    raw = '```markdown\nBroken fence here\n```\nHere is valid JSON: {"score": 8.0, "is_wow": false, "summary": "Тестова вакансія.", "reasoning": "Valid", "language_requirements": [], "pros": [], "cons": []}'
     parsed = extract_json_payload(raw)
     assert parsed["score"] == 8.0
-    assert parsed["summary_uk"] == "Тестова вакансія."
+    assert parsed["summary"] == "Тестова вакансія."
+
+
+def test_old_keys_accepted():
+    from src.evaluator.schemas import JobEvaluationResult
+
+    raw = (
+        '{"score": 7.0, "summary_uk": "Старий ключ резюме вакансії.", "reasoning": "ok",'
+        ' "role_is_direct_coaching": true}'
+    )
+    result = JobEvaluationResult.model_validate(extract_json_payload(raw))
+    assert (result.summary, result.is_core_role) == ("Старий ключ резюме вакансії.", True)

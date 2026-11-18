@@ -300,6 +300,15 @@ def test_bonus_points_range(started: ProfileStore, points, ok):
             apply_changes(started, [SetField("bonus_points", points)], label="x")
 
 
+@pytest.mark.parametrize("value,ok", [(None, True), ("en", True), ("uk", True), ("fil", True), ("EN", False), ("english", False), ("e", False), ("e1", False), ("", False)])
+def test_output_language_is_a_language_code_or_unset(started: ProfileStore, value, ok):
+    if ok:
+        apply_changes(started, [SetField("output_language", value)], label="x")
+    else:
+        with pytest.raises(ProfileValidationError):
+            apply_changes(started, [SetField("output_language", value)], label="x")
+
+
 def test_set_field_unknown_name_and_wrong_type(started: ProfileStore):
     with pytest.raises(ProfileValidationError):
         apply_changes(started, [SetField("persnoa", "x")], label="x")

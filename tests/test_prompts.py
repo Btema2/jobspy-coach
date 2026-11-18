@@ -46,7 +46,7 @@ def test_prompt_encodes_generic_rubric_tiers(no_profile):
     prompt = build_system_prompt()
     for expected in ("HARD REJECT", "1.0", "2.0", "6.5", "8.4", "8.5", "10.0", "DIGEST", "WOW"):
         assert expected in prompt
-    # The output language of summary_uk comes from the local profile (English if none states one).
+    # The output language of the summary comes from the local profile (English if none states one).
     assert "Ukrainian" not in prompt
     assert "output language" in prompt.lower()
     assert "English if none" in prompt
@@ -56,13 +56,13 @@ def test_prompt_declares_json_contract_with_generic_flags(no_profile):
     prompt = build_system_prompt()
     for field in (
         "score",
-        "summary_uk",
+        "summary",
         "reasoning",
         "language_requirements",
         "pros",
         "cons",
         "hard_reject",
-        "role_is_direct_coaching",
+        "is_core_role",
         "matches_bonus_criteria",
     ):
         assert f'"{field}"' in prompt
@@ -89,7 +89,7 @@ def test_prompt_without_profile_file_has_no_profile_content(no_profile):
 
 
 def test_user_prompt_truncates_description():
-    text = build_job_user_prompt("T", "C", "L", True, "x" * 5000)
+    text = build_job_user_prompt("T", "C", "L", "unverified", "x" * 5000)
     assert text.count("x") == 4000
 
 
@@ -109,3 +109,21 @@ def test_prompt_defines_direct_coaching_strictly(no_profile):
     for non_coaching in ("corporate trainer", "learning and development", "internal training facilitator"):
         assert non_coaching in lowered
     assert "wow also requires" in lowered or "only direct" in lowered
+
+
+def test_user_prompt_prints_remote_label():
+    text = build_job_user_prompt("T", "C", "L", "unverified (found with the remote filter)", "d")
+    assert "Remote: unverified (found with the remote filter)\n" in text
+
+
+def test_render_system_prompt_is_gone():
+    assert not hasattr(prompts, "render_system_prompt")
+
+
+def test_fallback_prompt_matches_compiled_legacy_import(no_profile):
+    from src.profile.compiler import compile_profile
+    from src.profile.importer import build_imported_snapshot
+
+    persona = "- Persona\n\n## Bonus criteria\n- <CRED>"
+    snapshot, _ = build_imported_snapshot((), persona, wow_threshold=8.5, digest_threshold=6.5)
+    assert build_system_prompt(persona) == compile_profile(snapshot).system_prompt

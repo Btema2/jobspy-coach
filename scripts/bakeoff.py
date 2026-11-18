@@ -90,7 +90,7 @@ def parse_model_output(content: Optional[str]) -> Dict[str, Any]:
         "valid_json": False,
         "score": None,
         "hard_reject": None,
-        "role_is_direct_coaching": None,
+        "is_core_role": None,
         "matches_bonus_criteria": None,
         "had_fence": "```" in raw,
         "had_think": "</think>" in raw.lower() or "<think>" in raw.lower(),
@@ -110,7 +110,7 @@ def parse_model_output(content: Optional[str]) -> Dict[str, Any]:
         valid_json=True,
         score=float(result.score),
         hard_reject=result.hard_reject,
-        role_is_direct_coaching=result.role_is_direct_coaching,
+        is_core_role=result.is_core_role,
         matches_bonus_criteria=result.matches_bonus_criteria,
     )
     return info
@@ -277,7 +277,8 @@ def build_messages(case: Dict[str, Any], persona: str = "generic") -> List[Dict[
         {
             "role": "user",
             "content": build_job_user_prompt(
-                case["title"], case["company"], case["location"], bool(case.get("is_remote")), case["description"]
+                case["title"], case["company"], case["location"],
+                "yes" if case.get("is_remote") else "unverified", case["description"]
             ),
         },
     ]
