@@ -16,6 +16,10 @@ class JobEvaluationResult(BaseModel):
     matches_bonus_criteria: bool = Field(default=False, description="Posting explicitly values the bonus criteria described in the local profile")
     role_is_direct_coaching: bool = Field(default=False, description="Role is direct 1-on-1 coaching / psychological support")
     eval_model: Optional[str] = Field(default=None, description="Model that actually produced the evaluation")
+    raw_score: Optional[float] = Field(
+        default=None,
+        description="Clamped model score before bonus, reject cap, title safety net and non-core cap (set by the pipeline)",
+    )
 
     @field_validator("score", mode="before")
     @classmethod

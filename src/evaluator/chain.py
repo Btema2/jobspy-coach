@@ -222,6 +222,7 @@ class ProviderChainEvaluator:
 
     def _postprocess(self, result: JobEvaluationResult, job: JobPosting) -> JobEvaluationResult:
         score = min(10.0, max(1.0, float(result.score)))
+        result.raw_score = score  # kept so scores can be re-bucketed later without another LLM call
         if result.hard_reject or score <= REJECT_CAP:
             score = min(score, REJECT_CAP)
         elif result.matches_bonus_criteria and score >= BONUS_MIN_BASE_SCORE:

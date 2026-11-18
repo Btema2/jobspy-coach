@@ -688,3 +688,40 @@ def test_new_job_fields_default_for_legacy_rows(tmp_path: Path):
     assert loaded.eval_is_core_role is None
     assert loaded.eval_bonus_flag is None
     assert loaded.eval_hard_reject is None
+
+
+@pytest.mark.parametrize("notification_status", [None, "pending"])
+def test_update_evaluation_persists_raw_fields(tmp_path: Path, notification_status):
+    from src.evaluator.schemas import JobEvaluationResult as PydanticResult
+    db = Database(tmp_path / "raw.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("raw"))
+    result = PydanticResult(
+        score=7.0, summary_uk="A valid summary text.", reasoning="r", raw_score=7.0,
+        role_is_direct_coaching=True, matches_bonus_criteria=False, hard_reject=False,
+    )
+    db.update_evaluation(job_id, result, notification_status=notification_status)
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.eval_raw_score == 7.0
+    assert loaded.eval_is_core_role is True
+    assert loaded.eval_bonus_flag is False
+    assert loaded.eval_hard_reject is False
+    if notification_status:
+        assert loaded.notification_status == notification_status
+
+
+@pytest.mark.parametrize("notification_status", [None, "pending"])
+def test_update_evaluation_without_raw_fields_leaves_null(tmp_path: Path, notification_status):
+    db = Database(tmp_path / "noraw.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("noraw"))
+    db.update_evaluation(
+        job_id,
+        JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r"),
+        notification_status=notification_status,
+    )
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.eval_raw_score is None
+    assert loaded.eval_is_core_role is None
+    assert loaded.eval_bonus_flag is None
+    assert loaded.eval_hard_reject is None

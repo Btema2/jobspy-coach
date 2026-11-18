@@ -317,55 +317,43 @@ class Database:
     ) -> None:
         now_str = datetime.now(timezone.utc).isoformat()
         eval_model = eval_result.eval_model if isinstance(eval_result.eval_model, str) else None
+        def _opt_int(value: Any) -> Optional[int]:
+            return None if value is None else int(bool(value))
+
+        raw_score = getattr(eval_result, "raw_score", None)
         with self._get_connection() as conn:
-            if notification_status is not None:
-                conn.execute("""
-                UPDATE jobs SET
-                    eval_status = 'evaluated',
-                    eval_score = ?,
-                    eval_is_wow = ?,
-                    eval_summary_uk = ?,
-                    eval_reasoning = ?,
-                    eval_languages = ?,
-                    eval_pros = ?,
-                    eval_cons = ?,
-                    eval_model = ?,
-                    notification_status = ?,
-                    evaluated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """, (
-                    eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
-                    json.dumps(eval_result.language_requirements, ensure_ascii=False),
-                    json.dumps(eval_result.pros, ensure_ascii=False),
-                    json.dumps(eval_result.cons, ensure_ascii=False),
-                    eval_model,
-                    notification_status,
-                    now_str, now_str, job_id
-                ))
-            else:
-                conn.execute("""
-                UPDATE jobs SET
-                    eval_status = 'evaluated',
-                    eval_score = ?,
-                    eval_is_wow = ?,
-                    eval_summary_uk = ?,
-                    eval_reasoning = ?,
-                    eval_languages = ?,
-                    eval_pros = ?,
-                    eval_cons = ?,
-                    eval_model = ?,
-                    evaluated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """, (
-                    eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
-                    json.dumps(eval_result.language_requirements, ensure_ascii=False),
-                    json.dumps(eval_result.pros, ensure_ascii=False),
-                    json.dumps(eval_result.cons, ensure_ascii=False),
-                    eval_model,
-                    now_str, now_str, job_id
-                ))
+            conn.execute("""
+            UPDATE jobs SET
+                eval_status = 'evaluated',
+                eval_score = ?,
+                eval_is_wow = ?,
+                eval_summary_uk = ?,
+                eval_reasoning = ?,
+                eval_languages = ?,
+                eval_pros = ?,
+                eval_cons = ?,
+                eval_model = ?,
+                eval_raw_score = ?,
+                eval_is_core_role = ?,
+                eval_bonus_flag = ?,
+                eval_hard_reject = ?,
+                notification_status = COALESCE(?, notification_status),
+                evaluated_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """, (
+                eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
+                json.dumps(eval_result.language_requirements, ensure_ascii=False),
+                json.dumps(eval_result.pros, ensure_ascii=False),
+                json.dumps(eval_result.cons, ensure_ascii=False),
+                eval_model,
+                float(raw_score) if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool) else None,
+                _opt_int(getattr(eval_result, "role_is_direct_coaching", None)),
+                _opt_int(getattr(eval_result, "matches_bonus_criteria", None)),
+                _opt_int(getattr(eval_result, "hard_reject", None)),
+                notification_status,
+                now_str, now_str, job_id
+            ))
             conn.commit()
 
     def mark_dismissed(self, job_id: int) -> None:

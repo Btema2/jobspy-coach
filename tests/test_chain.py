@@ -874,3 +874,23 @@ def test_cap_is_silent_when_it_does_not_bite(caplog):
     with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
         evaluate(score=7.0, role_is_direct_coaching=False)
     assert not any("capped" in r.getMessage().lower() for r in caplog.records)
+
+
+# ---------- raw score recording ----------
+
+def test_postprocess_records_raw_score_before_adjustments():
+    boosted = evaluate(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True)
+    assert boosted.score == 8.5  # 7.0 + BONUS_POINTS (1.5), direct coaching so no cap
+    assert boosted.raw_score == 7.0
+
+    rejected = evaluate(score=9.0, hard_reject=True)
+    assert rejected.score == 2.0
+    assert rejected.raw_score == 9.0
+
+
+def test_postprocess_raw_score_ignores_non_core_cap_and_is_clamped():
+    capped = evaluate(score=9.5, role_is_direct_coaching=False)
+    assert capped.score == DIGEST_MAX_SCORE
+    assert capped.raw_score == 9.5
+
+    assert evaluate(score=14, role_is_direct_coaching=True).raw_score == 10.0
