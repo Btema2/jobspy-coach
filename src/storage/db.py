@@ -506,6 +506,27 @@ class Database:
             conn.commit()
             return cursor.rowcount
 
+    def record_job_hit(self, job_id: int, query_key: str) -> None:
+        """Record that ``query_key`` surfaced this job; keeps ``first_seen``, refreshes ``last_seen``."""
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO job_hits (job_id, query_key, first_seen, last_seen) VALUES (?, ?, ?, ?)
+                ON CONFLICT(job_id, query_key) DO UPDATE SET last_seen = excluded.last_seen
+                """,
+                (job_id, query_key, now_str, now_str),
+            )
+
+    def get_job_hits(self, job_id: int) -> List[Dict[str, str]]:
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT query_key, first_seen, last_seen FROM job_hits WHERE job_id = ? "
+                "ORDER BY first_seen, query_key",
+                (job_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def rehash_all(self, dry_run: bool = False) -> Dict[str, int]:
         """Recompute ``dedup_hash`` for every row with the current normalization (idempotent).
 
@@ -514,7 +535,7 @@ class Database:
         pre-filtered (so a legacy stub never beats a full posting), else the oldest (lowest id). The other rows are deleted, EXCEPT further alert-sent rows: those are never deleted;
         they keep a unique filler hash derived from the canonical one ("twins"). Returns counters:
         ``total`` rows scanned, ``rehashed`` rows whose stored hash changed, ``merged`` rows deleted,
-        ``kept_twins`` alert-sent rows kept as twins. With ``dry_run`` nothing is written.
+        ``kept_twins`` alert-sent rows kept as twins. ``job_hits`` of deleted rows move to the keeper. With ``dry_run`` nothing is written.
         """
         alerted = ("instant_sent", "digest_sent")
         with self._get_connection() as conn:
@@ -529,6 +550,7 @@ class Database:
                 ).append(row)
 
             deletions: List[int] = []
+            merged_into: Dict[int, int] = {}
             targets: Dict[int, str] = {}
             twins = 0
             for canonical, members in groups.items():
@@ -547,6 +569,7 @@ class Database:
                         ).hexdigest()
                     else:
                         deletions.append(extra["id"])
+                        merged_into[extra["id"]] = members[0]["id"]
 
             current = {r["id"]: r["dedup_hash"] for r in rows}
             changes = {i: h for i, h in targets.items() if current[i] != h}
@@ -560,6 +583,12 @@ class Database:
                 return stats
 
             for job_id in deletions:
+                # Move the duplicate's per-query hits to the keeper; clashing (job_id, query_key) rows
+                # are ignored here and removed by the delete's ON DELETE CASCADE.
+                conn.execute(
+                    "UPDATE OR IGNORE job_hits SET job_id = ? WHERE job_id = ?",
+                    (merged_into[job_id], job_id),
+                )
                 conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             # Two phases so a new hash can never collide with a not-yet-rewritten old hash (UNIQUE).
             for job_id in changes:
