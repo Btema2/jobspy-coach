@@ -21,15 +21,27 @@ from apscheduler.triggers.interval import IntervalTrigger
 from src.config import get_settings
 from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.errors import ConfigurationError, EvaluationRejected, ProvidersUnavailable, StopRequested
+from src.logging_config import redact_secrets
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.notifier.templates import format_version_update_notice
 from src.scraper.jobspy_scraper import JobSpyScraper
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries
+from src.scraper.outcome import ScrapeOutcome
+from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries, query_key
 from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
 from src.storage.models import JobPosting
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_STORED_ERROR_CHARS = 300
+
+
+def sanitize_error_message(message: Optional[str]) -> Optional[str]:
+    """Redact secrets (proxy URL credentials, tokens) and truncate an error before it is persisted."""
+    if message is None:
+        return None
+    return redact_secrets(str(message))[:_MAX_STORED_ERROR_CHARS]
 
 
 @dataclass(frozen=True)
@@ -354,6 +366,16 @@ class DaemonService:
         # Scraper without a call plan (e.g. a test double): run every configured board.
         return [(q, site) for q in queries for site in q.site_names]
 
+    def _scrape_call(self, site: str, query: SearchQuery) -> ScrapeOutcome:
+        """One (query, board) scrape as a ScrapeOutcome; wraps the plain list of a legacy test double."""
+        outcome_fn = getattr(self.scraper, "scrape_board_outcome", None)
+        if callable(outcome_fn):
+            result = outcome_fn(site, query)
+            if isinstance(result, ScrapeOutcome):
+                return result
+        postings = self.scraper.scrape_board(site, query)
+        return ScrapeOutcome(postings=postings, rows=len(postings), status="ok" if postings else "empty")
+
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
     ) -> Tuple[int, int]:
@@ -375,9 +397,11 @@ class DaemonService:
 
                 t0 = time.time()
                 try:
-                    board_postings = self.scraper.scrape_board(site, q)
+                    outcome = self._scrape_call(site, q)
+                    board_postings = outcome.postings
                     duration = time.time() - t0
                     board_new_saved = 0
+                    hit_key = query_key(q, site)
 
                     for posting in board_postings:
                         if dry_run:
@@ -386,7 +410,9 @@ class DaemonService:
                             )
                             continue
 
-                        _, is_new = self.db.save_job(posting)
+                        # save_job returns the id for known jobs too; source_query is only stored for new rows.
+                        job_id, is_new = self.db.save_job(posting)
+                        self.db.record_job_hit(job_id, hit_key)
                         if is_new:
                             board_new_saved += 1
                             total_new_saved += 1
@@ -396,17 +422,24 @@ class DaemonService:
                             "[%d/%d] %s %s saved %d new (%d already known)",
                             idx, len(plan), q.query_id, site, board_new_saved, len(board_postings) - board_new_saved,
                         )
+                        failed = outcome.status == "failed"
                         self.db.record_scrape_run(
                             board=site,
                             query=q.search_term,
                             jobs_found=len(board_postings),
                             new_jobs_saved=board_new_saved,
                             duration_sec=duration,
-                            status="completed",
+                            status="failed" if failed else "completed",
+                            error_message=sanitize_error_message(outcome.error) if failed else None,
+                            rows_returned=outcome.rows,
+                            prefiltered=outcome.prefiltered,
+                            outcome=outcome.status,
+                            query_key=hit_key,
                         )
                 except Exception as e:
                     duration = time.time() - t0
-                    logger.error(f"Failed scrape cycle for board '{site}' query '{q.query_id}': {e}")
+                    safe_error = sanitize_error_message(str(e))
+                    logger.error(f"Failed scrape cycle for board '{site}' query '{q.query_id}': {safe_error}")
                     if not dry_run:
                         self.db.record_scrape_run(
                             board=site,
@@ -415,7 +448,9 @@ class DaemonService:
                             new_jobs_saved=0,
                             duration_sec=duration,
                             status="failed",
-                            error_message=str(e),
+                            error_message=safe_error,
+                            outcome="failed",
+                            query_key=query_key(q, site),
                         )
         finally:
             end_cycle = getattr(self.scraper, "end_cycle", None)
