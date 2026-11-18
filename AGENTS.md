@@ -28,10 +28,13 @@ src/
 │   └── pre_filter.py      # Zero-cost deterministic filters: sports/pets noise, title traps, seniority (classify_title), stub descriptions
 ├── scraper/
 │   ├── query_catalog.py   # Curated search queries mapped by country & board
-│   └── jobspy_scraper.py  # python-jobspy wrapper with pacing, jitter, proxies
+│   ├── jobspy_scraper.py  # python-jobspy wrapper with pacing, jitter, proxies
+│   ├── outcome.py         # ScrapeOutcome: per-(query, board) result (ok / empty / failed / skipped)
+│   └── coordinator.py     # ScrapeCoordinator: per-call lock + shared LinkedIn pacing
 ├── storage/
 │   ├── models.py          # Dataclasses (JobPosting, JobEvaluationResult, ScrapeRun)
-│   └── db.py              # SQLite WAL repository with SHA-256 deduplication
+│   ├── db.py              # SQLite WAL repository with SHA-256 deduplication
+│   └── migrations.py      # Add-only ordered migrations + schema_version table
 ├── evaluator/
 │   ├── chain.py           # ProviderChainEvaluator: NIM -> OpenRouter fallback, validation, score post-processing
 │   ├── providers.py       # NvidiaNimProvider / OpenRouterProvider (httpx, retries, error classification, daily budget)
@@ -73,6 +76,8 @@ docs/
    - JobSpy defaults `fetch_description=False`. If omitted, JobSpy returns `description=None` for all LinkedIn jobs, causing our pre-filter to drop 100% of LinkedIn jobs as `DESCRIPTION_TOO_SHORT`.
    - **Always pass `fetch_description=True`** in `JobSpyScraper.scrape_board`.
    - A failed detail request (HTTP 429, redirect) is only logged by python-jobspy and yields `description=None`. `scrape_board` skips such LinkedIn rows (WARNING with a count; not saved, so a later cycle retries them) instead of storing them as dismissed, because the dedup hash would suppress them forever. Short but non-empty descriptions, other boards, and titles the pre-filter drops on their own are unaffected.
+   - `scrape_board_outcome(query, board, track_cycle=True)` returns a `ScrapeOutcome` (postings, rows returned, pre-filtered count, `status`, error/skip reason). A board error reported in `df.attrs["errors"]` with no rows is `failed` (a blocked board, not an empty result); boards skipped for a missing country are `skipped`. `scrape_board` is a thin wrapper returning only the postings. The daemon records `scrape_runs.outcome/rows_returned/prefiltered/query_key` and `job_hits` from it; a skipped board is stored with status `completed`, outcome `skipped`.
+   - All board calls go through `ScrapeCoordinator` (one lock per call, shared LinkedIn cooldown); the scraper exposes `last_linkedin_call_time` and `linkedin_cooldown_seconds` as delegating properties.
    - Scrape progress (`[i/N] query board ...` before/after each call plus a per-board summary) is logged by the scraper itself (`begin_cycle`/`scrape_board`/`end_cycle`), because the CLI `scrape` and the daemon call `DaemonService.run_pipeline_cycle`, which calls `scrape_board` directly and never `scrape_all_queries`.
 2. **Rate Limiting & Guest Endpoints (HTTP 429)**:
    - LinkedIn guest endpoints aggressively throttle when blasted with large batch sizes.
@@ -109,6 +114,7 @@ docs/
    - Free models are frequently rate-limited upstream; treat the fallback as best-effort. The local daily budget (`OPENROUTER_DAILY_BUDGET`, default 45 of ~50/day) counts every HTTP attempt, rolls over at 00:00 UTC and resets on restart.
    - Only the first default model was verified in the bake-off (see `docs/model-selection.md`).
 3. **Model logging (`eval_model`)**: store the model that actually answered (`data.get("model", self.model)`) on `JobEvaluationResult.eval_model` and log it at `INFO`.
+   - `ProviderChainEvaluator.evaluate_job(job, system_prompt=None)` accepts an optional per-call system prompt (the daemon does not use it yet). `JobEvaluationResult.raw_score` keeps the pre-adjustment score; `update_evaluation` stores `eval_raw_score`, `eval_is_core_role`, `eval_bonus_flag` and `eval_hard_reject` for later re-bucketing.
 4. **Concurrency model (threads)**:
    - Worker threads run **only** `chain.evaluate_job` (HTTP + parsing). The thread that called `evaluate_unprocessed` is the **only** one that touches SQLite or Telegram (caller-thread invariant); do not move DB/Telegram work into workers.
    - Shutdown never calls `executor.shutdown(wait=True)`; signal handlers only set stop events and cancel queued futures (`request_shutdown`), because `with ThreadPoolExecutor` or executor shutdown inside a handler can deadlock.
@@ -122,12 +128,13 @@ docs/
 1. **Message Length**: Telegram hard-limits messages to 4,096 characters. All digests must chunk at $\le 3,800$ characters.
 2. **HTML Entity Escaping**: Job titles, company names, and URLs must pass through `html.escape()` (`&`, `<`, `>`) before insertion into HTML message strings to prevent 400 Bad Request parsing errors.
 3. **Summary & Reasoning Guards**: Summaries are clamped to 600 chars and reasoning to 800 chars before formatting.
-4. **Token Hygiene**: The bot token is part of the API URL, so `httpx` INFO logging would print it. `configure_logging()` (`src/logging_config.py`) keeps `httpx`/`httpcore` at WARNING and attaches a redacting filter to the root handlers. Never log `str(exception)` from an httpx call or the request URL. If a token was ever logged or pasted anywhere, rotate it (BotFather `/revoke`) and update `.env`.
+4. **Token Hygiene**: The bot token is part of the API URL, so `httpx` INFO logging would print it. `configure_logging()` (`src/logging_config.py`) keeps `httpx`/`httpcore` at WARNING and attaches a redacting filter to the root handlers. Never log `str(exception)` from an httpx call or the request URL. If a token was ever logged or pasted anywhere, rotate it (BotFather `/revoke`) and update `.env`. Error text stored in `scrape_runs` goes through `redact_secrets` (which also masks `scheme://user:pass@` proxy credentials) and is truncated to 300 chars by the daemon's `sanitize_error_message`.
 
 ### E. SQLite Concurrency & Database Operations
-1. **WAL Mode**: SQLite must always run in Write-Ahead Logging mode (`PRAGMA journal_mode = WAL;`) with `PRAGMA busy_timeout = 5000;` and `PRAGMA synchronous = NORMAL;`.
+1. **WAL Mode**: SQLite must always run in Write-Ahead Logging mode (`PRAGMA journal_mode = WAL;`) with `PRAGMA busy_timeout = 5000;` and `PRAGMA synchronous = NORMAL;`. `_get_connection` sets `busy_timeout` first and retries the WAL pragma on "database is locked", so two processes initialising a fresh file at once do not fail.
 2. **Dedup rehash**: `Database.rehash_all()` (CLI `rehash`) is idempotent. Per group of colliding rows it keeps the alert-sent row, else the evaluated row, else the oldest; other rows are deleted, but a second alert-sent row is never deleted (it keeps a unique filler hash). Stop the daemon before running it.
 3. **Stale Records Cleanup**: If bad scrape runs populate the database with stub records (e.g. empty descriptions), use `Database.delete_empty_description_jobs("linkedin")` to remove them so deduplication hashes don't permanently suppress valid future scrapes.
+4. **Schema changes** go through `src/storage/migrations.py` (ordered, add-only: no renames, no drops; tracked in `schema_version`), never ad-hoc `ALTER TABLE`. New columns include `jobs.source_query`, `jobs.remote_status`, `jobs.eval_raw_score/eval_is_core_role/eval_bonus_flag/eval_hard_reject` (filled for new evaluations only) and the `scrape_runs`/`job_hits` additions.
 
 ---
 

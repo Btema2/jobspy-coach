@@ -90,7 +90,7 @@ Scrape and job additions (add-only):
 - `scrape_runs` gets `rows_returned`, `prefiltered`, `outcome` and `query_key`.
 - `job_hits(job_id, query_key, first_seen, last_seen)` records every query that returned a job, including already-known jobs. It is keyed by `jobs.id`, and `rehash_all` re-points hits of deleted duplicates to the surviving row.
 - `jobs.source_query` (new column) records the first finder only. `jobs.remote_status` (new column, `verified` or `unverified`).
-- `jobs.eval_raw_score`, `jobs.eval_is_core_role`, `jobs.eval_bonus_flag` are filled for new evaluations. Older rows have NULL and are excluded from re-bucketing, with a count reported to the user.
+- `jobs.eval_raw_score`, `jobs.eval_is_core_role`, `jobs.eval_bonus_flag` and `jobs.eval_hard_reject` are filled for new evaluations. Re-bucketing needs the hard-reject flag because a hard reject caps the stored score regardless of the raw score. Older rows have NULL and are excluded from re-bucketing, with a count reported to the user.
 
 Existing columns, including `eval_summary_uk`, are not renamed.
 
@@ -110,7 +110,7 @@ Expansion rules:
 
 Cost control: the compiler counts calls and estimates cycle duration (LinkedIn cooldown x LinkedIn calls plus a per-call allowance). A profile whose call count exceeds `max_calls_per_cycle` is rejected by `ops` and never applied. The estimate versus `SCRAPE_INTERVAL_HOURS` is a runtime warning shown in `/preview` and diffs, not a validation rule, so an `.env` change can never invalidate a stored profile.
 
-Remote handling. The row flag is positive evidence only: `True` means `remote_status = verified`; `False` or missing means `unverified`. Rows are never dropped because of a `False` flag. The scraper stops substituting the query flag for a missing value. For a `remote_only` market the query always runs with the board's remote filter, and unverified rows are kept; the scorer receives `Remote: unverified (found with the remote filter)` and a remote-only requirement among the dealbreakers, so the judgement comes from the description. `remote_status` is stored in branch 1 and used by the scorer in branch 3.
+Remote handling. The row flag is positive evidence only: `True` means `remote_status = verified`; `False` or missing means `unverified`. Rows are never dropped because of a `False` flag. In branch 1 the scraper stops substituting the query flag for a missing value; this affects only boards that return no value. For a `remote_only` market the query always runs with the board's remote filter, and unverified rows are kept; the scorer receives `Remote: unverified (found with the remote filter)` and a remote-only requirement among the dealbreakers, so the judgement comes from the description. `remote_status` is stored in branch 1 and used by the scorer in branch 3.
 
 Automatic import and legacy seed, so an existing setup keeps working:
 
