@@ -348,6 +348,54 @@ def test_alert_send_failure_is_logged_not_raised(tmp_path, caplog):
     assert any("alert" in r.getMessage().lower() for r in caplog.records)
 
 
+def test_alert_not_recorded_when_send_returns_false_so_it_retries(tmp_path):
+    daemon = _make(tmp_path)
+    daemon.notifier.send_message.return_value = False
+
+    daemon._alert_once("k", "first")
+    daemon._alert_once("k", "second")
+    assert daemon.notifier.send_message.call_count == 2  # not recorded: retried
+
+    daemon.notifier.send_message.return_value = True
+    daemon._alert_once("k", "third")
+    daemon._alert_once("k", "fourth")
+    assert daemon.notifier.send_message.call_count == 3  # recorded after a success
+
+
+def test_alert_not_recorded_when_send_raises(tmp_path):
+    daemon = _make(tmp_path)
+    daemon.notifier.send_message.side_effect = RuntimeError("boom")
+
+    daemon._alert_once("k", "x")
+    daemon._alert_once("k", "x")
+
+    assert daemon.notifier.send_message.call_count == 2
+
+
+def test_compile_error_log_is_redacted_and_truncated(tmp_path, caplog):
+    import logging
+
+    daemon = _make(tmp_path)
+    _import_fixture(daemon)
+    secret = "http://user:hunter2@proxy.example:8080"
+    long_error = secret + " " + "x" * 1000
+
+    def boom(*args, **kwargs):
+        raise ValueError(long_error)
+
+    daemon.profile_store.read_snapshot = boom
+    with caplog.at_level(logging.ERROR):
+        daemon.current_profile()
+
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "hunter2" not in text
+    assert "profile cannot be compiled" in text
+    compile_records = [r.getMessage() for r in caplog.records if "cannot be compiled" in r.getMessage()]
+    assert all(len(m) <= len("profile cannot be compiled: ") + 300 for m in compile_records)
+    alerts = _alerts(daemon)
+    assert alerts and all("hunter2" not in a and len(a) <= 400 for a in alerts)
+
+
 def test_alert_text_is_html_escaped(tmp_path):
     daemon = _make(tmp_path)
 

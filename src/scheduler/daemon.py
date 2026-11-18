@@ -124,15 +124,23 @@ class DaemonService:
     # ----- profile -----
 
     def _alert_once(self, key: str, text: str) -> None:
-        """Telegram alert the first time ``key`` is seen in this process; failures are logged only."""
+        """Telegram alert the first time ``key`` is delivered in this process; failures are logged only.
+
+        The key is recorded only after a successful send, so a transient Telegram failure (a False
+        return or an exception) is retried on the next cycle.
+        """
         with self._alert_lock:
             if key in self._alerted:
                 return
-            self._alerted.add(key)
-        try:
-            self.notifier.send_message(html.escape(text, quote=False))
-        except Exception as exc:  # an alert must never break a cycle
-            logger.warning("Could not send profile alert (%s): %s", type(exc).__name__, redact_secrets(str(exc)))
+            try:
+                delivered = bool(self.notifier.send_message(html.escape(text, quote=False)))
+            except Exception as exc:  # an alert must never break a cycle
+                logger.warning("Could not send profile alert (%s): %s", type(exc).__name__, redact_secrets(str(exc)))
+                return
+            if delivered:
+                self._alerted.add(key)
+            else:
+                logger.warning("Profile alert was not delivered; it will be retried on the next cycle.")
 
     def _rearm_alerts(self, prefix: str) -> None:
         with self._alert_lock:
@@ -152,7 +160,7 @@ class DaemonService:
                     scrape_interval_hours=self.settings.scrape_interval_hours,
                 )
             except Exception as exc:  # a stored snapshot that cannot be read or compiled is skipped
-                logger.warning("Profile version %s is not usable: %s", info.version, exc)
+                logger.warning("Profile version %s is not usable: %s", info.version, sanitize_error_message(str(exc)))
                 continue
             logger.warning("Using profile version %s as the last good profile.", info.version)
             return compiled
@@ -170,7 +178,7 @@ class DaemonService:
                 return None, "no_profile"
             compiled = compile_profile(snapshot, scrape_interval_hours=self.settings.scrape_interval_hours)
         except (ProfileCompileError, sqlite3.Error, ValueError, KeyError, TypeError) as exc:
-            message = f"profile cannot be compiled: {exc}"
+            message = f"profile cannot be compiled: {sanitize_error_message(str(exc))}"
             logger.error(message)
             if alert:
                 self._alert_once(f"compile:{message}", message)
