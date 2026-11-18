@@ -345,3 +345,86 @@ def test_concurrent_init_loser_reports_already_exists(isolated, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "already exists" in result.output
+
+
+# --- requeue and backtest ------------------------------------------------------------------------
+
+
+def _profile_with_one_dropped_job(isolated):
+    """An imported-legacy-free profile (init) plus one pre-filtered row that a (now empty) rule set passes."""
+    runner.invoke(app, ["init"])
+    db = Database(isolated)
+    words = " ".join(f"word{n}" for n in range(60))
+    from src.storage.models import JobPosting
+
+    db.save_job(
+        JobPosting(
+            dedup_hash="h1", site="linkedin", job_url="https://example.test/1", title="<ROLE> one",
+            company="Example Co", location="<MARKET>", description=words, pre_filtered=True,
+            pre_filter_reason="USER_RULE: 'x'", pre_filter_rule="block:exact:x", eval_status="skipped",
+            notification_status="dismissed",
+        )
+    )
+    return db
+
+
+def test_requeue_cli_dry_run_reports_counts(isolated):
+    db = _profile_with_one_dropped_job(isolated)
+
+    result = runner.invoke(app, ["requeue", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "requeued: 1" in result.output and "checked: 1" in result.output
+    assert "<ROLE> one" in result.output
+    assert db.get_unprocessed_jobs() == []
+
+    live = runner.invoke(app, ["requeue"])
+    assert live.exit_code == 0, live.output
+    assert [j.title for j in db.get_unprocessed_jobs()] == ["<ROLE> one"]
+
+
+def test_requeue_thresholds_cli(isolated):
+    runner.invoke(app, ["init"])
+    db = Database(isolated)
+    from src.storage.models import JobPosting
+
+    job_id, _ = db.save_job(
+        JobPosting(
+            dedup_hash="h2", site="linkedin", job_url="https://example.test/2", title="<ROLE> two",
+            company="Example Co", location="<MARKET>", description="d", eval_status="evaluated",
+            eval_score=3.0, notification_status="dismissed",
+        )
+    )
+    with db._get_connection() as conn:  # save_job does not store the raw evaluation fields
+        conn.execute(
+            "UPDATE jobs SET eval_raw_score = 7.0, eval_is_core_role = 1, eval_bonus_flag = 0, "
+            "eval_hard_reject = 0 WHERE id = ?",
+            (job_id,),
+        )
+        conn.commit()
+
+    dry = runner.invoke(app, ["requeue", "--thresholds", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "changed: 1" in dry.output and "to digest: 1" in dry.output
+    assert db.get_job_by_id(job_id).notification_status == "dismissed"
+
+    live = runner.invoke(app, ["requeue", "--thresholds"])
+    assert live.exit_code == 0, live.output
+    row = db.get_job_by_id(job_id)
+    assert (row.notification_status, row.eval_score) == ("pending", 7.0)
+
+
+def test_requeue_without_profile_exits_nonzero():
+    result = runner.invoke(app, ["requeue"])
+    assert result.exit_code == 1
+    assert "no profile" in result.output
+
+
+def test_profile_import_prints_backtest_line(tmp_path, isolated):
+    runner.invoke(app, ["init"])
+    (tmp_path / "in.yaml").write_text(_IMPORT_YAML + "rules:\n  - {kind: block, term: \"<TERM>\", match_mode: exact, reason: USER_RULE, source: user}\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")])
+
+    assert result.exit_code == 0, result.output
+    assert "backtest not meaningful: only 0 stored jobs (needs 200)" in result.output

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 
 from src.storage.migrations import apply_migrations, ensure_column
 from src.storage.models import JobEvaluationResult, JobPosting, ScrapeRun
@@ -121,6 +121,7 @@ def compute_dedup_hash(company: str, title: str, location: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+_SQL_CHUNK = 500  # bound parameters per statement (SQLite's default limit is far above this)
 STALE_PENDING_DAYS = 7  # pending digest items older than this expire (``expire_stale_pending_jobs``)
 
 
@@ -625,6 +626,82 @@ class Database:
             )
             for r in rows
         ]
+
+    def get_titles_for_backtest(self, limit: int = 5000) -> List[str]:
+        """Titles of the newest stored jobs (non-empty), newest first, for the rule backtest."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT title FROM jobs WHERE title IS NOT NULL AND TRIM(title) != '' ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [r["title"] for r in rows]
+
+    def get_prefiltered_for_requeue(self, max_age_days: int) -> List[JobPosting]:
+        """Pre-filtered rows created within ``max_age_days`` (older ones would expire before any digest)."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE pre_filtered = 1 "
+                "AND datetime(created_at) >= datetime('now', '-' || ? || ' days') ORDER BY id ASC",
+                (max_age_days,),
+            ).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def count_prefiltered_older_than(self, max_age_days: int) -> int:
+        with self._get_connection() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE pre_filtered = 1 "
+                "AND datetime(created_at) < datetime('now', '-' || ? || ' days')",
+                (max_age_days,),
+            ).fetchone()[0]
+
+    def requeue_jobs(self, ids: Sequence[int]) -> int:
+        """Return pre-filtered rows to the evaluation queue (one transaction); their dedup hash is kept."""
+        if not ids:
+            return 0
+        now_str = datetime.now(timezone.utc).isoformat()
+        revived = 0
+        with self._get_connection() as conn:
+            for start in range(0, len(ids), _SQL_CHUNK):
+                chunk = list(ids[start:start + _SQL_CHUNK])
+                marks = ",".join("?" * len(chunk))
+                revived += conn.execute(
+                    f"""UPDATE jobs SET pre_filtered = 0, pre_filter_reason = NULL, pre_filter_rule = NULL,
+                        eval_status = 'unprocessed', notification_status = 'pending', eval_attempts = 0,
+                        updated_at = ?
+                    WHERE id IN ({marks}) AND pre_filtered = 1""",
+                    [now_str, *chunk],
+                ).rowcount
+            conn.commit()
+        return revived
+
+    def get_rebucket_candidates(self) -> List[JobPosting]:
+        """Evaluated rows whose bucket may still change (never alerted rows)."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE eval_status = 'evaluated' "
+                "AND notification_status IN ('pending', 'dismissed') ORDER BY id ASC"
+            ).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def apply_rebucket(self, changes: Sequence[Tuple[int, float, str]]) -> int:
+        """Write ``(id, score, notification_status)`` changes in one transaction; returns rows updated.
+
+        ``eval_is_wow`` is cleared (a re-bucketed row never sends an instant alert) and the status guard in
+        the ``WHERE`` keeps rows that were alerted or expired meanwhile untouched.
+        """
+        if not changes:
+            return 0
+        now_str = datetime.now(timezone.utc).isoformat()
+        updated = 0
+        with self._get_connection() as conn:
+            for job_id, score, status in changes:
+                updated += conn.execute(
+                    """UPDATE jobs SET eval_score = ?, notification_status = ?, eval_is_wow = 0, updated_at = ?
+                    WHERE id = ? AND eval_status = 'evaluated' AND notification_status IN ('pending', 'dismissed')""",
+                    (score, status, now_str, job_id),
+                ).rowcount
+            conn.commit()
+        return updated
 
     def get_stats(self, pending_threshold: float = 6.0) -> Dict[str, int]:
         with self._get_connection() as conn:

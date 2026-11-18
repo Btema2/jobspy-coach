@@ -11,6 +11,7 @@ from src.config import get_settings
 from src.evaluator.errors import ConfigurationError
 from src.logging_config import configure_logging
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.profile.backtest import backtest_snapshots, render_backtest
 from src.profile.compiler import compile_profile
 from src.profile.errors import (
     LegacyImportError,
@@ -21,6 +22,7 @@ from src.profile.errors import (
 )
 from src.profile.importer import DEFAULT_EXPORT_PATH, auto_import, export_profile, load_profile_yaml
 from src.profile.ops import ReplaceProfile, apply_changes, create_starter_profile
+from src.profile.requeue import rebucket_evaluated, requeue_prefiltered
 from src.profile.store import ProfileStore
 from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
@@ -220,14 +222,68 @@ def profile_import(file: Path = typer.Argument(..., help="YAML file written by `
     """Validate a YAML profile file and apply it as a new profile version."""
     store = _profile_store()
     try:
+        old = store.read_snapshot()
         result = apply_changes(store, [ReplaceProfile(load_profile_yaml(file))], label=f"import {file.name}")
     except ProfileError as exc:
         raise _fail_profile_error(exc, hint="Nothing was changed.") from None
     for line in result.diff:
         console.print(line, markup=False, highlight=False)
+    try:  # the import is already applied: a backtest problem must not turn it into a failure
+        new = store.read_snapshot()
+        backtest = backtest_snapshots(Database(get_settings().db_path), old, new) if new is not None else None
+    except ProfileError:
+        backtest = None
+    if backtest is not None:
+        for line in render_backtest(backtest):
+            console.print(line, markup=False, highlight=False)
     for warning in result.warnings:
         console.print(f"Warning: {warning}", style="yellow", markup=False, highlight=False)
     console.print(f"Profile is now at version {result.version}.", markup=False)
+
+
+@app.command()
+def requeue(
+    thresholds: bool = typer.Option(
+        False, "--thresholds", help="Re-bucket evaluated rows under the profile's thresholds (no LLM call)"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would change without writing"),
+) -> None:
+    """Revive pre-filtered rows that the current rules pass, or (--thresholds) re-bucket evaluated rows.
+
+    Never run while the daemon is running. Re-bucketed rows never send instant alerts.
+    """
+    settings = get_settings()
+    db = Database(settings.db_path)
+    db.init_db()
+    snapshot = ProfileStore(db).read_snapshot()
+    if snapshot is None:
+        raise _fail("no profile, run `jobspy-coach init`")
+    try:
+        compiled = compile_profile(snapshot, scrape_interval_hours=settings.scrape_interval_hours)
+    except ProfileCompileError as exc:
+        raise _fail(f"profile cannot be compiled: {exc}") from None
+    prefix = "dry run: " if dry_run else ""
+    if thresholds:
+        rebucket = rebucket_evaluated(db, compiled.scoring, dry_run=dry_run)
+        console.print(
+            f"{prefix}checked: {rebucket.checked}, changed: {rebucket.changed}, "
+            f"skipped (missing stored fields): {rebucket.skipped_missing}, to digest: {rebucket.to_digest}, "
+            f"to dismissed: {rebucket.to_dismissed}",
+            markup=False,
+            soft_wrap=True,
+        )
+        samples = rebucket.samples
+    else:
+        revived = requeue_prefiltered(db, compiled.rules, dry_run=dry_run)
+        console.print(
+            f"{prefix}checked: {revived.checked}, requeued: {revived.requeued}, "
+            f"still dropped: {revived.still_dropped}, too old: {revived.too_old}",
+            markup=False,
+            soft_wrap=True,
+        )
+        samples = revived.samples
+    for title in samples:
+        console.print(f"  - {title}", markup=False, highlight=False, soft_wrap=True)
 
 
 @app.command()
