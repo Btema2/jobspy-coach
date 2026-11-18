@@ -9,6 +9,7 @@ import jobspy
 import pandas as pd
 
 from src.filters.pre_filter import classify_title, pre_filter_job
+from src.scraper.coordinator import ScrapeCoordinator
 from src.scraper.outcome import ScrapeOutcome
 from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries, query_key
 from src.storage.db import compute_dedup_hash
@@ -146,6 +147,7 @@ class JobSpyScraper:
         proxies: Optional[List[str]] = None,
         linkedin_cooldown_seconds: float = 12.0,
         fetch_description: bool = True,
+        coordinator: Optional[ScrapeCoordinator] = None,
     ):
         self.jitter_min = jitter_min
         self.jitter_max = jitter_max
@@ -154,12 +156,27 @@ class JobSpyScraper:
         self.apply_prefilter = apply_prefilter
         self.enabled_boards = enabled_boards
         self.proxies = proxies
-        self.linkedin_cooldown_seconds = linkedin_cooldown_seconds
-        self.last_linkedin_call_time = 0.0
+        self._coordinator = coordinator or ScrapeCoordinator(linkedin_cooldown_seconds)
         self.fetch_description = fetch_description
         self._logged_skips: set = set()
         self._logged_board_errors: set = set()
         self._cycle: Optional[_Cycle] = None
+
+    @property
+    def linkedin_cooldown_seconds(self) -> float:
+        return self._coordinator.linkedin_cooldown_seconds
+
+    @linkedin_cooldown_seconds.setter
+    def linkedin_cooldown_seconds(self, value: float) -> None:
+        self._coordinator.linkedin_cooldown_seconds = value
+
+    @property
+    def last_linkedin_call_time(self) -> float:
+        return self._coordinator.last_linkedin_call_time
+
+    @last_linkedin_call_time.setter
+    def last_linkedin_call_time(self, value: float) -> None:
+        self._coordinator.last_linkedin_call_time = value
 
     def _build_scrape_kwargs(self, site_name: str, query: SearchQuery) -> dict:
         board = site_name.lower()
@@ -301,7 +318,11 @@ class JobSpyScraper:
     def scrape_board(self, site_name: str, query: SearchQuery) -> List[JobPosting]:
         return self.scrape_board_outcome(site_name, query).postings
 
-    def scrape_board_outcome(self, site_name: str, query: SearchQuery) -> ScrapeOutcome:
+    def scrape_board_outcome(
+        self, site_name: str, query: SearchQuery, *, track_cycle: bool = True
+    ) -> ScrapeOutcome:
+        """Scrapes one (query, board). ``track_cycle=False`` (e.g. an on-demand search interleaved with a
+        running cycle) leaves the cycle's ``[i/N]`` counter and totals untouched and omits the prefix."""
         board = site_name.lower()
         reason = self.board_skip_reason(site_name, query)
         if reason == "disabled":
@@ -313,40 +334,36 @@ class JobSpyScraper:
 
         # Every real request is logged here (not in a caller) so that the CLI `scrape`, the daemon and
         # scrape_query/scrape_all_queries, which all end up in scrape_board, show the same progress.
-        if self._cycle:
+        tracked = track_cycle and self._cycle is not None
+        if tracked:
             self._cycle.index += 1
-        prefix = self._call_prefix()
+        prefix = self._call_prefix() if tracked else ""
         logger.info('%s%s %s "%s" %s', prefix, query.query_id, site_name, query.search_term, query.location)
-        totals = self._totals(board)
+        totals = self._totals(board) if tracked else None
 
-        if board == "linkedin":
-            elapsed = time.time() - self.last_linkedin_call_time
-            if elapsed < self.linkedin_cooldown_seconds:
-                time.sleep(self.linkedin_cooldown_seconds - elapsed)
-            self.last_linkedin_call_time = time.time()
-
-        t0 = time.time()
-        df: Optional[pd.DataFrame] = None
-        failed = False
-        last_error: Optional[str] = None
-        for attempt in range(1, 4):
-            try:
-                df = scrape_jobs(**self._build_scrape_kwargs(site_name, query))
-                break
-            except Exception as e:
-                last_error = str(e)
-                if attempt < 3:
-                    backoff = (2 ** attempt) * 3
-                    logger.warning(
-                        f"Attempt {attempt}/3 failed scraping '{site_name}' for query '{query.query_id}': {e}. "
-                        f"Retrying in {backoff}s..."
-                    )
-                    time.sleep(backoff)
-                else:
-                    logger.warning(
-                        f"Error scraping board '{site_name}' for query '{query.query_id}' after 3 attempts: {e}"
-                    )
-                    failed = True
+        with self._coordinator.call(board):
+            t0 = time.time()
+            df: Optional[pd.DataFrame] = None
+            failed = False
+            last_error: Optional[str] = None
+            for attempt in range(1, 4):
+                try:
+                    df = scrape_jobs(**self._build_scrape_kwargs(site_name, query))
+                    break
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < 3:
+                        backoff = (2 ** attempt) * 3
+                        logger.warning(
+                            f"Attempt {attempt}/3 failed scraping '{site_name}' for query '{query.query_id}': {e}. "
+                            f"Retrying in {backoff}s..."
+                        )
+                        time.sleep(backoff)
+                    else:
+                        logger.warning(
+                            f"Error scraping board '{site_name}' for query '{query.query_id}' after 3 attempts: {e}"
+                        )
+                        failed = True
 
         if failed:
             seconds = time.time() - t0
