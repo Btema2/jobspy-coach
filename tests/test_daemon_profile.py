@@ -1,20 +1,26 @@
 """The daemon scrapes and evaluates from the compiled profile (one snapshot per cycle)."""
 import json
+import sqlite3
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
 
 import pytest
 
 from src.config import Settings
+from src.evaluator.chain import ProviderChainEvaluator
+from src.evaluator.circuit_breaker import CircuitBreaker
+from src.evaluator.providers import CompletionResult
 from src.evaluator.schemas import JobEvaluationResult
 from src.profile.compiler import compile_profile
 from src.profile.importer import build_imported_snapshot, parse_queries_json
+from src.profile.errors import ProfileCompileError
 from src.profile.ops import AddPinnedQuery, ReplaceProfile, SetField, apply_changes
 from src.profile.snapshot import PinnedQuery, ProfileFields, ProfileSnapshot
 from src.scheduler.daemon import DaemonService
 from src.scraper import query_catalog
 from src.scraper.jobspy_scraper import JobSpyScraper
+from src.scraper.outcome import STATUS_EMPTY, ScrapeOutcome
 from src.scraper.query_catalog import SearchQuery
 from src.storage.models import JobPosting
 
@@ -65,15 +71,73 @@ class FakeScraper:
         return []
 
 
-class RecordingChain:
-    def __init__(self):
-        self.prompts: List[Optional[str]] = []
+class RuleScraper:
+    """Scraper double with the real ``scrape_board_outcome`` keyword; records the rules it was given."""
 
-    def evaluate_job(self, job, system_prompt=None):
-        self.prompts.append(system_prompt)
+    def __init__(self, on_call=None):
+        self.calls: List[Tuple[str, str]] = []
+        self.rules: List[object] = []
+        self.on_call = on_call
+
+    def scrape_board_outcome(self, site, query, *, track_cycle=True, rules=None):
+        self.calls.append((query.query_id, site))
+        self.rules.append(rules)
+        if self.on_call is not None and len(self.calls) == 1:
+            self.on_call()
+        return ScrapeOutcome(postings=[], rows=0, status=STATUS_EMPTY)
+
+
+class RecordingChain:
+    """Test double with the per-call policy signature; scores a job by its title (default 7.0)."""
+
+    def __init__(self, scores: Optional[Dict[str, float]] = None, is_core_role: bool = True, on_call=None):
+        self.prompts: List[Optional[str]] = []
+        self.policies: List[object] = []
+        self.scores = scores or {}
+        self.is_core_role = is_core_role
+        self.on_call = on_call
+        self.calls = 0
+
+    def evaluate_job(self, job, policy=None):
+        self.calls += 1
+        if self.on_call is not None and self.calls == 1:
+            self.on_call()
+        self.policies.append(policy)
+        self.prompts.append(policy.system_prompt if policy is not None else None)
         return JobEvaluationResult(
-            score=7.0, summary="A sufficiently long summary.", reasoning="Because.", eval_model="m/x"
+            score=self.scores.get(job.title, 7.0),
+            summary="A sufficiently long summary.",
+            reasoning="Because.",
+            eval_model="m/x",
+            is_core_role=self.is_core_role,
         )
+
+
+class ScriptedProvider:
+    """Provider double answering with a JSON payload built from the job title; records every system prompt."""
+
+    name = "scripted"
+    model = "vendor/scripted"
+    max_tokens = 100
+
+    def __init__(self, payload: Callable[[str], dict]):
+        self.payload = payload
+        self.systems: List[str] = []
+        self.breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=600)
+
+    def is_available(self) -> bool:
+        return True
+
+    def complete(self, system, user, max_tokens=None):
+        self.systems.append(system)
+        title = user.split("Title:", 1)[1].splitlines()[0].strip() if "Title:" in user else ""
+        return CompletionResult(
+            content=json.dumps(self.payload(title)), model_used=self.model, latency=0.0, finish_reason="stop"
+        )
+
+
+def _answer(score: float, **extra) -> dict:
+    return {"score": score, "summary": "A sufficiently long summary.", "reasoning": "r", **extra}
 
 
 class LegacyChain:
@@ -304,7 +368,7 @@ def test_compile_failure_without_memory_rebuilds_from_versions(tmp_path):
     assert "<NEWEST PERSONA>" in expected_prompt
 
 
-def test_unreadable_snapshot_is_a_compile_error_with_fallback(tmp_path):
+def test_unreadable_row_is_compile_error(tmp_path):
     scraper = FakeScraper()
     chain = RecordingChain()
     daemon = _make(tmp_path, scraper, chain)
@@ -381,7 +445,7 @@ def test_compile_error_log_is_redacted_and_truncated(tmp_path, caplog):
     long_error = secret + " " + "x" * 1000
 
     def boom(*args, **kwargs):
-        raise ValueError(long_error)
+        raise ProfileCompileError(long_error)
 
     daemon.profile_store.read_snapshot = boom
     with caplog.at_level(logging.ERROR):
@@ -441,7 +505,7 @@ def test_explicit_queries_bypass_profile(tmp_path):
     assert daemon.notifier.send_message.call_count == 0
 
 
-def test_chain_built_with_profile_bonus_flag(tmp_path, monkeypatch):
+def test_chain_is_built_without_a_bonus_flag(tmp_path, monkeypatch):
     builder = MagicMock(return_value=RecordingChain())
     monkeypatch.setattr("src.scheduler.daemon.build_chain_from_settings", builder)
     daemon = DaemonService(db_path=tmp_path / "p.db", scraper=FakeScraper(), notifier=MagicMock())
@@ -454,10 +518,11 @@ def test_chain_built_with_profile_bonus_flag(tmp_path, monkeypatch):
 
     daemon.evaluate_unprocessed()
 
-    assert builder.call_args.kwargs["bonus_enabled"] is True
+    assert builder.call_count == 1
+    assert "bonus_enabled" not in builder.call_args.kwargs
 
 
-def test_chain_built_without_profile_keeps_old_call(tmp_path, monkeypatch):
+def test_chain_is_built_without_a_bonus_flag_and_without_a_profile(tmp_path, monkeypatch):
     builder = MagicMock(return_value=LegacyChain())
     monkeypatch.setattr("src.scheduler.daemon.build_chain_from_settings", builder)
     daemon = DaemonService(db_path=tmp_path / "p.db", scraper=FakeScraper(), notifier=MagicMock())
@@ -467,6 +532,264 @@ def test_chain_built_without_profile_keeps_old_call(tmp_path, monkeypatch):
     daemon.evaluate_unprocessed()
 
     assert "bonus_enabled" not in builder.call_args.kwargs
+
+
+# --- profile thresholds, bonus, cap and rules per cycle -------------------------------------------
+
+
+def _profile(daemon: DaemonService, **fields) -> None:
+    fields.setdefault("persona", "<PERSONA>")
+    snapshot = ProfileSnapshot(ProfileFields(**fields), pinned_queries=(_pinned("Q-1"),))
+    apply_changes(daemon.profile_store, [ReplaceProfile(snapshot)], label="p", expected_version=0)
+
+
+def _real_chain_daemon(tmp_path, provider: ScriptedProvider, **settings) -> DaemonService:
+    chain = ProviderChainEvaluator([provider])
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    daemon.settings = _settings(**settings)
+    daemon.notifier.send_wow_alert.return_value = True
+    return daemon
+
+
+def _save(daemon: DaemonService, n: int, title: str) -> int:
+    return daemon.db.save_job(
+        JobPosting(
+            dedup_hash=f"h{n}", site="indeed", job_url=f"https://example.test/{n}", title=title,
+            company="Example Co", location="Remote",
+            description="A coaching role description that is long enough to be meaningful.",
+        )
+    )[0]
+
+
+def test_profile_thresholds_drive_wow_and_dismissal(tmp_path):
+    chain = RecordingChain({"Core A": 8.2, "Core B": 6.2, "Core C": 5.5})
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    daemon.settings = _settings(WOW_SCORE_THRESHOLD=8.5, DIGEST_SCORE_THRESHOLD=6.5)
+    _profile(daemon, wow_threshold=8.0, digest_threshold=6.0, core_role_definition="<CORE>")
+    ids = [_save(daemon, n, t) for n, t in enumerate(["Core A", "Core B", "Core C"], 1)]
+
+    evaluated, wow = daemon.evaluate_unprocessed()
+
+    assert (evaluated, wow) == (3, 1)
+    a, b, c = (daemon.db.get_job_by_id(i) for i in ids)
+    assert a.notification_status == "instant_sent" and a.eval_is_wow
+    assert b.notification_status == "pending"  # 6.2 is above the profile digest threshold, below .env's 6.5
+    assert c.notification_status == "dismissed"
+    assert daemon.notifier.send_wow_alert.call_count == 1
+
+
+def test_non_core_never_wow_with_lowered_threshold(tmp_path):
+    provider = ScriptedProvider(lambda title: _answer(8.9, is_core_role=False))
+    daemon = _real_chain_daemon(tmp_path, provider)
+    _profile(daemon, wow_threshold=7.0, digest_threshold=6.0, core_role_definition="<CORE>")
+    job_id = _save(daemon, 1, "Trainer")
+
+    evaluated, wow = daemon.evaluate_unprocessed()
+
+    assert (evaluated, wow) == (1, 0)
+    job = daemon.db.get_job_by_id(job_id)
+    assert job.eval_score == 6.9 and not job.eval_is_wow and job.notification_status == "pending"
+    daemon.notifier.send_wow_alert.assert_not_called()
+
+
+def test_profile_without_bonus_criteria_gets_no_bonus(tmp_path):
+    provider = ScriptedProvider(lambda title: _answer(6.5, is_core_role=True, matches_bonus_criteria=True))
+    daemon = _real_chain_daemon(tmp_path, provider)
+    _profile(daemon, bonus_criteria="")
+    job_id = _save(daemon, 1, "Coach")
+
+    daemon.evaluate_unprocessed()
+
+    assert daemon.db.get_job_by_id(job_id).eval_score == 6.5
+
+
+def test_bonus_follows_profile_change_without_restart(tmp_path):
+    provider = ScriptedProvider(lambda title: _answer(6.5, is_core_role=True, matches_bonus_criteria=True))
+    daemon = _real_chain_daemon(tmp_path, provider)
+    _profile(daemon, bonus_criteria="<CREDENTIAL>", bonus_points=1.0)
+    chain = daemon.evaluator
+    first = _save(daemon, 1, "Coach")
+    daemon.run_pipeline_cycle(queries=[])  # a cycle with a profile: evaluation only
+    assert daemon.db.get_job_by_id(first).eval_score == 7.5
+
+    apply_changes(daemon.profile_store, [SetField("bonus_criteria", "")], label="drop bonus")
+    second = _save(daemon, 2, "Coach")
+    daemon.run_pipeline_cycle(queries=[])
+
+    assert daemon.db.get_job_by_id(second).eval_score == 6.5
+    assert daemon.evaluator is chain
+
+
+def test_evaluation_keeps_cycle_snapshot_when_persona_changes_mid_batch(tmp_path):
+    def change():
+        apply_changes(daemon.profile_store, [SetField("persona", "<NEW PERSONA>")], label="mid-batch")
+
+    chain = RecordingChain(on_call=change)
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    _profile(daemon, persona="<OLD PERSONA>")
+    for n in range(1, 4):
+        _save(daemon, n, f"Coach {n}")
+
+    daemon.evaluate_unprocessed()
+
+    assert len(chain.prompts) == 3
+    assert all("<OLD PERSONA>" in p and "<NEW PERSONA>" not in p for p in chain.prompts)
+
+    _save(daemon, 4, "Coach 4")
+    daemon.evaluate_unprocessed()
+    assert "<NEW PERSONA>" in chain.prompts[-1]
+
+
+def test_none_profile_not_reresolved_mid_cycle(tmp_path):
+    def create_profile():
+        _profile(daemon, persona="<LATE PERSONA>")
+
+    chain = LegacyChain()
+    daemon = _make(tmp_path, RuleScraper(on_call=create_profile), chain)
+    _save(daemon, 1, "Coach")
+    daemon.current_profile = MagicMock(wraps=daemon.current_profile)
+    daemon.evaluate_unprocessed = MagicMock(wraps=daemon.evaluate_unprocessed)
+    query = SearchQuery("Q-X", "<ROLE>", "<MARKET>", ["linkedin"])
+
+    daemon.run_pipeline_cycle(queries=[query])
+
+    assert daemon.current_profile.call_count == 1
+    assert daemon.evaluate_unprocessed.call_args.kwargs["profile"] is None
+    assert chain.jobs == ["Coach"]  # no profile was in force for this cycle's evaluation
+
+
+def test_evaluate_unprocessed_resolves_the_profile_only_for_the_unset_default(tmp_path):
+    chain = RecordingChain()
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    _profile(daemon, persona="<PERSONA>")
+    _save(daemon, 1, "Coach")
+
+    daemon.evaluate_unprocessed(profile=None)
+
+    assert chain.prompts == [None]  # an explicit None is "no profile", not "look it up"
+
+
+def test_compile_alert_rearms_after_recovery(tmp_path):
+    daemon = _make(tmp_path)
+    _import_fixture(daemon)
+    with daemon.db._get_connection() as conn:
+        originals = conn.execute("SELECT id, term FROM rules WHERE match_mode = 'pattern'").fetchall()
+
+    def restore():
+        with daemon.db._get_connection() as conn:
+            for row in originals:
+                conn.execute("UPDATE rules SET term = ? WHERE id = ?", (row["term"], row["id"]))
+            conn.commit()
+
+    _break_pattern_rules(daemon, "(")
+    daemon.run_pipeline_cycle()
+    daemon.run_pipeline_cycle()
+    assert daemon.notifier.send_message.call_count == 1
+
+    restore()
+    daemon.run_pipeline_cycle()  # good cycle re-arms
+    _break_pattern_rules(daemon, "(")
+    daemon.run_pipeline_cycle()
+
+    assert daemon.notifier.send_message.call_count == 2
+
+
+def test_no_profile_alert_rearms(tmp_path):
+    daemon = _make(tmp_path)
+    daemon.run_pipeline_cycle()
+    daemon.run_pipeline_cycle()
+    assert daemon.notifier.send_message.call_count == 1
+
+    _import_fixture(daemon)
+    daemon.run_pipeline_cycle()
+    with daemon.db._get_connection() as conn:
+        conn.execute("DELETE FROM profile")
+        conn.commit()
+    daemon.run_pipeline_cycle()
+
+    assert daemon.notifier.send_message.call_count == 2
+
+
+def test_db_locked_skips_scraping_without_alert(tmp_path, monkeypatch):
+    scraper = FakeScraper()
+    chain = RecordingChain()
+    daemon = _make(tmp_path, scraper, chain)
+    _import_fixture(daemon)
+    good_prompt = compile_profile(daemon.profile_store.read_snapshot()).system_prompt
+    daemon.run_pipeline_cycle()  # remembers the last good profile
+    scraper.calls.clear()
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daemon.profile_store, "read_snapshot", locked)
+    _seed_job(daemon)
+    daemon.run_pipeline_cycle()
+
+    assert scraper.calls == []
+    assert daemon.notifier.send_message.call_count == 0
+    assert chain.prompts == [good_prompt]
+
+
+def test_unexpected_exception_from_the_store_is_not_swallowed(tmp_path, monkeypatch):
+    daemon = _make(tmp_path)
+
+    def boom():
+        raise KeyError("bug")
+
+    monkeypatch.setattr(daemon.profile_store, "read_snapshot", boom)
+    with pytest.raises(KeyError):
+        daemon.current_profile()
+
+
+def test_cycle_rules_reach_scraper_and_safety_net(tmp_path):
+    from src.profile.ops import AddRule
+    from src.profile.snapshot import Rule
+
+    scraper = RuleScraper()
+    chain = RecordingChain()
+    daemon = _make(tmp_path, scraper, chain)
+    _profile(daemon)
+    apply_changes(daemon.profile_store, [AddRule(Rule("block", "<TERM>", "exact", "USER_BLOCK", "user"))], label="rule")
+    expected = compile_profile(daemon.profile_store.read_snapshot()).rules
+    _save(daemon, 1, "Coach")
+
+    daemon.run_pipeline_cycle()
+    daemon.run_pipeline_cycle(queries=[SearchQuery("Q-X", "<ROLE>", "<MARKET>", ["linkedin"])])
+
+    assert len(scraper.rules) == 2 and all(r == expected for r in scraper.rules)
+    assert any(r.kind == "block" for r in expected)
+    assert chain.policies[0].rules == expected
+
+
+def test_no_profile_cycle_passes_no_rules(tmp_path):
+    scraper = RuleScraper()
+    daemon = _make(tmp_path, scraper)
+
+    daemon.run_pipeline_cycle(queries=[SearchQuery("Q-X", "<ROLE>", "<MARKET>", ["linkedin"])])
+
+    assert scraper.rules == [None]
+
+
+def test_digest_uses_profile_threshold(tmp_path):
+    chain = RecordingChain({"Coach": 6.2})
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    daemon.settings = _settings(DIGEST_SCORE_THRESHOLD=6.5)
+    _profile(daemon, digest_threshold=6.0, wow_threshold=8.0)
+    _save(daemon, 1, "Coach")
+    daemon.evaluate_unprocessed()
+
+    assert daemon.run_daily_digest_cycle(dry_run=True) == 1
+
+
+def test_digest_without_profile_uses_env_threshold(tmp_path):
+    chain = RecordingChain({"Coach": 6.7})
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    daemon.settings = _settings(DIGEST_SCORE_THRESHOLD=6.8)
+    _save(daemon, 1, "Coach")
+    daemon.evaluate_unprocessed()  # no profile: dismissed below the .env threshold
+
+    assert daemon.run_daily_digest_cycle(dry_run=True) == 0
 
 
 # --- removed catalog ----------------------------------------------------------------------------

@@ -761,3 +761,52 @@ def test_update_evaluation_stores_is_core_role(tmp_path: Path):
     )
     db.update_evaluation(job_id, result)
     assert db.get_job_by_id(job_id).eval_is_core_role is True
+
+
+def _prefiltered_job(n: int, rule=None, reason="EXCLUDED_TITLE_TRAP: 'x'", pre_filtered=True) -> JobPosting:
+    return JobPosting(
+        dedup_hash=f"pf-{n}",
+        site="linkedin",
+        job_url=f"https://example.test/{n}",
+        title=f"Title {n}",
+        company="Example Co",
+        location="Remote",
+        description="d",
+        pre_filtered=pre_filtered,
+        pre_filter_reason=reason if pre_filtered else None,
+        pre_filter_rule=rule,
+    )
+
+
+def test_get_recent_prefiltered_returns_last_20_with_rule(tmp_path: Path):
+    db = Database(tmp_path / "pf.db")
+    db.init_db()
+    db.save_job(_prefiltered_job(0, rule=None, reason="DESCRIPTION_TOO_SHORT: length=3 (min 150)"))  # legacy row
+    for n in range(1, 25):
+        db.save_job(_prefiltered_job(n, rule=f"block:exact:term{n}"))
+    db.save_job(_prefiltered_job(99, pre_filtered=False))  # not dropped: never listed
+
+    dropped = db.get_recent_prefiltered()
+
+    assert len(dropped) == 20
+    assert [d.title for d in dropped][:3] == ["Title 24", "Title 23", "Title 22"]
+    assert dropped[0].rule_key == "block:exact:term24" and dropped[0].reason == "EXCLUDED_TITLE_TRAP: 'x'"
+    assert (dropped[0].company, dropped[0].site) == ("Example Co", "linkedin")
+    assert dropped[0].created_at is not None and dropped[0].id > dropped[1].id
+    everything = db.get_recent_prefiltered(limit=100)
+    assert len(everything) == 25
+    legacy = everything[-1]
+    assert legacy.rule_key is None and legacy.reason.startswith("DESCRIPTION_TOO_SHORT")
+
+
+def test_pre_filter_rule_round_trips_on_the_job(tmp_path: Path):
+    db = Database(tmp_path / "pf2.db")
+    db.init_db()
+    job_id, _ = db.save_job(_prefiltered_job(1, rule="seed:block:EXCLUDED_TITLE_TRAP"))
+    assert db.get_job_by_id(job_id).pre_filter_rule == "seed:block:EXCLUDED_TITLE_TRAP"
+
+
+def test_stale_pending_days_default():
+    from src.storage.db import STALE_PENDING_DAYS
+
+    assert STALE_PENDING_DAYS == 7

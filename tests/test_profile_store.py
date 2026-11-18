@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.profile.errors import ProfileValidationError, VersionConflict
+from src.profile.errors import ProfileCompileError, ProfileValidationError, VersionConflict
 from src.profile.snapshot import (
     Market,
     PinnedQuery,
@@ -208,3 +208,23 @@ def test_failed_write_leaves_rows_version_and_history_untouched(store: ProfileSt
     assert store.read_snapshot() == before
     assert before is not None and before.version == 1 and before.fields.persona == "<ONE>"
     assert [v.version for v in store.list_versions()] == [1]
+
+
+def test_read_snapshot_wraps_undecodable_rows_in_compile_error(db: Database, store: ProfileStore):
+    store.write_snapshot(_snapshot(), expected_version=0, label="x")
+    with db._get_connection() as conn:
+        conn.execute("UPDATE markets SET countries = 'not json'")
+        conn.commit()
+
+    with pytest.raises(ProfileCompileError, match="stored profile is unreadable"):
+        store.read_snapshot()
+
+
+def test_read_snapshot_lets_sql_errors_propagate(db: Database, store: ProfileStore):
+    store.write_snapshot(_snapshot(), expected_version=0, label="x")
+    with db._get_connection() as conn:
+        conn.execute("ALTER TABLE markets RENAME TO markets_gone")
+        conn.commit()
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.read_snapshot()

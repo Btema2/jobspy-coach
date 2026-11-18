@@ -1,4 +1,5 @@
 import html
+import inspect
 import logging
 import math
 import random
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -23,23 +24,29 @@ from apscheduler.triggers.interval import IntervalTrigger
 from src.config import get_settings
 from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.errors import ConfigurationError, EvaluationRejected, ProvidersUnavailable, StopRequested
+from src.evaluator.scoring import ScoringPolicy, decide_wow
+from src.filters.rules import CompiledRule
 from src.logging_config import redact_secrets
 from src.profile.compiler import CompiledProfile, compile_profile
-from src.profile.errors import ProfileCompileError
+from src.profile.errors import ProfileError
 from src.profile.store import ProfileStore
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.notifier.templates import format_version_update_notice
 from src.scraper.jobspy_scraper import JobSpyScraper
-from src.scraper.outcome import ScrapeOutcome
+from src.scraper.outcome import STATUS_EMPTY, STATUS_FAILED, STATUS_OK, ScrapeOutcome
 from src.scraper.query_catalog import SearchQuery, query_key
 from src.scraper.version_checker import check_jobspy_update
-from src.storage.db import Database
+from src.storage.db import STALE_PENDING_DAYS, Database
 from src.storage.models import JobPosting
 
 logger = logging.getLogger(__name__)
 
 
 _MAX_STORED_ERROR_CHARS = 300
+
+# Default of ``evaluate_unprocessed(profile=...)``: "resolve the profile now". An explicit ``None`` means
+# "this cycle has no profile" and is never re-resolved (a profile created mid-cycle waits for the next one).
+UNSET: Any = object()
 
 
 def sanitize_error_message(message: Optional[str]) -> Optional[str]:
@@ -167,7 +174,7 @@ class DaemonService:
         return None
 
     def current_profile(self, alert: bool = True) -> Tuple[Optional[CompiledProfile], Optional[str]]:
-        """Compile the stored profile; ``(profile, problem)`` with problem ``None``, ``no_profile`` or ``compile_error``.
+        """Compile the stored profile; ``(profile, problem)`` with problem ``None``, ``no_profile``, ``compile_error`` or ``db_busy``.
 
         On a compile or snapshot-read error the fallback is the last good profile (in memory), else the
         newest stored version that compiles, else None; the error is alerted once per distinct text.
@@ -177,33 +184,47 @@ class DaemonService:
             if snapshot is None:
                 return None, "no_profile"
             compiled = compile_profile(snapshot, scrape_interval_hours=self.settings.scrape_interval_hours)
-        except (ProfileCompileError, sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+        except sqlite3.OperationalError as exc:
+            # A locked or briefly unavailable database says nothing about the profile: no alert, no
+            # scraping this cycle, and evaluation keeps the last good profile.
+            logger.warning("Profile database unavailable (%s); skipping scraping this cycle.", sanitize_error_message(str(exc)))
+            return self._last_good, "db_busy"
+        except ProfileError as exc:
             message = f"profile cannot be compiled: {sanitize_error_message(str(exc))}"
             logger.error(message)
             if alert:
                 self._alert_once(f"compile:{message}", message)
             if self._last_good is None:
                 self._last_good = self._rebuild_from_versions()
+            self._rearm_alerts("no_profile")  # a profile exists again, even if it does not compile
             return self._last_good, "compile_error"
         self._last_good = compiled
         self._rearm_alerts("compile:")
+        self._rearm_alerts("no_profile")
         return compiled, None
 
     # ----- evaluation engine -----
 
-    def _get_evaluator(self, profile: Optional[CompiledProfile] = None) -> Any:
+    def _get_evaluator(self) -> Any:
         """Return the provider chain, building it on first use (raises ConfigurationError).
 
-        The chain is built once; the profile's bonus flag is applied at that first build (a per-call
-        bonus is a later branch).
+        The chain is built once and holds no profile state: prompt, thresholds, bonus and cap arrive per
+        call as a ``ScoringPolicy``, so a profile change takes effect without a restart.
         """
         with self._chain_lock:
             if self.evaluator is None:
-                kwargs: Dict[str, Any] = {"stop_event": self._stop_event}
-                if profile is not None:
-                    kwargs["bonus_enabled"] = profile.bonus_enabled
-                self.evaluator = build_chain_from_settings(self.settings, **kwargs)
+                self.evaluator = build_chain_from_settings(self.settings, stop_event=self._stop_event)
             return self.evaluator
+
+    def _policy(self, profile: Optional[CompiledProfile]) -> ScoringPolicy:
+        """The scoring policy of a cycle: the profile's, else the ``.env`` thresholds (bonus off, legacy rules)."""
+        if profile is not None:
+            return profile.scoring
+        return ScoringPolicy(
+            system_prompt="",
+            wow_threshold=self.settings.wow_score_threshold,
+            digest_threshold=self.settings.digest_score_threshold,
+        )
 
     def _stop_chain(self) -> None:
         stop = getattr(self.evaluator, "stop", None)
@@ -251,9 +272,12 @@ class DaemonService:
         return "unknown"
 
     def evaluate_unprocessed(
-        self, limit: Optional[int] = None, dry_run: bool = False, profile: Optional[CompiledProfile] = None
+        self, limit: Optional[int] = None, dry_run: bool = False, profile: Any = UNSET
     ) -> Tuple[int, int]:
         """Evaluate queued jobs concurrently; return ``(evaluated_count, wow_sent)``.
+
+        ``profile`` is the cycle's compiled profile; only the ``UNSET`` default resolves it here, an explicit
+        ``None`` means no profile. One policy is taken at the start and used for the whole batch.
 
         Invariant: the thread that calls this method is the only one that touches the
         database or Telegram. Worker threads only run ``chain.evaluate_job`` (LLM calls).
@@ -270,11 +294,12 @@ class DaemonService:
         if not jobs:
             return 0, 0
 
-        if profile is None:
+        if profile is UNSET:
             profile = self.current_profile(alert=not dry_run)[0]
-        system_prompt = profile.system_prompt if profile is not None else None
+        policy = self._policy(profile)
+        has_profile = profile is not None
 
-        chain = self._get_evaluator(profile)
+        chain = self._get_evaluator()
         if not self._rearm_stop_event(chain) or self._shutdown_requested.is_set():
             return 0, 0
         total = len(jobs)
@@ -303,9 +328,9 @@ class DaemonService:
                 in_flight += 1
                 in_flight_peak = max(in_flight_peak, in_flight)
             try:
-                if system_prompt is None:  # no profile: the legacy one-argument call
+                if not has_profile:  # no profile: the chain's own default policy, legacy one-argument call
                     return chain.evaluate_job(job), time.monotonic() - started
-                return chain.evaluate_job(job, system_prompt=system_prompt), time.monotonic() - started
+                return chain.evaluate_job(job, policy=policy), time.monotonic() - started
             finally:
                 with stats_lock:
                     in_flight -= 1
@@ -367,13 +392,13 @@ class DaemonService:
                     done, total, provider_name, model or "unknown-model", latency, job.title, eval_res.score,
                 )
 
-                # The alert decision lives here, from settings, once.
-                # WOW additionally requires a core role, so a lowered WOW_SCORE_THRESHOLD can never
-                # promote capped (<= 8.4) non-coaching roles into instant alerts.
-                eval_res.is_wow = bool(
-                    eval_res.score >= settings.wow_score_threshold
-                    and not eval_res.hard_reject
-                    and eval_res.is_core_role
+                # The alert decision lives here, from the cycle's policy, once. WOW additionally requires a
+                # core role (while the cap is on), so a lowered threshold can never promote capped roles.
+                eval_res.is_wow = decide_wow(
+                    eval_res.score,
+                    hard_reject=eval_res.hard_reject,
+                    is_core_role=eval_res.is_core_role,
+                    policy=policy,
                 )
                 if dry_run:
                     evaluated_count += 1
@@ -382,7 +407,7 @@ class DaemonService:
                     continue
 
                 notification_status = None
-                if eval_res.score < settings.digest_score_threshold and not eval_res.is_wow:
+                if eval_res.score < policy.digest_threshold and not eval_res.is_wow:
                     notification_status = "dismissed"
 
                 self.db.update_evaluation(
@@ -459,15 +484,34 @@ class DaemonService:
         # Scraper without a call plan (e.g. a test double): run every configured board.
         return [(q, site) for q in queries for site in q.site_names]
 
-    def _scrape_call(self, site: str, query: SearchQuery) -> ScrapeOutcome:
-        """One (query, board) scrape as a ScrapeOutcome; wraps the plain list of a legacy test double."""
+    def _scrape_call(
+        self, site: str, query: SearchQuery, rules: Optional[Sequence[CompiledRule]] = None
+    ) -> ScrapeOutcome:
+        """One (query, board) scrape as a ScrapeOutcome; wraps the plain list of a legacy test double.
+
+        ``rules`` (the cycle profile's compiled rules) go to the scraper only when it accepts the keyword,
+        so a double with the older ``(site, query)`` signature still works.
+        """
         outcome_fn = getattr(self.scraper, "scrape_board_outcome", None)
         if callable(outcome_fn):
-            result = outcome_fn(site, query)
+            if rules is not None and self._accepts_rules(outcome_fn):
+                result = outcome_fn(site, query, rules=rules)
+            else:
+                result = outcome_fn(site, query)
             if isinstance(result, ScrapeOutcome):
                 return result
         postings = self.scraper.scrape_board(site, query)
-        return ScrapeOutcome(postings=postings, rows=len(postings), status="ok" if postings else "empty")
+        return ScrapeOutcome(
+            postings=postings, rows=len(postings), status=STATUS_OK if postings else STATUS_EMPTY
+        )
+
+    @staticmethod
+    def _accepts_rules(fn: Any) -> bool:
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+        return "rules" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
@@ -478,7 +522,8 @@ class DaemonService:
         if queries is None:
             queries = self._profile_queries(profile, problem, dry_run)
 
-        total_new_saved = self._scrape_queries(queries, dry_run) if queries else 0
+        rules = profile.rules if profile is not None else None
+        total_new_saved = self._scrape_queries(queries, dry_run, rules) if queries else 0
 
         if dry_run:
             return 0, 0
@@ -499,7 +544,8 @@ class DaemonService:
             if not dry_run:
                 self._alert_once("no_profile", "no profile: run jobspy-coach init")
             return []
-        self._rearm_alerts("no_profile")
+        if problem == "db_busy":
+            return []  # already logged by current_profile; nothing to alert about
         if problem == "compile_error":
             logger.warning("Profile does not compile: scraping skipped this cycle.")
             return []
@@ -517,7 +563,12 @@ class DaemonService:
         self._rearm_alerts("empty_queries")
         return list(profile.queries)
 
-    def _scrape_queries(self, active_queries: List[SearchQuery], dry_run: bool) -> int:
+    def _scrape_queries(
+        self,
+        active_queries: List[SearchQuery],
+        dry_run: bool,
+        rules: Optional[Sequence[CompiledRule]] = None,
+    ) -> int:
         logger.info("Starting pipeline scrape cycle across queries...")
         total_new_saved = 0
 
@@ -535,7 +586,7 @@ class DaemonService:
 
                 t0 = time.time()
                 try:
-                    outcome = self._scrape_call(site, q)
+                    outcome = self._scrape_call(site, q, rules)
                     board_postings = outcome.postings
                     duration = time.time() - t0
                     board_new_saved = 0
@@ -560,7 +611,7 @@ class DaemonService:
                             "[%d/%d] %s %s saved %d new (%d already known)",
                             idx, len(plan), q.query_id, site, board_new_saved, len(board_postings) - board_new_saved,
                         )
-                        failed = outcome.status == "failed"
+                        failed = outcome.status == STATUS_FAILED
                         self.db.record_scrape_run(
                             board=site,
                             query=q.search_term,
@@ -600,12 +651,18 @@ class DaemonService:
 
     def run_daily_digest_cycle(self, dry_run: bool = False) -> int:
         if not dry_run:
-            expired = self.db.expire_stale_pending_jobs(days=7)
+            expired = self.db.expire_stale_pending_jobs(days=STALE_PENDING_DAYS)
             if expired > 0:
-                logger.info(f"Transitioned {expired} stale pending jobs (>7 days) to 'expired_dismissed'.")
+                logger.info(
+                    f"Transitioned {expired} stale pending jobs (>{STALE_PENDING_DAYS} days) to 'expired_dismissed'."
+                )
 
+        profile = self.current_profile(alert=False)[0]
+        digest_threshold = (
+            profile.scoring.digest_threshold if profile is not None else self.settings.digest_score_threshold
+        )
         pending = self.db.get_pending_digest_jobs(
-            min_score=self.settings.digest_score_threshold,
+            min_score=digest_threshold,
             limit=self.settings.digest_max_items,
         )
         if not pending:

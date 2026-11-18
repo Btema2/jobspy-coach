@@ -9,7 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from src.profile.errors import VersionConflict
+from src.profile.errors import ProfileCompileError, VersionConflict
 from src.profile.snapshot import (
     SNAPSHOT_SCHEMA,
     Market,
@@ -65,7 +65,13 @@ class ProfileStore:
                 rule_rows = self._read_table(conn, "rules")
             finally:
                 conn.execute("COMMIT")
-        p = profile_rows[0]
+        try:
+            return self._decode(profile_rows[0], role_rows, term_rows, market_rows, pinned_rows, rule_rows)
+        except (ValueError, KeyError, TypeError) as exc:  # a hand-edited or damaged row (JSON, field mapping)
+            raise ProfileCompileError(f"stored profile is unreadable: {exc}") from exc
+
+    @staticmethod
+    def _decode(p, role_rows, term_rows, market_rows, pinned_rows, rule_rows) -> ProfileSnapshot:
         fields = ProfileFields(**{**{c: p[c] for c in _FIELD_COLUMNS}, "paused": bool(p["paused"])})
         terms_by_role: dict = {}
         for t in term_rows:

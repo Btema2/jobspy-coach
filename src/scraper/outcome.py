@@ -1,9 +1,13 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from src.storage.models import JobPosting
 
-# status values: "ok", "empty", "failed", "skipped"
+ScrapeStatus = Literal["ok", "empty", "failed", "skipped"]
+STATUS_OK: ScrapeStatus = "ok"
+STATUS_EMPTY: ScrapeStatus = "empty"
+STATUS_FAILED: ScrapeStatus = "failed"
+STATUS_SKIPPED: ScrapeStatus = "skipped"
 
 
 @dataclass
@@ -17,7 +21,7 @@ class ScrapeOutcome:
 
     postings: List[JobPosting]
     rows: int
-    status: str
+    status: ScrapeStatus
     error: Optional[str] = None
     skip_reason: Optional[str] = None
     prefiltered: int = 0

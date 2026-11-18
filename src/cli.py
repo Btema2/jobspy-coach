@@ -329,7 +329,16 @@ def stats():
     settings = get_settings()
     db = Database(settings.db_path)
     db.init_db()
-    data = db.get_stats(pending_threshold=settings.digest_score_threshold)
+    digest_threshold = settings.digest_score_threshold  # .env only without a (compilable) profile
+    try:
+        snapshot = ProfileStore(db).read_snapshot()
+        if snapshot is not None:
+            digest_threshold = compile_profile(
+                snapshot, scrape_interval_hours=settings.scrape_interval_hours
+            ).scoring.digest_threshold
+    except ProfileError:
+        pass
+    data = db.get_stats(pending_threshold=digest_threshold)
 
     table = Table(title="JobSpy Coach: Repository Statistics")
     table.add_column("Metric", style="cyan", no_wrap=True)

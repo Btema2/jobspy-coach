@@ -1,12 +1,20 @@
 """ScrapeOutcome statuses from scrape_board_outcome (no network: scrape_jobs is monkeypatched)."""
 import enum
+from typing import get_args
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
 from src.scraper.jobspy_scraper import JobSpyScraper
-from src.scraper.outcome import ScrapeOutcome
+from src.scraper.outcome import (
+    STATUS_EMPTY,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_SKIPPED,
+    ScrapeOutcome,
+    ScrapeStatus,
+)
 from src.scraper.query_catalog import SearchQuery, query_key
 
 LONG_DESC = "We are hiring a career coach to support clients one to one in their professional growth. " * 4
@@ -157,3 +165,31 @@ def test_scrape_board_still_returns_list(mock_scrape):
 def test_query_key_format():
     q = _query(query_id="Q-ABC")
     assert query_key(q, "LinkedIn") == "Q-ABC|linkedin"
+
+
+def test_scrape_outcome_status_constants():
+    assert get_args(ScrapeStatus) == ("ok", "empty", "failed", "skipped")
+    assert (STATUS_OK, STATUS_EMPTY, STATUS_FAILED, STATUS_SKIPPED) == get_args(ScrapeStatus)
+
+
+def test_scraper_records_pre_filter_rule(mock_scrape):
+    mock_scrape.return_value = _frame([_row(1, title="Scrum Master"), _row(2)])
+    out = _scraper().scrape_board_outcome("linkedin", _query())
+    trapped = next(p for p in out.postings if p.title == "Scrum Master")
+    clean = next(p for p in out.postings if p.title == "Career Coach")
+    assert trapped.pre_filtered and trapped.pre_filter_rule == "seed:block:EXCLUDED_TITLE_TRAP"
+    assert clean.pre_filter_rule is None
+
+    out = _scraper().scrape_board_outcome("linkedin", _query(), rules=())
+    passed = next(p for p in out.postings if p.title == "Scrum Master")
+    assert not passed.pre_filtered and passed.pre_filter_rule is None
+
+
+def test_rules_reach_the_linkedin_empty_description_check(mock_scrape):
+    mock_scrape.return_value = _frame([_row(1, title="Scrum Master", desc=None)])
+    # legacy seed: the title is dropped for good, so the row is kept (pre-filtered), not skipped
+    out = _scraper().scrape_board_outcome("linkedin", _query())
+    assert out.skipped_empty == 0 and out.postings[0].pre_filtered
+    # without rules the title is fine, so the missing description means the detail fetch failed
+    out = _scraper().scrape_board_outcome("linkedin", _query(), rules=())
+    assert out.skipped_empty == 1 and out.postings == []

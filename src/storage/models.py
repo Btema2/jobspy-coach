@@ -38,6 +38,7 @@ class JobPosting:
     # Pre-filter
     pre_filtered: bool = False
     pre_filter_reason: Optional[str] = None
+    pre_filter_rule: Optional[str] = None  # stable key of the rule that dropped it (None: legacy row or stub)
 
     # LLM Evaluation
     eval_status: str = "unprocessed"  # unprocessed, evaluated, failed, skipped

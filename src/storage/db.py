@@ -6,6 +6,7 @@ import sqlite3
 import time
 import unicodedata
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -118,6 +119,22 @@ def compute_dedup_hash(company: str, title: str, location: str) -> str:
         f"{_normalize_company(company)}:{_normalize_title(title)}:{_normalize_location(location)}"
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+STALE_PENDING_DAYS = 7  # pending digest items older than this expire (``expire_stale_pending_jobs``)
+
+
+@dataclass(frozen=True)
+class DroppedJob:
+    """A pre-filtered posting, for the ``/dropped`` view; ``rule_key`` is None for legacy rows and stubs."""
+
+    id: int
+    title: str
+    company: str
+    site: str
+    reason: Optional[str]
+    rule_key: Optional[str]
+    created_at: Optional[datetime]
 
 
 def _opt_bool(val: Any) -> Optional[bool]:
@@ -250,18 +267,19 @@ class Database:
                 dedup_hash, site, external_id, job_url, job_url_direct,
                 title, company, location, job_type, date_posted,
                 salary_min, salary_max, salary_currency, salary_interval,
-                description, is_remote, pre_filtered, pre_filter_reason,
+                description, is_remote, pre_filtered, pre_filter_reason, pre_filter_rule,
                 eval_status, eval_score, eval_is_wow, eval_summary_uk,
                 eval_reasoning, eval_languages, eval_pros, eval_cons,
                 eval_error, evaluated_at, eval_model, eval_attempts,
                 notification_status, instant_sent_at, digest_sent_at,
                 source_query, remote_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.dedup_hash, job.site, job.external_id, job.job_url, job.job_url_direct,
                 job.title, job.company, job.location, job.job_type, job.date_posted,
                 job.salary_min, job.salary_max, job.salary_currency, job.salary_interval,
                 job.description, int(job.is_remote), int(job.pre_filtered), job.pre_filter_reason,
+                job.pre_filter_rule,
                 job.eval_status, job.eval_score, int(job.eval_is_wow), job.eval_summary_uk,
                 job.eval_reasoning,
                 json.dumps(job.eval_languages, ensure_ascii=False) if job.eval_languages else None,
@@ -476,7 +494,7 @@ class Database:
             conn.commit()
             return cursor.lastrowid
 
-    def expire_stale_pending_jobs(self, days: int = 7) -> int:
+    def expire_stale_pending_jobs(self, days: int = STALE_PENDING_DAYS) -> int:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -592,6 +610,22 @@ class Database:
                 conn.execute("UPDATE jobs SET dedup_hash = ? WHERE id = ?", (new_hash, job_id))
             return stats
 
+    def get_recent_prefiltered(self, limit: int = 20) -> List[DroppedJob]:
+        """The newest pre-filtered postings, newest first."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, title, company, site, pre_filter_reason, pre_filter_rule, created_at "
+                "FROM jobs WHERE pre_filtered = 1 ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            DroppedJob(
+                id=r["id"], title=r["title"], company=r["company"], site=r["site"],
+                reason=r["pre_filter_reason"], rule_key=r["pre_filter_rule"], created_at=_parse_dt(r["created_at"]),
+            )
+            for r in rows
+        ]
+
     def get_stats(self, pending_threshold: float = 6.0) -> Dict[str, int]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -633,6 +667,7 @@ class Database:
             is_remote=bool(row["is_remote"]),
             pre_filtered=bool(row["pre_filtered"]),
             pre_filter_reason=row["pre_filter_reason"],
+            pre_filter_rule=row["pre_filter_rule"],
             eval_status=row["eval_status"],
             eval_score=row["eval_score"],
             eval_is_wow=bool(row["eval_is_wow"]),

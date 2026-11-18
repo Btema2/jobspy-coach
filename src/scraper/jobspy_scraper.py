@@ -2,15 +2,22 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import jobspy
 import pandas as pd
 
 from src.filters.pre_filter import classify_title, pre_filter_job
+from src.filters.rules import CompiledRule
 from src.scraper.coordinator import ScrapeCoordinator
-from src.scraper.outcome import ScrapeOutcome
+from src.scraper.outcome import (
+    STATUS_EMPTY,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_SKIPPED,
+    ScrapeOutcome,
+)
 from src.scraper.query_catalog import SearchQuery, query_key
 from src.storage.db import compute_dedup_hash
 from src.storage.models import JobPosting
@@ -319,18 +326,29 @@ class JobSpyScraper:
         return self.scrape_board_outcome(site_name, query).postings
 
     def scrape_board_outcome(
-        self, site_name: str, query: SearchQuery, *, track_cycle: bool = True
+        self,
+        site_name: str,
+        query: SearchQuery,
+        *,
+        track_cycle: bool = True,
+        rules: Optional[Sequence[CompiledRule]] = None,
     ) -> ScrapeOutcome:
-        """Scrapes one (query, board). ``track_cycle=False`` (e.g. an on-demand search interleaved with a
-        running cycle) leaves the cycle's ``[i/N]`` counter and totals untouched and omits the prefix."""
+        """Scrapes one (query, board).
+
+        ``track_cycle=True`` advances the cycle's ``[i/N]`` counter and totals; ``track_cycle=False`` (e.g. an
+        on-demand search interleaved with a running cycle) leaves them untouched and omits the prefix. The
+        ``[i/N]`` line is logged before the coordinator lock is taken, so it can precede a wait for LinkedIn
+        pacing. ``rules`` (compiled profile rules, ``None`` = the legacy seed) drive the title pre-filter and
+        the LinkedIn empty-description check; a dropped posting carries the key of the rule that dropped it.
+        """
         board = site_name.lower()
         reason = self.board_skip_reason(site_name, query)
         if reason == "disabled":
             logger.debug("Skipping board '%s' as it is not in enabled_boards", site_name)
-            return ScrapeOutcome(postings=[], rows=0, status="skipped", skip_reason="disabled")
+            return ScrapeOutcome(postings=[], rows=0, status=STATUS_SKIPPED, skip_reason="disabled")
         if reason == "no_country":
             self._warn_missing_country_once(site_name, query, 1)
-            return ScrapeOutcome(postings=[], rows=0, status="skipped", skip_reason="no_country")
+            return ScrapeOutcome(postings=[], rows=0, status=STATUS_SKIPPED, skip_reason="no_country")
 
         # Every real request is logged here (not in a caller) so that the CLI `scrape`, the daemon and
         # scrape_query/scrape_all_queries, which all end up in scrape_board, show the same progress.
@@ -372,7 +390,7 @@ class JobSpyScraper:
                 totals.calls += 1
                 totals.failed += 1
                 totals.seconds += seconds
-            return ScrapeOutcome(postings=[], rows=0, status="failed", error=last_error)
+            return ScrapeOutcome(postings=[], rows=0, status=STATUS_FAILED, error=last_error)
 
         if isinstance(df, pd.DataFrame):
             self._warn_board_errors_once(df)
@@ -381,7 +399,7 @@ class JobSpyScraper:
         postings: List[JobPosting] = []
         skipped_empty = 0
         if df is not None and not df.empty:
-            postings, skipped_empty = self._rows_to_postings(df, site_name, query)
+            postings, skipped_empty = self._rows_to_postings(df, site_name, query, rules)
 
         seconds = time.time() - t0
         prefiltered = sum(1 for p in postings if p.pre_filtered)
@@ -409,11 +427,11 @@ class JobSpyScraper:
 
         board_error = self._board_error(df, board)
         if board_error and rows == 0:
-            status = "failed"
+            status = STATUS_FAILED
         elif rows == 0:
-            status = "empty"
+            status = STATUS_EMPTY
         else:
-            status = "ok"
+            status = STATUS_OK
         return ScrapeOutcome(
             postings=postings,
             rows=rows,
@@ -424,7 +442,11 @@ class JobSpyScraper:
         )
 
     def _rows_to_postings(
-        self, df: pd.DataFrame, site_name: str, query: SearchQuery
+        self,
+        df: pd.DataFrame,
+        site_name: str,
+        query: SearchQuery,
+        rules: Optional[Sequence[CompiledRule]] = None,
     ) -> Tuple[List[JobPosting], int]:
         """Converts a python-jobspy frame to postings; returns them plus the count of LinkedIn rows skipped
         because their description is empty."""
@@ -456,7 +478,7 @@ class JobSpyScraper:
                 board == "linkedin"
                 and self.fetch_description
                 and not desc
-                and not (self.apply_prefilter and classify_title(title))
+                and not (self.apply_prefilter and classify_title(title, rules))
             ):
                 skipped_empty += 1
                 continue
@@ -464,13 +486,15 @@ class JobSpyScraper:
             dedup_hash = compute_dedup_hash(company, title, location)
 
             if self.apply_prefilter:
-                pf_res = pre_filter_job(title, desc)
+                pf_res = pre_filter_job(title, desc, rules)
                 is_prefiltered = not pf_res.passed
                 pre_filter_reason = pf_res.reason if is_prefiltered else None
+                pre_filter_rule = pf_res.rule_key if is_prefiltered else None
                 notification_status = "dismissed" if is_prefiltered else "pending"
             else:
                 is_prefiltered = False
                 pre_filter_reason = None
+                pre_filter_rule = None
                 notification_status = "pending"
 
             raw_direct_url = _clean_str(row.get("job_url_direct"))
@@ -510,6 +534,7 @@ class JobSpyScraper:
                     date_posted=date_posted_val,
                     pre_filtered=is_prefiltered,
                     pre_filter_reason=pre_filter_reason,
+                    pre_filter_rule=pre_filter_rule,
                     notification_status=notification_status,
                 )
             )

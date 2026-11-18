@@ -237,3 +237,35 @@ def test_cli_cleanup_empty_deletes_empty_description_stubs(monkeypatch):
     assert result.exit_code == 0
     mock_delete.assert_called_once_with("linkedin")
     assert "4" in result.stdout
+
+
+def _stats_threshold(monkeypatch) -> float:
+    mock_stats = MagicMock(return_value={"total_jobs": 1})
+    monkeypatch.setattr("src.storage.db.Database.get_stats", mock_stats)
+    monkeypatch.setattr("src.cli.check_jobspy_update", MagicMock(return_value=None))
+    assert runner.invoke(app, ["stats"]).exit_code == 0
+    return mock_stats.call_args.kwargs["pending_threshold"]
+
+
+def test_cli_stats_uses_the_profile_digest_threshold(monkeypatch):
+    from src.profile.ops import ReplaceProfile, apply_changes
+    from src.profile.snapshot import PinnedQuery, ProfileFields, ProfileSnapshot
+    from src.config import get_settings
+    from src.profile.store import ProfileStore
+    from src.storage.db import Database
+
+    db = Database(get_settings().db_path)
+    db.init_db()
+    snapshot = ProfileSnapshot(
+        ProfileFields(persona="<PERSONA>", digest_threshold=6.0, wow_threshold=8.0),
+        pinned_queries=(PinnedQuery("Q-1", "<ROLE>", "<MARKET>", ("linkedin",)),),
+    )
+    apply_changes(ProfileStore(db), [ReplaceProfile(snapshot)], label="p", expected_version=0)
+
+    assert _stats_threshold(monkeypatch) == 6.0
+
+
+def test_cli_stats_without_profile_uses_env_threshold(monkeypatch):
+    monkeypatch.setenv("DIGEST_SCORE_THRESHOLD", "6.8")
+
+    assert _stats_threshold(monkeypatch) == 6.8
