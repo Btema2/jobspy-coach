@@ -430,3 +430,50 @@ def test_validators_report_network_errors_without_the_url():
     for result in (validators.nim(NIM), validators.openrouter(OR)):
         assert result.ok is None
         assert "ReadTimeout" in result.detail and NIM not in result.detail and OR not in result.detail
+
+
+def test_rejected_existing_token_skipped_issues_no_pairing_code(env):
+    env.path.write_text(f"TELEGRAM_BOT_TOKEN={BOT}\nNVIDIA_API_KEY={NIM}\n")
+    validators = FakeValidators({"telegram": [CheckResult(False, "Telegram rejected the token (HTTP 401)")]})
+    prompter = ScriptedPrompter(secrets=["", ""], confirms=[True, True])  # keep token (rejected), skip re-entry
+
+    assert env.run(prompter, validators, options=InitOptions(start=None)) == 0
+
+    assert env.state.get_pairing_code() is None
+    assert "no pairing code" in env.output.lower() and "TELEGRAM_BOT_TOKEN" in env.output
+    assert "no LLM key" not in env.output  # the NVIDIA key is still in the file
+    assert prompter.confirm_labels[-1] == ("Start the daemon now?", False)
+
+
+def test_rejected_existing_token_replaced_still_pairs(env):
+    env.path.write_text(f"TELEGRAM_BOT_TOKEN={BOT}\n")
+    validators = FakeValidators({"telegram": [CheckResult(False, "x"), CheckResult(True, "@fake_bot")]})
+    prompter = ScriptedPrompter(secrets=["111:<NEW>", "", ""], confirms=[True])
+
+    assert env.run(prompter, validators) == 0
+
+    assert env.state.get_pairing_code() is not None
+    assert "no pairing code" not in env.output.lower()
+
+
+def test_no_llm_warning_when_a_key_is_still_in_the_file(env):
+    env.path.write_text(f"OPENROUTER_API_KEY={OR}\n")
+    prompter = ScriptedPrompter(secrets=["", ""], confirms=[False])  # decline keeping it, skip re-entry
+
+    env.run(prompter)
+
+    assert "no LLM key" not in env.output
+
+
+@pytest.mark.parametrize("language", ["", "english", "EN", "e1", "en\n", "x" * 40])
+def test_invalid_language_fails_before_anything_is_written(env, language):
+    env.path.write_text("KEEP=1\n")
+    before = env.path.read_bytes()
+    prompter = ScriptedPrompter(secrets=[BOT, NIM, ""])
+
+    assert env.run(prompter, options=InitOptions(start=False, language=language)) == 1
+
+    assert env.path.read_bytes() == before
+    assert prompter.secret_labels == []
+    assert env.store.read_snapshot() is None
+    assert "--language" in env.output or "language" in env.output.lower()

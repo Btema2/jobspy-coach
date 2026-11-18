@@ -9,7 +9,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Protocol, Tuple
+from typing import Callable, Dict, Optional, Protocol, Set, Tuple
 
 import httpx
 import typer
@@ -25,7 +25,7 @@ from src.bot.state import BotStateStore
 from src.config import Settings
 from src.envfile import merge_env_file, read_env_value, validate_env_value
 from src.profile.errors import ProfileError, ProfileValidationError, VersionConflict
-from src.profile.ops import create_starter_profile
+from src.profile.ops import create_starter_profile, is_language_code
 from src.profile.store import ProfileStore
 
 # Keep identical to OPENROUTER_MODELS in .env.example (a test compares them).
@@ -158,10 +158,12 @@ def _collect_credentials(
     prompter: Prompter,
     validators: Validators,
     out: Callable[[str], None],
-) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Returns (values to write, effective values by name). Raises ``_CredentialsFailed`` after 3 rejections."""
+) -> Tuple[Dict[str, str], Dict[str, str], Set[str]]:
+    """Returns (values to write, effective values by name, names whose existing value was rejected and not
+    replaced). Raises ``_CredentialsFailed`` after 3 rejections."""
     updates: Dict[str, str] = {}
     effective: Dict[str, str] = {}
+    rejected: Set[str] = set()
     for name, validator_name, settings_field in _CREDENTIALS:
         validate = getattr(validators, validator_name)
         existing = read_env_value(env_path, name) or getattr(settings, settings_field) or ""
@@ -170,6 +172,7 @@ def _collect_credentials(
                 effective[name] = existing
                 continue
             out(f"{name}: the existing value does not work; enter a new one.")
+            rejected.add(name)
         for _ in range(MAX_ATTEMPTS):
             value = prompter.secret(f"{name} (input hidden, press Enter to skip)").strip()
             if not value:
@@ -177,10 +180,11 @@ def _collect_credentials(
             if _check(validate, value, name, out):
                 updates[name] = value
                 effective[name] = value
+                rejected.discard(name)
                 break
         else:
             raise _CredentialsFailed(name)
-    return updates, effective
+    return updates, effective, rejected
 
 
 def _store_credentials(
@@ -267,10 +271,14 @@ def run_init(
     start_daemon: Callable[[], None],
     clock: Callable[[], float] = time.time,
 ) -> int:
+    if not is_language_code(options.language):
+        out("--language must be a two or three letter lower-case code such as 'en'; nothing was changed.")
+        return 1
     effective: Dict[str, str] = {}
+    rejected: Set[str] = set()
     if not options.skip_credentials:
         try:
-            updates, effective = _collect_credentials(env_path, settings, prompter, validators, out)
+            updates, effective, rejected = _collect_credentials(env_path, settings, prompter, validators, out)
         except _CredentialsFailed as failed:
             out(f"{failed.args[0]} was rejected three times; nothing was written.")
             return 1
@@ -279,7 +287,10 @@ def run_init(
         except (OSError, ValueError) as exc:
             out(f"Could not write .env ({type(exc).__name__}); nothing was changed.")
             return 1
-        if not (effective.get("NVIDIA_API_KEY") or effective.get("OPENROUTER_API_KEY")):
+        if not any(
+            effective.get(name) or read_env_value(env_path, name) or getattr(settings, field)
+            for name, _, field in _CREDENTIALS[1:]
+        ):
             out(
                 "Warning: no LLM key configured (NVIDIA_API_KEY or OPENROUTER_API_KEY); "
                 "evaluation cannot run until one is set."
@@ -293,7 +304,14 @@ def run_init(
         or read_env_value(env_path, "TELEGRAM_BOT_TOKEN")
         or settings.telegram_bot_token
     )
-    code_issued = _pairing_step(env_path, state, settings, clock, out) if token else False
+    code_issued = False
+    if "TELEGRAM_BOT_TOKEN" in rejected:
+        out(
+            "No pairing code issued: Telegram rejected TELEGRAM_BOT_TOKEN. "
+            "Run jobspy-coach init again with a valid token."
+        )
+    elif token:
+        code_issued = _pairing_step(env_path, state, settings, clock, out)
 
     start = options.start
     if start is None:

@@ -598,6 +598,11 @@ def diff_snapshots(old: Optional[ProfileSnapshot], new: ProfileSnapshot) -> List
 # --- apply / versions --------------------------------------------------------------------------
 
 
+def is_language_code(value: str) -> bool:
+    """True for a lower-case two or three letter language code such as ``en``."""
+    return _LANGUAGE_RE.fullmatch(value) is not None
+
+
 def apply_changes(
     store: ProfileStore,
     ops: Sequence[Operation],
