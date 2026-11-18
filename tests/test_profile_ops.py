@@ -101,6 +101,12 @@ def test_create_starter_profile_is_paused_and_empty(store: ProfileStore):
     assert history(store)[0].label == "init starter profile"
 
 
+def test_create_starter_profile_output_language(store: ProfileStore):
+    create_starter_profile(store, wow_threshold=9.0, digest_threshold=7.0, output_language="en")
+
+    assert store.read_snapshot().fields.output_language == "en"
+
+
 def test_stale_expected_version_conflicts(started: ProfileStore):
     with pytest.raises(VersionConflict):
         apply_changes(started, [AddRole("<ROLE>")], label="x", expected_version=0)

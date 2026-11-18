@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    telegram_bot_polling: bool = Field(default=True, alias="TELEGRAM_BOT_POLLING")
 
     # Scheduler & Scraper
     scrape_interval_hours: int = Field(default=6, alias="SCRAPE_INTERVAL_HOURS")

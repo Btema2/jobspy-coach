@@ -1,3 +1,4 @@
+from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 from unittest.mock import MagicMock
@@ -181,7 +182,7 @@ def test_cli_digest_command(monkeypatch):
 
 def _create_profile():
     """`run` refuses to start without a stored profile."""
-    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["init", "--skip-credentials", "--no-start"]).exit_code == 0
 
 
 def test_cli_run_command(monkeypatch):
@@ -298,3 +299,108 @@ def test_cli_test_telegram_uses_profile_language(monkeypatch, isolate_cli_test_d
     assert runner.invoke(app, ["test-telegram"]).exit_code == 0
     assert sent[-1] == t("test_telegram", "en")
     assert sent[-1] != sent[0]
+
+
+def test_init_never_accepts_secrets_as_arguments():
+    for args in (["init", "--token", "x"], ["init", "--api-key", "x"], ["init", "--nvidia-api-key", "x"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2, result.output
+
+
+def test_init_options_and_run_init_wiring(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run_init(**kwargs):
+        captured.update(kwargs)
+        return 3
+
+    monkeypatch.setattr("src.cli.run_init", fake_run_init)
+
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start", "--language", "pl"])
+
+    assert result.exit_code == 3
+    options = captured["options"]
+    assert (options.skip_credentials, options.start, options.language) == (True, False, "pl")
+    assert captured["env_path"] == Path(".env")
+    result = runner.invoke(app, ["init"])
+    assert captured["options"].start is None and captured["options"].language == "en"
+
+
+def test_init_start_daemon_clears_settings_cache_then_runs_the_run_path(monkeypatch):
+    from src.config import get_settings
+
+    calls = []
+
+    def fake_run_init(**kwargs):
+        get_settings()  # fill the cache
+        kwargs["start_daemon"]()
+        return 0
+
+    monkeypatch.setattr("src.cli.run_init", fake_run_init)
+    monkeypatch.setattr("src.cli._run_daemon", lambda: calls.append(get_settings.cache_info().currsize))
+    assert runner.invoke(app, ["init", "--skip-credentials", "--start"]).exit_code == 0
+
+    assert calls == [0]
+
+
+def test_bot_unpair_clears_pairing_and_chat_id(isolate_cli_test_db, tmp_path):
+    from src.bot.state import BotStateStore
+    from src.storage.db import Database
+
+    db = Database(isolate_cli_test_db)
+    db.init_db()
+    state = BotStateStore(db)
+    state.set_pairing(5, 5)
+    env = tmp_path / ".env"
+    env.write_text("# keep\nTELEGRAM_BOT_TOKEN=123:<TOKEN>\nTELEGRAM_CHAT_ID=5\nOTHER=1\n")
+
+    result = runner.invoke(app, ["bot", "unpair"])
+
+    assert result.exit_code == 0, result.output
+    assert state.get_pairing() is None
+    assert env.read_text() == "# keep\nTELEGRAM_BOT_TOKEN=123:<TOKEN>\nTELEGRAM_CHAT_ID=\nOTHER=1\n"
+    assert result.output.strip().startswith("Unpaired. Alerts stop until you pair again")
+    assert "jobspy-coach init" in result.output and "Restart the daemon" in result.output
+
+
+def test_bot_unpair_without_env_file(isolate_cli_test_db, tmp_path):
+    result = runner.invoke(app, ["bot", "unpair"])
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / ".env").exists()
+
+
+def test_run_and_init_start_share_one_code_path(monkeypatch):
+    assert runner.invoke(app, ["init", "--skip-credentials", "--no-start"]).exit_code == 0
+    started = []
+    monkeypatch.setattr("src.scheduler.daemon.DaemonService.start", lambda self: started.append(1))
+
+    assert runner.invoke(app, ["run"]).exit_code == 0
+    assert runner.invoke(app, ["init", "--skip-credentials", "--start"]).exit_code == 0
+    assert started == [1, 1]
+
+
+def test_init_interactive_flow_writes_env_and_never_echoes_secrets(monkeypatch, tmp_path):
+    from src.bot.bootstrap import CheckResult, Validators
+    from src.bot.state import BotStateStore
+    from src.envfile import read_env_value
+    from src.storage.db import Database
+
+    ok = lambda value: CheckResult(True, "ok")  # noqa: E731
+    monkeypatch.setattr("src.cli.http_validators", lambda settings: Validators(ok, ok, ok))
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NVIDIA_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    result = runner.invoke(app, ["init", "--no-start"], input="111:<BOT>\nnvapi-<NIM>\n\n")
+
+    assert result.exit_code == 0, result.output
+    env = tmp_path / ".env"
+    assert read_env_value(env, "TELEGRAM_BOT_TOKEN") == "111:<BOT>"
+    assert read_env_value(env, "NVIDIA_API_KEY") == "nvapi-<NIM>"
+    assert (env.stat().st_mode & 0o777) == 0o600
+    assert "<BOT>" not in result.output and "<NIM>" not in result.output
+    assert "Send /start " in result.output
+    from src.config import get_settings
+
+    db = Database(get_settings().db_path)
+    assert BotStateStore(db).get_pairing_code() is not None

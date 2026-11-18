@@ -8,7 +8,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from src.bot.bootstrap import InitOptions, TyperPrompter, http_validators, run_init
+from src.bot.state import BotStateStore
 from src.config import get_settings
+from src.envfile import merge_env_file
 from src.evaluator.errors import ConfigurationError
 from src.i18n import t
 from src.logging_config import configure_logging
@@ -20,10 +23,9 @@ from src.profile.errors import (
     ProfileCompileError,
     ProfileError,
     ProfileValidationError,
-    VersionConflict,
 )
 from src.profile.importer import DEFAULT_EXPORT_PATH, auto_import, export_profile, load_profile_yaml
-from src.profile.ops import ReplaceProfile, apply_changes, create_starter_profile
+from src.profile.ops import ReplaceProfile, apply_changes
 from src.profile.requeue import rebucket_evaluated, requeue_prefiltered
 from src.profile.store import ProfileStore
 from src.scheduler.daemon import DaemonService
@@ -49,6 +51,9 @@ configure_logging()
 
 profile_app = typer.Typer(help="Inspect, export and import the stored search profile")
 app.add_typer(profile_app, name="profile")
+
+bot_app = typer.Typer(help="Manage the Telegram bot")
+app.add_typer(bot_app, name="bot")
 
 
 def _fail(message: str, *, hint: str = "") -> "typer.Exit":
@@ -120,9 +125,8 @@ def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
     return typer.Exit(code=1)
 
 
-@app.command()
-def run():
-    """Start the 24/7 background daemon scheduler."""
+def _run_daemon() -> None:
+    """Start the daemon in this process (blocks until it stops); shared by `run` and `init --start`."""
     if not _profile_store().has_profile():
         raise _fail("no profile, run `jobspy-coach init`")
     console.print("[bold green]Starting JobSpy Coach Daemon...[/bold green]")
@@ -134,36 +138,66 @@ def run():
 
 
 @app.command()
-def init() -> None:
-    """Create an empty, paused starter profile (does nothing when a profile exists). Never prompts."""
+def run():
+    """Start the 24/7 background daemon scheduler."""
+    _run_daemon()
+
+
+def _start_daemon_after_init() -> None:
+    get_settings.cache_clear()  # init just wrote .env: the daemon must read the new values
+    _run_daemon()
+
+
+@app.command()
+def init(
+    skip_credentials: bool = typer.Option(
+        False, "--skip-credentials", help="Do not prompt for or write credentials"
+    ),
+    start: Optional[bool] = typer.Option(
+        None, "--start/--no-start", help="Start the daemon afterwards (default: ask)"
+    ),
+    language: str = typer.Option("en", "--language", help="Output language code of the starter profile"),
+) -> None:
+    """Set up credentials (hidden prompts), a paused starter profile and Telegram pairing; optionally start.
+
+    Secrets are never accepted as arguments.
+    """
     settings = get_settings()
-    store = _profile_store()
-    existing = store.read_snapshot()
-    if existing is not None:
-        console.print(f"Profile already exists (version {existing.version}); nothing to do.", markup=False)
-        return
-    try:
-        result = create_starter_profile(
-            store,
-            wow_threshold=settings.wow_score_threshold,
-            digest_threshold=settings.digest_score_threshold,
-        )
-    except VersionConflict:  # a concurrent `init` (or import) won the race
-        current = store.read_snapshot()
-        console.print(
-            f"Profile already exists (version {current.version if current else '?'}); nothing to do.",
-            markup=False,
-        )
-        return
-    except ProfileError as exc:
-        raise _fail_profile_error(exc) from None
-    console.print(f"Created an empty starter profile (version {result.version}); it is paused.", markup=False)
-    for note in result.warnings:
-        console.print(f"- {note}", style="yellow", markup=False, highlight=False)
+    db = Database(settings.db_path)
+    db.init_db()
+    code = run_init(
+        env_path=Path(".env"),
+        store=ProfileStore(db),
+        state=BotStateStore(db),
+        settings=settings,
+        prompter=TyperPrompter(),
+        validators=http_validators(settings),
+        options=InitOptions(skip_credentials=skip_credentials, start=start, language=language),
+        out=lambda line: console.print(line, markup=False, highlight=False, soft_wrap=True),
+        start_daemon=_start_daemon_after_init,
+    )
+    if code:
+        raise typer.Exit(code=code)
+
+
+@bot_app.command("unpair")
+def bot_unpair() -> None:
+    """Forget the paired Telegram account (and blank TELEGRAM_CHAT_ID in .env)."""
+    settings = get_settings()
+    db = Database(settings.db_path)
+    db.init_db()
+    BotStateStore(db).clear_pairing()
+    env_path = Path(".env")
+    if env_path.exists():
+        try:
+            merge_env_file(env_path, {"TELEGRAM_CHAT_ID": ""})
+        except OSError as exc:
+            raise _fail(f"cannot update .env ({type(exc).__name__}); the pairing was cleared") from None
     console.print(
-        "Fill it in: run `jobspy-coach profile export`, edit the YAML file, then run "
-        "`jobspy-coach profile import <file>`.",
+        "Unpaired. Alerts stop until you pair again: run jobspy-coach init and send the new code. "
+        "Restart the daemon if it is running.",
         markup=False,
+        soft_wrap=True,
     )
 
 

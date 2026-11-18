@@ -676,14 +676,16 @@ def resolve_thresholds(wow: float, digest: float) -> Tuple[float, float, Optiona
 
 
 def create_starter_profile(
-    store: ProfileStore, *, wow_threshold: float, digest_threshold: float
+    store: ProfileStore, *, wow_threshold: float, digest_threshold: float, output_language: Optional[str] = None
 ) -> ApplyResult:
     """An empty, paused profile (used by ``init`` when no legacy files exist).
 
     Invalid ``.env`` thresholds fall back to the defaults with a note in ``warnings`` (like the import).
     """
     wow, digest, note = resolve_thresholds(wow_threshold, digest_threshold)
-    snapshot = ProfileSnapshot(ProfileFields(paused=True, wow_threshold=wow, digest_threshold=digest))
+    snapshot = ProfileSnapshot(
+        ProfileFields(paused=True, wow_threshold=wow, digest_threshold=digest, output_language=output_language)
+    )
     result = apply_changes(
         store, [ReplaceProfile(snapshot)], label="init starter profile", expected_version=0
     )

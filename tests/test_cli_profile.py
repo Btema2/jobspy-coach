@@ -116,7 +116,7 @@ def test_unknown_board_in_queries_json_names_file_and_entry(tmp_path, isolated):
 
 
 def test_init_creates_paused_starter_profile(isolated):
-    result = runner.invoke(app, ["init"])
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
 
     assert result.exit_code == 0, result.output
     snapshot = _store(isolated).read_snapshot()
@@ -128,10 +128,10 @@ def test_init_creates_paused_starter_profile(isolated):
 def test_init_after_legacy_import_keeps_imported_profile(tmp_path, isolated):
     _legacy_queries(tmp_path)
 
-    result = runner.invoke(app, ["init"])
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
 
     assert result.exit_code == 0, result.output
-    assert "already exists" in result.output
+    assert "Profile exists (version" in result.output
     snapshot = _store(isolated).read_snapshot()
     assert snapshot.fields.paused is False
     assert len(snapshot.pinned_queries) == len(json.loads(QUERIES_FIXTURE.read_text(encoding="utf-8")))
@@ -139,7 +139,7 @@ def test_init_after_legacy_import_keeps_imported_profile(tmp_path, isolated):
 
 
 def test_init_never_prompts():
-    result = runner.invoke(app, ["init"], input="")
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start"], input="")
 
     assert result.exit_code == 0, result.output
     assert "token" not in result.output.lower()
@@ -163,7 +163,7 @@ def test_profile_preview_lists_queries_and_estimate(tmp_path):
 
 
 def test_profile_preview_shows_paused_starter(isolated):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
 
     result = runner.invoke(app, ["profile", "preview"])
 
@@ -231,7 +231,7 @@ markets:
 
 
 def test_profile_import_applies_and_prints_diff(tmp_path, isolated):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
 
     result = runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")])
@@ -244,7 +244,7 @@ def test_profile_import_applies_and_prints_diff(tmp_path, isolated):
 
 
 def test_profile_import_invalid_exits_nonzero_and_writes_nothing(tmp_path, isolated):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     bad = _IMPORT_YAML.replace("digest_threshold: 6.5", "digest_threshold: 9.0")
     (tmp_path / "bad.yaml").write_text(bad, encoding="utf-8")
 
@@ -256,7 +256,7 @@ def test_profile_import_invalid_exits_nonzero_and_writes_nothing(tmp_path, isola
 
 
 def test_profile_import_missing_file_exits_nonzero(tmp_path):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
 
     result = runner.invoke(app, ["profile", "import", str(tmp_path / "nope.yaml")])
 
@@ -274,7 +274,7 @@ def test_init_with_invalid_env_thresholds_falls_back_with_a_note(isolated, monke
     monkeypatch.setenv("DIGEST_SCORE_THRESHOLD", "9.0")
     get_settings.cache_clear()
 
-    result = runner.invoke(app, ["init"])
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
 
     assert result.exit_code == 0, result.output
     snapshot = _store(isolated).read_snapshot()
@@ -338,13 +338,13 @@ def test_concurrent_init_loser_reports_already_exists(isolated, monkeypatch):
         return real(self)
 
     monkeypatch.setattr(ProfileStore, "read_snapshot", racing)
-    runner.invoke(app, ["init"])  # ... but a concurrent init has created it by now
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])  # ... but a concurrent init has created it by now
     calls["n"] = 0
 
-    result = runner.invoke(app, ["init"])
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
 
     assert result.exit_code == 0, result.output
-    assert "already exists" in result.output
+    assert "Profile exists (version" in result.output
 
 
 # --- requeue and backtest ------------------------------------------------------------------------
@@ -352,7 +352,7 @@ def test_concurrent_init_loser_reports_already_exists(isolated, monkeypatch):
 
 def _profile_with_one_dropped_job(isolated):
     """An imported-legacy-free profile (init) plus one pre-filtered row that a (now empty) rule set passes."""
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     db = Database(isolated)
     words = " ".join(f"word{n}" for n in range(60))
     from src.storage.models import JobPosting
@@ -384,7 +384,7 @@ def test_requeue_cli_dry_run_reports_counts(isolated):
 
 
 def test_requeue_thresholds_cli(isolated):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     db = Database(isolated)
     from src.storage.models import JobPosting
 
@@ -421,7 +421,7 @@ def test_requeue_without_profile_exits_nonzero():
 
 
 def test_profile_import_prints_backtest_line(tmp_path, isolated):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     (tmp_path / "in.yaml").write_text(_IMPORT_YAML + "rules:\n  - {kind: block, term: \"<TERM>\", match_mode: exact, reason: USER_RULE, source: user}\n", encoding="utf-8")
 
     result = runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")])
@@ -431,7 +431,7 @@ def test_profile_import_prints_backtest_line(tmp_path, isolated):
 
 
 def test_requeue_with_an_unreadable_profile_is_a_clean_error(tmp_path, isolated):
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
     assert runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")]).exit_code == 0
     with Database(isolated)._get_connection() as conn:
@@ -448,7 +448,7 @@ def test_requeue_with_an_unreadable_profile_is_a_clean_error(tmp_path, isolated)
 def test_profile_import_survives_a_failing_backtest(tmp_path, isolated, monkeypatch):
     import sqlite3
 
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
 
     def locked(*args, **kwargs):
@@ -470,7 +470,7 @@ def test_profile_import_backtests_against_the_applied_snapshots(tmp_path, isolat
         seen["old"], seen["new"] = old, new
 
     monkeypatch.setattr("src.cli.backtest_snapshots", spy)
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
 
     result = runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")])
@@ -482,7 +482,7 @@ def test_profile_import_backtests_against_the_applied_snapshots(tmp_path, isolat
 def test_requeue_dry_run_never_initialises_or_migrates(isolated, monkeypatch):
     import sqlite3
 
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     calls = []
     real_init = Database.init_db
     monkeypatch.setattr(Database, "init_db", lambda self: calls.append(1) or real_init(self))
@@ -513,7 +513,7 @@ def test_requeue_dry_run_reports_an_uninitialised_database_and_writes_nothing(is
 def test_requeue_dry_run_reports_an_outdated_schema(isolated):
     import sqlite3
 
-    runner.invoke(app, ["init"])
+    runner.invoke(app, ["init", "--skip-credentials", "--no-start"])
     conn = sqlite3.connect(isolated)
     conn.execute("DELETE FROM schema_version WHERE version >= 3")
     conn.commit()
