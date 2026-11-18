@@ -169,10 +169,37 @@ def test_adopt_chat_id_only_positive_int(state):
     assert state.get_pairing() == Pairing(4242, 4242)
 
 
-def test_code_comparison_is_constant_time():
-    import inspect
+def test_code_comparison_uses_compare_digest_on_equal_length_digests(state, monkeypatch):
+    import hmac
 
-    import src.bot.auth as auth
+    import src.bot.auth as auth_module
 
-    source = inspect.getsource(auth)
-    assert "hmac.compare_digest" in source
+    calls = []
+    real = hmac.compare_digest
+
+    def spy(a, b):
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(auth_module.hmac, "compare_digest", spy)
+    auth = Authorizer(state, clock=Clock())
+    issue_pairing_code(state, NOW)
+
+    for guess in ("x", "ABCD-EFGH-IJKL-MNOP" * 20, "\u00e9\u00e9", "0"):
+        assert auth.try_pair(_msg(f"/start {guess}", user_id=7, chat_id=7)).paired is False
+        auth = Authorizer(state, clock=Clock())  # a restart clears the lock; the code stays valid
+
+    assert len(calls) == 4
+    assert all(len(a) == 64 and len(b) == 64 for a, b in calls)  # hex digests, whatever the guess length
+    assert state.get_pairing() is None
+
+
+def test_forwarded_messages_are_rejected_even_from_the_paired_user(state):
+    state.set_pairing(111, 111)
+    auth = Authorizer(state, clock=Clock())
+    raw = message_update(1, "/undo", user_id=111, chat_id=111)
+    raw["message"]["forward_origin"] = {"type": "user"}
+
+    assert auth.decide(parse_update(raw)) is AuthDecision.REJECT
+    assert parse_update(raw).command is None
+    assert auth.decide(_msg("/undo")) is AuthDecision.ACCEPT

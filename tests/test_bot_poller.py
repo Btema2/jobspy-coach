@@ -391,3 +391,99 @@ def test_set_my_commands_failure_does_not_stop_polling(telegram, state, tmp_path
     poller.run_forever()
 
     assert len(telegram.calls("getUpdates")) == 1
+
+
+# --- review fixes ---------------------------------------------------------------------------
+
+
+class _RecordingStop:
+    def __init__(self, limit):
+        self.waits = []
+        self.limit = limit
+
+    def is_set(self):
+        return len(self.waits) >= self.limit
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return self.is_set()
+
+
+def test_failed_answer_callback_query_still_routes_the_callback(telegram, state, tmp_path, caplog):
+    _paired(state)
+    poller, router = _make(telegram, state, tmp_path)
+    telegram.respond("answerCallbackQuery", 400, {
+        "ok": False, "error_code": 400,
+        "description": "Bad Request: query is too old and response timeout expired <SECRET-TEXT>"})
+
+    with caplog.at_level(logging.DEBUG):
+        poller.process(callback_update(9, "w:1:go"))
+
+    assert [u.text for u in router.handled] == ["w:1:go"]
+    assert len(telegram.calls("sendMessage")) == 1
+    assert "SECRET-TEXT" not in caplog.text
+
+
+def test_raising_answer_callback_query_still_routes_the_callback(telegram, state, tmp_path, caplog):
+    _paired(state)
+    poller, router = _make(telegram, state, tmp_path)
+
+    def boom(callback_id, text=None):
+        raise RuntimeError("<SECRET-TEXT>")
+
+    poller._client.answer_callback_query = boom
+    with caplog.at_level(logging.DEBUG):
+        poller.process(callback_update(9, "w:1:go"))
+
+    assert len(router.handled) == 1
+    assert "RuntimeError" in caplog.text and "SECRET-TEXT" not in caplog.text
+
+
+def test_forwarded_command_is_ignored_and_logged_without_content(telegram, state, tmp_path, caplog):
+    _paired(state)
+    poller, router = _make(telegram, state, tmp_path)
+    for key, value in (("forward_origin", {"type": "user"}), ("forward_date", 1), ("forward_from", {"id": 5})):
+        raw = message_update(1, "/undo <SECRET-TEXT>", date=int(NOW))
+        raw["message"][key] = value
+        with caplog.at_level(logging.DEBUG):
+            poller.process(raw)
+
+    assert router.handled == []
+    assert telegram.calls("sendMessage") == []
+    assert "rejected update 1 (message, private)" in caplog.text and "SECRET-TEXT" not in caplog.text
+
+
+def test_unreadable_update_backs_off_instead_of_spinning(telegram, state, tmp_path):
+    _paired(state)
+    stop = _RecordingStop(3)
+    poller, router = _make(telegram, state, tmp_path, stop=stop)
+    for _ in range(3):
+        telegram.queue_updates([{"message": {"text": "no update id"}}])
+
+    poller.run_forever()
+
+    assert len(stop.waits) == 3 and all(w > 0 for w in stop.waits)
+    assert len(telegram.calls("getUpdates")) == 3
+    assert router.handled == []
+
+
+def test_unreadable_update_followed_by_a_readable_one_advances(telegram, state, tmp_path):
+    _paired(state)
+    poller, router = _make(telegram, state, tmp_path)
+    telegram.queue_updates([{"update_id": "x"}, message_update(7, "/help")])
+
+    assert poller.poll_once() == 2
+    assert state.get_offset() == 8
+
+
+def test_generic_failures_warn_once_per_outage(telegram, state, tmp_path, caplog):
+    stop = _RecordingStop(4)
+    poller, _ = _make(telegram, state, tmp_path, stop=stop)
+    for _ in range(4):
+        telegram.respond("getUpdates", 500, {"ok": False, "error_code": 500, "description": "boom"})
+
+    with caplog.at_level(logging.DEBUG):
+        poller.run_forever()
+
+    failures = [r for r in caplog.records if "bot polling failed" in r.getMessage()]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG, logging.DEBUG, logging.DEBUG]

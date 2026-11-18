@@ -32,6 +32,10 @@ CONFLICT_BACKOFF_SECONDS = 30
 ERROR_REPLY = "Something went wrong; nothing was changed unless a diff was shown."
 
 
+class UnreadableUpdate(Exception):
+    """The last update of a batch had no readable id: back off instead of re-fetching it in a tight loop."""
+
+
 class Router(Protocol):
     def is_mutating(self, update: Update) -> bool: ...
 
@@ -76,6 +80,7 @@ class BotPoller:
             except Exception as exc:  # the menu is a convenience: never stop polling for it
                 logger.warning("setMyCommands failed: %s", type(exc).__name__)
         failures = 0
+        outage_logged = False
         conflict_logged = False
         while not self._stop.is_set():
             try:
@@ -93,21 +98,33 @@ class BotPoller:
                     )
                 self._stop.wait(CONFLICT_BACKOFF_SECONDS)
             except Exception as exc:  # network errors, API errors, a database hiccup: back off and retry
-                logger.warning("bot polling failed: %s", type(exc).__name__)
+                # One WARNING per outage; repeats stay at DEBUG so a long outage does not flood the log.
+                logger.log(
+                    logging.DEBUG if outage_logged else logging.WARNING,
+                    "bot polling failed: %s",
+                    type(exc).__name__,
+                )
+                outage_logged = True
                 self._stop.wait(min(MAX_BACKOFF_SECONDS, 2 ** min(failures, 6)))
                 failures += 1
             else:
                 failures = 0
+                outage_logged = False
                 conflict_logged = False
 
     def poll_once(self) -> int:
         updates = self._client.get_updates(self._state.get_offset(), LONG_POLL_SECONDS)
         handled = 0
+        unreadable_last = False
         for raw in updates:
             if self._stop.is_set():
                 break  # not acknowledged: Telegram re-delivers it after the restart
+            unreadable_last = parse_update(raw).update_id < 0
             self.process(raw)
             handled += 1
+        if unreadable_last:
+            # Nothing later in the batch moved the offset past it, so Telegram would hand it out again at once.
+            raise UnreadableUpdate("update without a readable id")
         return handled
 
     # --- one update ------------------------------------------------------------------------
@@ -138,7 +155,10 @@ class BotPoller:
 
     def _handle_accepted(self, update: Update) -> None:
         if update.kind == "callback" and update.callback_id:
-            self._client.answer_callback_query(update.callback_id)
+            try:  # a stale button ("query is too old") must not drop the press
+                self._client.answer_callback_query(update.callback_id)
+            except Exception as exc:
+                logger.debug("answerCallbackQuery failed: %s", type(exc).__name__)
         try:
             if (
                 self._router.is_mutating(update)

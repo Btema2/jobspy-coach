@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 _COMMAND_RE = re.compile(r"/([A-Za-z0-9_]{1,32})(?:@[A-Za-z0-9_]{1,64})?(?=\s|$)")
 # Logged on rejected updates, so only values from this closed set are ever kept.
+_FORWARD_KEYS = ("forward_origin", "forward_date", "forward_from", "forward_from_chat", "forward_sender_name")
 _CHAT_TYPES = {"private", "group", "supergroup", "channel", "sender"}
 
 
@@ -21,6 +22,7 @@ class Update:
     args: str = ""
     callback_id: Optional[str] = None
     message_id: Optional[int] = None  # the message a callback button sits on
+    forwarded: bool = False  # a forwarded message is never a command
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,8 @@ def parse_update(raw: dict) -> Update:
     try:
         return _parse(raw)
     except Exception:  # a hostile payload must never take the poller down
-        return Update(update_id=-1, kind="other")
+        update_id = _int(raw.get("update_id")) if isinstance(raw, dict) else None
+        return Update(update_id=update_id if update_id is not None and update_id >= 0 else -1, kind="other")
 
 
 def _parse(raw: Any) -> Update:
@@ -74,7 +77,8 @@ def _parse(raw: Any) -> Update:
     if isinstance(message, dict):
         chat = _dict(message.get("chat"))
         text = _text(message.get("text"))
-        command, args = _split_command(text)
+        forwarded = any(key in message for key in _FORWARD_KEYS)
+        command, args = (None, "") if forwarded else _split_command(text)
         return Update(
             update_id=update_id,
             kind="message",
@@ -86,6 +90,7 @@ def _parse(raw: Any) -> Update:
             command=command,
             args=args,
             message_id=_int(message.get("message_id")),
+            forwarded=forwarded,
         )
 
     callback = raw.get("callback_query")

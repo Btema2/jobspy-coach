@@ -88,6 +88,8 @@ class Authorizer:
     def decide(self, update: Update) -> AuthDecision:
         if update.kind == "other" or update.user_id is None or update.chat_id is None:
             return AuthDecision.REJECT
+        if update.forwarded:  # a forwarded "/undo" carries the forward time: never a command, never pairing
+            return AuthDecision.REJECT
         pairing = self._state.get_pairing()
         if pairing is not None:
             ok = (
