@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -191,3 +192,19 @@ def test_snapshot_from_dict_rejects_newer_or_missing_schema():
         snapshot_from_dict({"snapshot_schema": 99, "profile": {}})
     with pytest.raises(ProfileValidationError):
         snapshot_from_dict({"profile": {}})
+
+
+def test_failed_write_leaves_rows_version_and_history_untouched(store: ProfileStore):
+    store.write_snapshot(_snapshot("<ONE>"), expected_version=0, label="a")
+    before = store.read_snapshot()
+    broken = ProfileSnapshot(
+        fields=ProfileFields(persona="<TWO>"),
+        roles=(Role("<ROLE>"), Role("<role>")),  # violates the NOCASE UNIQUE role name
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.write_snapshot(broken, expected_version=1, label="b")
+
+    assert store.read_snapshot() == before
+    assert before is not None and before.version == 1 and before.fields.persona == "<ONE>"
+    assert [v.version for v in store.list_versions()] == [1]

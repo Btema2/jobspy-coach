@@ -210,7 +210,7 @@ def test_compiled_prompt_equals_todays_prompt():
 
 def test_empty_persona_matches_frozen_generic_prompt():
     compiled = compile_profile(_snap(fields=ProfileFields(persona="   ")))
-    frozen = (FIXTURES / "system_prompt_generic.txt").read_text()
+    frozen = (FIXTURES / "system_prompt_generic.txt").read_text(encoding="utf-8")
     assert compiled.system_prompt == frozen
     assert DEFAULT_CANDIDATE_PERSONA in compiled.system_prompt
 
@@ -233,23 +233,23 @@ def test_passthrough_fields():
         compiled.version = 5  # type: ignore[misc]
 
 
-def _rule(rules, kind_mode_term):
+def _rule(kind_mode_term):
     kind, mode, term = kind_mode_term
     compiled = compile_profile(_snap(rules=(Rule(kind, term, mode, "r", "user"),)))
     return compiled.rules[0].regex
 
 
 def test_rule_match_modes():
-    exact = _rule(None, ("block", "exact", "l&d"))
+    exact = _rule(("block", "exact", "l&d"))
     assert exact.search("Head of L&D")
     assert not exact.search("l&dx")
     assert not exact.search("xl&d")
 
-    prefix = _rule(None, ("soft", "prefix", "coach"))
+    prefix = _rule(("soft", "prefix", "coach"))
     assert prefix.search("Coaching")
     assert not prefix.search("Lifecoach")
 
-    pattern = _rule(None, ("block", "pattern", "cross-?fit"))
+    pattern = _rule(("block", "pattern", "cross-?fit"))
     assert pattern.search("Crossfit")
     assert pattern.search("CROSS-FIT")
 

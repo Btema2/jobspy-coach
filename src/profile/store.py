@@ -142,10 +142,10 @@ class ProfileStore:
                     "(SELECT version FROM profile_versions ORDER BY version DESC LIMIT ?)",
                     (KEEP_VERSIONS,),
                 )
+                conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-            conn.execute("COMMIT")
         return new_version
 
     @staticmethod
