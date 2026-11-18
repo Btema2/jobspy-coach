@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 from src.bot.render import CHUNK_LIMIT, PAGE_SIZE, chunk_html, esc, paginate, render_apply, utf16_len
 from src.profile.ops import ApplyResult
 
@@ -42,11 +44,48 @@ def test_chunk_html_utf16_and_entities():
     assert rejoined == text.replace("\n", "")
 
 
-def test_chunk_html_never_splits_a_tag():
-    text = "x" * 3795 + "<b>bold</b>"
-    chunks = chunk_html(text)
-    assert all(c.count("<") == c.count(">") for c in chunks)
+_ATOMS = [
+    "&amp;",
+    "<b>",
+    '<a href="https://example.test/?a=1&amp;b=2&amp;c=3">',
+    "&#128512;",
+]
+
+
+def _assert_well_cut(chunks, text):
     assert "".join(chunks) == text
+    for chunk in chunks:
+        assert utf16_len(chunk) <= CHUNK_LIMIT
+        assert chunk.count("<") == chunk.count(">"), chunk[-80:]
+        assert "&" not in re.sub(r"&#?\w+;", "", chunk), chunk[-80:]
+
+
+@pytest.mark.parametrize("atom", _ATOMS)
+def test_chunk_html_backs_off_when_the_cut_lands_inside_an_atom(atom):
+    # Sweep the padding so the 3,800 cut falls at every offset inside the atom (and just outside it).
+    for inside in range(len(atom) + 2):
+        text = "x" * (CHUNK_LIMIT - inside) + atom + "y" * 40
+        chunks = chunk_html(text)
+        assert len(chunks) == 2
+        _assert_well_cut(chunks, text)
+
+
+def test_chunk_html_never_splits_inside_a_tag_whose_attribute_has_entities():
+    tag = '<a href="https://example.test/?a=1&amp;b=2&amp;c=3&amp;d=4">'
+    for inside in range(1, len(tag)):
+        text = "x" * (CHUNK_LIMIT - inside) + tag + "label</a>"
+        _assert_well_cut(chunk_html(text), text)
+
+
+def test_chunk_html_counts_surrogate_pairs_as_two_units():
+    for pad in (CHUNK_LIMIT - 3, CHUNK_LIMIT - 2, CHUNK_LIMIT - 1):
+        text = "x" * pad + "\U0001F600" * 3
+        chunks = chunk_html(text)
+        _assert_well_cut(chunks, text)
+        assert len(chunks) == 2
+    # An emoji that would straddle the limit moves whole to the next chunk.
+    chunks = chunk_html("x" * (CHUNK_LIMIT - 1) + "\U0001F600")
+    assert chunks == ["x" * (CHUNK_LIMIT - 1), "\U0001F600"]
 
 
 def test_chunk_html_packs_lines_up_to_the_limit():

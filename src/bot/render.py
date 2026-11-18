@@ -37,12 +37,13 @@ def _hard_split(line: str, limit: int) -> List[str]:
     rest = line
     while utf16_len(rest) > limit:
         cut = _fit_prefix(rest, limit)
-        # Back off out of a split entity/tag; the last '&' or '<' before the cut is the only candidate.
-        start = max(rest.rfind("&", 0, cut), rest.rfind("<", 0, cut))
-        if start > 0:
-            match = _ATOMIC_RE.match(rest, start)
-            if match and match.end() > cut:
-                cut = start
+        # Back off out of a split entity or tag: the atom that straddles the cut starts at or before it.
+        for match in _ATOMIC_RE.finditer(rest):
+            if match.start() >= cut:
+                break
+            if match.end() > cut:
+                cut = match.start()
+                break
         cut = max(cut, 1)
         pieces.append(rest[:cut])
         rest = rest[cut:]
