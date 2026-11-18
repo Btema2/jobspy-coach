@@ -52,6 +52,14 @@ class JobPosting:
     evaluated_at: Optional[datetime] = None
     eval_model: Optional[str] = None
     eval_attempts: int = 0
+    eval_raw_score: Optional[float] = None
+    eval_is_core_role: Optional[bool] = None
+    eval_bonus_flag: Optional[bool] = None
+    eval_hard_reject: Optional[bool] = None
+
+    # Provenance
+    source_query: Optional[str] = None
+    remote_status: str = "unverified"
 
     # Notification
     notification_status: str = "pending"  # pending, instant_sent, digest_sent, dismissed, expired_dismissed

@@ -666,3 +666,25 @@ def test_save_job_round_trips_new_fields(tmp_path: Path):
     loaded = db.get_job_by_id(job_id)
     assert loaded.eval_model == "vendor/m"
     assert loaded.eval_attempts == 2
+
+
+def test_save_job_persists_source_query_and_remote_status(tmp_path: Path):
+    db = Database(tmp_path / "sq.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("g", source_query="Q1|linkedin", remote_status="verified"))
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.source_query == "Q1|linkedin"
+    assert loaded.remote_status == "verified"
+
+
+def test_new_job_fields_default_for_legacy_rows(tmp_path: Path):
+    db = Database(tmp_path / "lg.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("h"))
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.source_query is None
+    assert loaded.remote_status == "unverified"
+    assert loaded.eval_raw_score is None
+    assert loaded.eval_is_core_role is None
+    assert loaded.eval_bonus_flag is None
+    assert loaded.eval_hard_reject is None

@@ -120,6 +120,10 @@ def compute_dedup_hash(company: str, title: str, location: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _opt_bool(val: Any) -> Optional[bool]:
+    return None if val is None else bool(val)
+
+
 def _parse_dt(val: Any) -> Optional[datetime]:
     if not val:
         return None
@@ -250,8 +254,9 @@ class Database:
                 eval_status, eval_score, eval_is_wow, eval_summary_uk,
                 eval_reasoning, eval_languages, eval_pros, eval_cons,
                 eval_error, evaluated_at, eval_model, eval_attempts,
-                notification_status, instant_sent_at, digest_sent_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notification_status, instant_sent_at, digest_sent_at,
+                source_query, remote_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.dedup_hash, job.site, job.external_id, job.job_url, job.job_url_direct,
                 job.title, job.company, job.location, job.job_type, job.date_posted,
@@ -269,6 +274,8 @@ class Database:
                 job.notification_status,
                 job.instant_sent_at.isoformat() if job.instant_sent_at else None,
                 job.digest_sent_at.isoformat() if job.digest_sent_at else None,
+                job.source_query,
+                job.remote_status or "unverified",
             ))
             conn.commit()
             new_id = cursor.lastrowid
@@ -614,6 +621,12 @@ class Database:
             evaluated_at=_parse_dt(row["evaluated_at"]),
             eval_model=row["eval_model"],
             eval_attempts=row["eval_attempts"] or 0,
+            eval_raw_score=row["eval_raw_score"],
+            eval_is_core_role=_opt_bool(row["eval_is_core_role"]),
+            eval_bonus_flag=_opt_bool(row["eval_bonus_flag"]),
+            eval_hard_reject=_opt_bool(row["eval_hard_reject"]),
+            source_query=row["source_query"],
+            remote_status=row["remote_status"] or "unverified",
             notification_status=row["notification_status"],
             instant_sent_at=_parse_dt(row["instant_sent_at"]),
             digest_sent_at=_parse_dt(row["digest_sent_at"]),
