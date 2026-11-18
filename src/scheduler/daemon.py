@@ -134,6 +134,8 @@ class DaemonService:
         self._shutdown_requested = threading.Event()
         # One scrape cycle at a time: a scheduled cycle that finds it held is skipped, /run_now is refused.
         self._cycle_lock = threading.Lock()
+        # Held while a digest runs: it reads and marks pending rows, so /requeue must wait for it as well.
+        self._digest_lock = threading.Lock()
         self._bot_poller: Optional[BotPoller] = None
         self._bot_thread: Optional[threading.Thread] = None
         self._chain_lock = threading.Lock()
@@ -562,7 +564,8 @@ class DaemonService:
         return "rules" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     def is_cycle_running(self) -> bool:
-        return self._cycle_lock.locked()
+        """A scrape/evaluate cycle or a digest is running (the bot refuses /requeue meanwhile)."""
+        return self._cycle_lock.locked() or self._digest_lock.locked()
 
     def trigger_cycle(self) -> str:
         """Schedule an immediate cycle (``/run_now``, ``/resume``); the scheduler thread runs it."""
@@ -727,6 +730,10 @@ class DaemonService:
         return total_new_saved
 
     def run_daily_digest_cycle(self, dry_run: bool = False) -> int:
+        with self._digest_lock:
+            return self._run_daily_digest_cycle(dry_run)
+
+    def _run_daily_digest_cycle(self, dry_run: bool) -> int:
         if not dry_run:
             expired = self.db.expire_stale_pending_jobs(days=STALE_PENDING_DAYS)
             if expired > 0:

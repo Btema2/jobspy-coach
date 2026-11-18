@@ -139,6 +139,26 @@ def test_trigger_cycle_refuses_while_running(tmp_path):
     assert daemon.is_cycle_running() is False
 
 
+def test_is_cycle_running_covers_the_digest_run(tmp_path):
+    """/requeue rewrites job buckets; a digest sending and marking rows concurrently must block it too."""
+    daemon = _daemon(tmp_path)
+    daemon.db.init_db()
+    seen = []
+    real_pending = daemon.db.get_pending_digest_jobs
+
+    def spy(*args, **kwargs):
+        seen.append(daemon.is_cycle_running())
+        return real_pending(*args, **kwargs)
+
+    daemon.db.get_pending_digest_jobs = spy
+    assert daemon.is_cycle_running() is False
+    daemon.run_daily_digest_cycle(dry_run=True)
+    assert seen == [True]
+    assert daemon.is_cycle_running() is False
+    # a digest in flight does not make /run_now report a running scrape cycle
+    assert daemon._cycle_lock.locked() is False
+
+
 def test_trigger_cycle_adds_immediate_job(tmp_path):
     daemon = _daemon(tmp_path)
     daemon.scheduler = MagicMock()
