@@ -321,7 +321,7 @@ jobspy-coach requeue                        # jobs that now pass go back to the 
 jobspy-coach requeue --thresholds --dry-run # re-score evaluated jobs under the profile thresholds, bonus and cap
 jobspy-coach requeue --thresholds
 ```
-`requeue` only revives jobs created in the last 7 days (older ones would expire before any digest; they are counted as `too old`), and jobs with a stub description stay dropped. `requeue --thresholds` makes no LLM call: it recomputes the final score from the stored raw score and flags, skips and counts jobs evaluated before those were stored, never touches jobs that already got an alert or a digest, and never sends an instant alert (a job that now qualifies joins the next digest).
+`requeue` only revives jobs created in the last 7 days (older ones would expire before any digest; they are counted as `too old`), and jobs with a stub description stay dropped. `--dry-run` is read-only (it never initialises or migrates the database). `requeue --thresholds` makes no LLM call, looks at the same 7-day window (older jobs are counted as `too old`): it recomputes the final score from the stored raw score and flags, skips and counts jobs evaluated before those were stored, never touches jobs that already got an alert or a digest, and never sends an instant alert (a job that now qualifies joins the next digest).
 
 ### 1. `test-telegram`
 Validates Telegram bot token, chat ID, and network connectivity by delivering a verification message.
