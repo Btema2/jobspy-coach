@@ -21,6 +21,18 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from src.bot.auth import Authorizer, adopt_chat_id
+from src.bot.client import TelegramBotClient
+from src.bot.commands import (
+    COMMANDS,
+    TRIGGER_BUSY,
+    TRIGGER_NOT_READY,
+    TRIGGER_STARTED,
+    BotContext,
+    CommandRouter,
+)
+from src.bot.poller import BotPoller
+from src.bot.state import BotStateStore
 from src.config import get_settings
 from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.errors import ConfigurationError, EvaluationRejected, ProvidersUnavailable, StopRequested
@@ -120,6 +132,10 @@ class DaemonService:
         self.evaluator: Optional[ProviderChainEvaluator] = evaluator
         self._stop_event = threading.Event()
         self._shutdown_requested = threading.Event()
+        # One scrape cycle at a time: a scheduled cycle that finds it held is skipped, /run_now is refused.
+        self._cycle_lock = threading.Lock()
+        self._bot_poller: Optional[BotPoller] = None
+        self._bot_thread: Optional[threading.Thread] = None
         self._chain_lock = threading.Lock()
         # Futures of the batch in flight (snapshot-cancelled by request_shutdown).
         self._futures: List[Future] = []
@@ -545,8 +561,33 @@ class DaemonService:
             return False
         return "rules" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
+    def is_cycle_running(self) -> bool:
+        return self._cycle_lock.locked()
+
+    def trigger_cycle(self) -> str:
+        """Schedule an immediate cycle (``/run_now``, ``/resume``); the scheduler thread runs it."""
+        if self._shutdown_requested.is_set() or self.scheduler is None:
+            return TRIGGER_NOT_READY
+        if self._cycle_lock.locked():
+            return TRIGGER_BUSY
+        self.scheduler.add_job(
+            self.run_pipeline_cycle, id="run_now", replace_existing=True, misfire_grace_time=None
+        )
+        return TRIGGER_STARTED
+
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
+    ) -> Tuple[int, int]:
+        if not self._cycle_lock.acquire(blocking=False):
+            logger.warning("A pipeline cycle is already running; this one is skipped.")
+            return 0, 0
+        try:
+            return self._run_pipeline_cycle(queries, dry_run)
+        finally:
+            self._cycle_lock.release()
+
+    def _run_pipeline_cycle(
+        self, queries: Optional[List[SearchQuery]], dry_run: bool
     ) -> Tuple[int, int]:
         # One snapshot per cycle: the profile is compiled once here and drives both scraping and
         # evaluation, so a change committed mid-cycle only takes effect in the next cycle.
@@ -726,6 +767,56 @@ class DaemonService:
             self.db.mark_digest_sent([j.id for j in pending if j.id is not None])
         return len(pending)
 
+    # ----- bot -----
+
+    def _on_paired(self, chat_id: int) -> None:
+        """A new pairing: alerts and digests go to the paired chat from now on, without a restart."""
+        self.notifier.chat_id = str(chat_id)
+
+    def _start_bot(self) -> Optional[BotPoller]:
+        """Start the Telegram bot poller thread; any failure is logged and the daemon runs without the bot.
+
+        The poller stops on ``_shutdown_requested`` (set once, for good), never on ``_stop_event``, which is
+        re-armed for every evaluation batch. It owns its ``Database`` instance (a second DB and Telegram
+        thread by design; it never runs evaluation).
+        """
+        settings = self.settings
+        if not settings.telegram_bot_token or not settings.telegram_bot_polling:
+            return None
+        try:
+            client = TelegramBotClient(settings.telegram_bot_token, stop_event=self._shutdown_requested)
+            state = BotStateStore(Database(self.db.db_path))
+            adopt_chat_id(state, settings.telegram_chat_id)
+            pairing = state.get_pairing()
+            if not self.notifier.chat_id and pairing is not None:
+                self.notifier.chat_id = str(pairing.chat_id)
+            env_path = Path(".env")
+            ctx = BotContext(
+                db_path=self.db.db_path,
+                env_path=env_path,
+                settings=settings,
+                trigger_cycle=self.trigger_cycle,
+                is_cycle_running=self.is_cycle_running,
+                scraper=self.scraper,
+            )
+            poller = BotPoller(
+                client,
+                state,
+                Authorizer(state),
+                CommandRouter(ctx, client=client),
+                stop_event=self._shutdown_requested,
+                env_path=env_path,
+                on_paired=self._on_paired,
+                commands=COMMANDS,
+            )
+            self._bot_thread = poller.start()
+            self._bot_poller = poller
+            logger.info("Telegram bot polling started.")
+            return poller
+        except Exception as exc:  # never the message: it can hold a request URL
+            logger.warning("Telegram bot could not start: %s", type(exc).__name__)
+            return None
+
     def start(self) -> None:
         self.scheduler = BlockingScheduler(timezone=self.settings.timezone)
 
@@ -772,6 +863,8 @@ class DaemonService:
                 "No LLM provider is configured (set NVIDIA_API_KEY and/or OPENROUTER_API_KEY with "
                 "OPENROUTER_MODELS): scraping will run but evaluation will fail until one is set."
             )
+
+        self._start_bot()  # before the (long) startup cycle, so the bot answers while it runs
 
         logger.info("Running initial startup scraping cycle...")
         try:

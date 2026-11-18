@@ -519,7 +519,7 @@ def test_help_lists_every_command(router):
 def test_unknown_command_and_plain_text_hint(router):
     assert send(router, "/nonsense") == "Unknown command. Send /help."
     assert send(router, "hello there") == "Send /help to see what I can do."
-    assert send(router, "/setup") == "Unknown command. Send /help."  # Task 4 plugs it in
+    assert "Unknown command" not in send(router, "/setup")  # the wizard is plugged in by the router itself
 
 
 def test_args_too_long(router, store):
@@ -538,9 +538,9 @@ def test_register_handlers(router):
     assert send(router, "/hello you") == "hi you"
     assert send(router, "/setup") == "wizard"
     seen: List[str] = []
-    router.register_callback("wz:", lambda update: seen.append(update.text) or [OutgoingMessage("step")])
-    messages = router.handle(parse_update(callback_update(2, "wz:abc")))
-    assert [m.text for m in messages] == ["step"] and seen == ["wz:abc"]
+    router.register_callback("xx:", lambda update: seen.append(update.text) or [OutgoingMessage("step")])
+    messages = router.handle(parse_update(callback_update(2, "xx:abc")))
+    assert [m.text for m in messages] == ["step"] and seen == ["xx:abc"]
     messages = router.handle(parse_update(callback_update(3, "other:1")))
     assert [m.text for m in messages] == ["This button is no longer active."]
     router.set_text_handler(lambda update: [OutgoingMessage("text " + update.text)] if update.text == "ok" else None)

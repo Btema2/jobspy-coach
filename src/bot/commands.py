@@ -3,7 +3,8 @@
 Every change applies immediately (validated, versioned, snapshotted) and is answered with the code-rendered
 diff. Every user-supplied or stored term passes through ``esc``; long output is paginated and chunked, so a
 reply never exceeds Telegram's limit. ``/setup``, ``/stats`` and ``/test`` are plugged in by the wizard, stats
-and probe modules through ``register`` / ``register_callback`` / ``set_text_handler``.
+and probe modules (see ``_register_features``) through ``register`` / ``register_callback`` /
+``set_text_handler``.
 """
 import time
 from dataclasses import dataclass
@@ -161,6 +162,21 @@ class CommandRouter:
             ("requeue", self._requeue),
         ):
             self.register(name, handler)
+        self._register_features()
+
+    def _register_features(self) -> None:
+        """Plug in /setup, /stats and /test (their modules import this one, hence the local imports)."""
+        from src.bot.probe import ProbeRunner
+        from src.bot.state import BotStateStore
+        from src.bot.stats import stats_command
+        from src.bot.wizard import SetupWizard
+
+        wizard = SetupWizard(BotStateStore(self._db), self._store, clock=self._ctx.clock)
+        self.register("setup", wizard.start)
+        self.register_callback("wz:", wizard.on_callback)
+        self.set_text_handler(wizard.on_text)
+        self.register("stats", lambda update: stats_command(self._db, self._store, self._ctx.settings, update.args))
+        self.register("test", ProbeRunner(self._ctx, self.client, clock=self._ctx.clock).request)
 
     # --- registration -------------------------------------------------------------------
 

@@ -185,7 +185,9 @@ class JobSpyScraper:
     def last_linkedin_call_time(self, value: float) -> None:
         self._coordinator.last_linkedin_call_time = value
 
-    def _build_scrape_kwargs(self, site_name: str, query: SearchQuery) -> dict:
+    def _build_scrape_kwargs(
+        self, site_name: str, query: SearchQuery, results_wanted: Optional[int] = None
+    ) -> dict:
         board = site_name.lower()
         search_term = query.search_term
         hours_old = self.hours_old
@@ -200,7 +202,7 @@ class JobSpyScraper:
             "site_name": [site_name],
             "search_term": search_term,
             "location": query.location,
-            "results_wanted": self.results_per_query,
+            "results_wanted": self.results_per_query if results_wanted is None else results_wanted,
             "hours_old": hours_old,
             "is_remote": query.is_remote,
             "proxies": self.proxies,
@@ -332,6 +334,7 @@ class JobSpyScraper:
         *,
         track_cycle: bool = True,
         rules: Optional[Sequence[CompiledRule]] = None,
+        results_wanted: Optional[int] = None,
     ) -> ScrapeOutcome:
         """Scrapes one (query, board).
 
@@ -340,6 +343,7 @@ class JobSpyScraper:
         ``[i/N]`` line is logged before the coordinator lock is taken, so it can precede a wait for LinkedIn
         pacing. ``rules`` (compiled profile rules, ``None`` = the legacy seed) drive the title pre-filter and
         the LinkedIn empty-description check; a dropped posting carries the key of the rule that dropped it.
+        ``results_wanted`` overrides ``results_per_query`` for this call (the bot's ``/test`` asks for few rows).
         """
         board = site_name.lower()
         reason = self.board_skip_reason(site_name, query)
@@ -366,7 +370,7 @@ class JobSpyScraper:
             last_error: Optional[str] = None
             for attempt in range(1, 4):
                 try:
-                    df = scrape_jobs(**self._build_scrape_kwargs(site_name, query))
+                    df = scrape_jobs(**self._build_scrape_kwargs(site_name, query, results_wanted))
                     break
                 except Exception as e:
                     last_error = str(e) or type(e).__name__

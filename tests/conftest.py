@@ -19,3 +19,11 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip_live)
+
+
+@pytest.fixture(autouse=True)
+def no_real_bot_poller(monkeypatch):
+    """A DaemonService built from the real ``.env`` must never start a live Telegram poller in a test."""
+    from src.scheduler.daemon import DaemonService
+
+    monkeypatch.setattr(DaemonService, "_start_bot", lambda self: None, raising=False)

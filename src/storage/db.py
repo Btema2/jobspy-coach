@@ -138,6 +138,21 @@ class DroppedJob:
     created_at: Optional[datetime]
 
 
+@dataclass(frozen=True)
+class QueryKeyRuns:
+    """Scrape runs of one ``query_key`` (``<query_id>|<board>``) in a window, for the ``/stats`` view.
+
+    ``ok``, ``empty`` and ``failed`` are exclusive: a run that failed (outcome or status) counts only as failed.
+    """
+
+    query_key: str
+    calls: int
+    ok: int
+    empty: int
+    failed: int
+    new_jobs: int
+
+
 def _opt_bool(val: Any) -> Optional[bool]:
     return None if val is None else bool(val)
 
@@ -540,6 +555,50 @@ class Database:
                 (job_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_query_key_runs(self, days: int = 7) -> List[QueryKeyRuns]:
+        """Per ``query_key`` run counts over the last ``days`` days; skipped boards and keyless runs are left out."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT query_key,
+                       COUNT(*) AS calls,
+                       SUM(CASE WHEN failed = 0 AND outcome = 'ok' THEN 1 ELSE 0 END) AS ok,
+                       SUM(CASE WHEN failed = 0 AND outcome = 'empty' THEN 1 ELSE 0 END) AS empty,
+                       SUM(failed) AS failed,
+                       SUM(new_jobs_saved) AS new_jobs
+                FROM (
+                    SELECT query_key, outcome, new_jobs_saved,
+                           CASE WHEN outcome = 'failed' OR status = 'failed' THEN 1 ELSE 0 END AS failed
+                    FROM scrape_runs
+                    WHERE query_key IS NOT NULL
+                      AND COALESCE(outcome, '') <> 'skipped'
+                      AND datetime(run_time) >= datetime('now', ?)
+                )
+                GROUP BY query_key
+                ORDER BY query_key
+                """,
+                (f"-{int(days)} days",),
+            ).fetchall()
+        return [
+            QueryKeyRuns(r["query_key"], r["calls"], r["ok"], r["empty"], r["failed"], r["new_jobs"])
+            for r in rows
+        ]
+
+    def get_relevant_hits(self, days: int, min_score: float) -> List[Tuple[str, int]]:
+        """``(query_key, job_id)`` of jobs seen in the last ``days`` days that were evaluated at ``min_score`` or more."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT h.query_key, h.job_id
+                FROM job_hits h JOIN jobs j ON j.id = h.job_id
+                WHERE j.eval_status = 'evaluated' AND j.eval_score >= ?
+                  AND datetime(h.last_seen) >= datetime('now', ?)
+                ORDER BY h.query_key, h.job_id
+                """,
+                (min_score, f"-{int(days)} days"),
+            ).fetchall()
+        return [(r["query_key"], r["job_id"]) for r in rows]
 
     def rehash_all(self, dry_run: bool = False) -> Dict[str, int]:
         """Recompute ``dedup_hash`` for every row with the current normalization (idempotent).
