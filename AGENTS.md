@@ -28,7 +28,7 @@ src/
 │   └── pre_filter.py      # Zero-cost deterministic filters: sports/pets noise, title traps, seniority (classify_title), stub descriptions
 ├── scraper/
 │   ├── query_catalog.py   # Curated search queries mapped by country & board
-│   ├── jobspy_scraper.py  # python-jobspy wrapper with pacing, jitter, proxies
+│   ├── jobspy_scraper.py  # python-jobspy wrapper with jitter, proxies, ScrapeOutcome
 │   ├── outcome.py         # ScrapeOutcome: per-(query, board) result (ok / empty / failed / skipped)
 │   └── coordinator.py     # ScrapeCoordinator: per-call lock + shared LinkedIn pacing
 ├── storage/
@@ -74,11 +74,11 @@ docs/
 1. **`fetch_description=True` is Mandatory**:
    - In `python-jobspy`, Indeed returns descriptions inline in search cards, but **LinkedIn requires a secondary detail request** (`/jobs/view/{job_id}`).
    - JobSpy defaults `fetch_description=False`. If omitted, JobSpy returns `description=None` for all LinkedIn jobs, causing our pre-filter to drop 100% of LinkedIn jobs as `DESCRIPTION_TOO_SHORT`.
-   - **Always pass `fetch_description=True`** in `JobSpyScraper.scrape_board`.
-   - A failed detail request (HTTP 429, redirect) is only logged by python-jobspy and yields `description=None`. `scrape_board` skips such LinkedIn rows (WARNING with a count; not saved, so a later cycle retries them) instead of storing them as dismissed, because the dedup hash would suppress them forever. Short but non-empty descriptions, other boards, and titles the pre-filter drops on their own are unaffected.
+   - **Always pass `fetch_description=True`** in `JobSpyScraper.scrape_board_outcome` (`scrape_board` is a thin wrapper).
+   - A failed detail request (HTTP 429, redirect) is only logged by python-jobspy and yields `description=None`. `scrape_board_outcome` skips such LinkedIn rows (WARNING with a count; not saved, so a later cycle retries them) instead of storing them as dismissed, because the dedup hash would suppress them forever. Short but non-empty descriptions, other boards, and titles the pre-filter drops on their own are unaffected.
    - `scrape_board_outcome(query, board, track_cycle=True)` returns a `ScrapeOutcome` (postings, rows returned, pre-filtered count, `status`, error/skip reason). A board error reported in `df.attrs["errors"]` with no rows is `failed` (a blocked board, not an empty result); boards skipped for a missing country are `skipped`. `scrape_board` is a thin wrapper returning only the postings. The daemon records `scrape_runs.outcome/rows_returned/prefiltered/query_key` and `job_hits` from it; a skipped board is stored with status `completed`, outcome `skipped`.
    - All board calls go through `ScrapeCoordinator` (one lock per call, shared LinkedIn cooldown); the scraper exposes `last_linkedin_call_time` and `linkedin_cooldown_seconds` as delegating properties.
-   - Scrape progress (`[i/N] query board ...` before/after each call plus a per-board summary) is logged by the scraper itself (`begin_cycle`/`scrape_board`/`end_cycle`), because the CLI `scrape` and the daemon call `DaemonService.run_pipeline_cycle`, which calls `scrape_board` directly and never `scrape_all_queries`.
+   - Scrape progress (`[i/N] query board ...` before/after each call plus a per-board summary) is logged by the scraper itself (`begin_cycle`/`scrape_board_outcome`/`end_cycle`), because the CLI `scrape` and the daemon call `DaemonService.run_pipeline_cycle`, which calls `DaemonService._scrape_call` -> `scrape_board_outcome` (falling back to `scrape_board` only for test doubles) and never `scrape_all_queries`.
 2. **Rate Limiting & Guest Endpoints (HTTP 429)**:
    - LinkedIn guest endpoints aggressively throttle when blasted with large batch sizes.
    - **Batch size floor**: Keep `SCRAPER_RESULTS_PER_QUERY=10` (never $\ge 25$).
@@ -132,7 +132,7 @@ docs/
 
 ### E. SQLite Concurrency & Database Operations
 1. **WAL Mode**: SQLite must always run in Write-Ahead Logging mode (`PRAGMA journal_mode = WAL;`) with `PRAGMA busy_timeout = 5000;` and `PRAGMA synchronous = NORMAL;`. `_get_connection` sets `busy_timeout` first and retries the WAL pragma on "database is locked", so two processes initialising a fresh file at once do not fail.
-2. **Dedup rehash**: `Database.rehash_all()` (CLI `rehash`) is idempotent. Per group of colliding rows it keeps the alert-sent row, else the evaluated row, else the oldest; other rows are deleted, but a second alert-sent row is never deleted (it keeps a unique filler hash). Stop the daemon before running it.
+2. **Dedup rehash**: `Database.rehash_all()` (CLI `rehash`) is idempotent. Per group of colliding rows it keeps the alert-sent row, else the evaluated row, else the oldest; other rows are deleted, but a second alert-sent row is never deleted (it keeps a unique filler hash). `job_hits` of deleted duplicates are re-pointed to the surviving row. Stop the daemon before running it.
 3. **Stale Records Cleanup**: If bad scrape runs populate the database with stub records (e.g. empty descriptions), use `Database.delete_empty_description_jobs("linkedin")` to remove them so deduplication hashes don't permanently suppress valid future scrapes.
 4. **Schema changes** go through `src/storage/migrations.py` (ordered, add-only: no renames, no drops; tracked in `schema_version`), never ad-hoc `ALTER TABLE`. New columns include `jobs.source_query`, `jobs.remote_status`, `jobs.eval_raw_score/eval_is_core_role/eval_bonus_flag/eval_hard_reject` (filled for new evaluations only) and the `scrape_runs`/`job_hits` additions.
 
@@ -167,7 +167,7 @@ Any AI agent working on this codebase must adhere strictly to these principles:
 ## 5. Quick CLI & Testing Reference
 
 ```bash
-# Run full automated test suite (~600 tests, no network; the `live` smoke test is skipped)
+# Run full automated test suite (~790 tests, no network; the `live` smoke test is skipped)
 .venv/bin/pytest -v
 
 # Optional: 2 real calls through the provider chain (needs keys in .env)
