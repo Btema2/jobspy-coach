@@ -828,6 +828,26 @@ def test_alert_and_digest_language_is_none_without_a_language(tmp_path, monkeypa
     assert daemon.notifier.send_daily_digest.call_args.kwargs["lang"] is None
 
 
+def test_digest_update_notice_uses_the_profile_language(tmp_path, monkeypatch):
+    from src.scraper.version_checker import VersionCheckResult
+
+    monkeypatch.setattr(
+        "src.scheduler.daemon.check_jobspy_update", lambda: VersionCheckResult(True, "1.0.0", "2.0.0")
+    )
+    daemon = _make(tmp_path, FakeScraper(), RecordingChain({"Core B": 7.0}))
+    daemon.settings = _settings()
+    daemon.notifier.send_daily_digest.return_value = 1
+    _profile(daemon, wow_threshold=8.5, digest_threshold=6.5, core_role_definition="<CORE>", output_language="en")
+    _save(daemon, 1, "Core B")
+    daemon.evaluate_unprocessed()
+
+    daemon.run_daily_digest_cycle()
+
+    notice = daemon.notifier.send_daily_digest.call_args.kwargs["update_notice"]
+    assert "update available" in notice and "v2.0.0" in notice
+    assert "Доступне" not in notice
+
+
 # --- removed catalog ----------------------------------------------------------------------------
 
 

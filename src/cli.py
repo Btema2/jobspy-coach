@@ -1,7 +1,8 @@
 import importlib.metadata
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Generator, Optional
 import typer
 from typer.core import TyperGroup
 from rich.console import Console
@@ -400,12 +401,24 @@ def digest(
     console.print(f"[bold green]Digest completed. Processed {count} jobs.[/bold green]")
 
 
+class _ReadOnlyDatabase(Database):
+    """Opens the file read-only: a lookup must never create, initialise or migrate the database."""
+
+    @contextmanager
+    def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+
 def _stored_output_language(settings) -> Optional[str]:
     """The stored profile's ``output_language``; None when there is no profile or it cannot be read."""
     try:
-        db = Database(settings.db_path)
-        db.init_db()
-        snapshot = ProfileStore(db).read_snapshot()
+        snapshot = ProfileStore(_ReadOnlyDatabase(settings.db_path)).read_snapshot()
     except (ProfileError, sqlite3.Error):
         return None
     return snapshot.fields.output_language if snapshot is not None else None

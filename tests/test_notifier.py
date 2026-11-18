@@ -602,3 +602,18 @@ def test_english_alert_strings():
     for chunk in chunks:
         assert len(chunk) <= 3800
         assert not cyrillic.search(chunk)
+
+
+def test_notifier_forwards_lang_to_wow_alert_and_digest(monkeypatch):
+    notifier = TelegramNotifier(token="fake-token", chat_id="12345")
+    sent = []
+    monkeypatch.setattr(notifier, "send_message", lambda text, reply_markup=None: sent.append(text) or True)
+    monkeypatch.setattr("time.sleep", MagicMock())
+    job = _legacy_jobs(1)[0]
+
+    assert notifier.send_wow_alert(job, lang="en") is True
+    assert notifier.send_daily_digest([job], "15.10.2026", lang="en") == 1
+
+    assert "Score:" in sent[0] and "Оцінка" not in sent[0]
+    assert "Morning Job Digest" in sent[1] and "Ранковий" not in sent[1]
+    notifier.close()

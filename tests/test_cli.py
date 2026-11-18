@@ -404,3 +404,20 @@ def test_init_interactive_flow_writes_env_and_never_echoes_secrets(monkeypatch, 
 
     db = Database(get_settings().db_path)
     assert BotStateStore(db).get_pairing_code() is not None
+
+
+def test_stored_output_language_lookup_is_read_only(tmp_path, monkeypatch):
+    from src.cli import _stored_output_language
+    from src.storage.db import Database
+
+    def no_init(self):
+        raise AssertionError("init_db must not be called")
+
+    monkeypatch.setattr(Database, "init_db", no_init)
+    missing = tmp_path / "missing.db"
+
+    class _Settings:
+        db_path = missing
+
+    assert _stored_output_language(_Settings()) is None
+    assert not missing.exists()
