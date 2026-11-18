@@ -66,7 +66,7 @@ def test_merge_leaves_no_temp_files(tmp_path):
     merge_env_file(path, {"A": "1"})
     merge_env_file(path, {"A": "2"})
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == [".env"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env", ".env.lock"]
 
 
 @pytest.mark.parametrize(
@@ -108,3 +108,41 @@ def test_merge_follows_symlink(tmp_path):
     assert link.is_symlink()
     assert target.read_text() == "A=2\n"
     assert _mode(target) == 0o600
+
+
+def test_concurrent_merges_do_not_lose_updates(tmp_path):
+    import threading
+
+    path = tmp_path / ".env"
+    path.write_text("KEEP=1\n")
+    errors = []
+    start = threading.Barrier(8)
+
+    def worker(index):
+        try:
+            start.wait()
+            for round_ in range(10):
+                merge_env_file(path, {f"KEY_{index}": str(round_)})
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    for index in range(8):
+        assert read_env_value(path, f"KEY_{index}") == "9"
+    assert read_env_value(path, "KEEP") == "1"
+    assert _mode(path) == 0o600
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_lock_file_is_private_and_next_to_the_target(tmp_path):
+    path = tmp_path / ".env"
+    merge_env_file(path, {"A": "1"})
+
+    locks = [p for p in tmp_path.iterdir() if p.name.endswith(".lock")]
+    assert len(locks) == 1 and _mode(locks[0]) == 0o600

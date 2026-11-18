@@ -4,12 +4,14 @@
 temp file created with mode 600 and swaps it in atomically, so a crash never leaves a half-written file and
 the secrets are never world-readable, not even briefly.
 """
+import fcntl
 import os
 import re
 import secrets
 import unicodedata
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Mapping, Optional
+from typing import Iterator, List, Mapping, Optional
 
 from dotenv import dotenv_values
 
@@ -63,6 +65,22 @@ def _merge(data: bytes, updates: Mapping[str, str]) -> bytes:
     return b"".join(out)
 
 
+@contextmanager
+def _locked(target: Path) -> Iterator[None]:
+    """Advisory exclusive lock on a sibling lock file: serialises read-modify-replace across threads and processes.
+
+    The lock file is separate because ``os.replace`` swaps the inode of the ``.env`` itself.
+    """
+    lock_path = target.with_name(f"{target.name}.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
 def merge_env_file(path: Path, updates: Mapping[str, str]) -> None:
     """Set ``updates`` in the dotenv file ``path`` (created when missing), mode 600, atomically."""
     for key, value in updates.items():
@@ -70,6 +88,11 @@ def merge_env_file(path: Path, updates: Mapping[str, str]) -> None:
             raise ValueError("invalid environment variable name")
         validate_env_value(value)
     target = Path(path).resolve()  # a symlinked .env stays a symlink; its target is updated
+    with _locked(target):
+        _merge_locked(target, updates)
+
+
+def _merge_locked(target: Path, updates: Mapping[str, str]) -> None:
     try:
         existing = target.read_bytes()
     except FileNotFoundError:
