@@ -1,6 +1,6 @@
 # Generic Search Profile and Telegram Management Bot: Design
 
-Status: revision 3, after two independent reviews against the code. Date: 2026-11-18.
+Status: revision 3, after two independent reviews against the code. Branch 1 and Branch 2 implemented. Date: 2026-11-18.
 Scope: architectural. One design, five sequenced implementation branches (section 14).
 
 All examples use placeholders (`<ROLE>`, `<MARKET>`). This file must never contain candidate data (AGENTS.md section 1).

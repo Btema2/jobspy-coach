@@ -27,10 +27,18 @@ src/
 ├── filters/
 │   └── pre_filter.py      # Zero-cost deterministic filters: sports/pets noise, title traps, seniority (classify_title), stub descriptions
 ├── scraper/
-│   ├── query_catalog.py   # Curated search queries mapped by country & board
+│   ├── query_catalog.py   # Only `SearchQuery` and `query_key`; there is no curated query catalog anymore (queries come from the stored profile)
 │   ├── jobspy_scraper.py  # python-jobspy wrapper with jitter, proxies, ScrapeOutcome
 │   ├── outcome.py         # ScrapeOutcome: per-(query, board) result (ok / empty / failed / skipped)
 │   └── coordinator.py     # ScrapeCoordinator: per-call lock + shared LinkedIn pacing
+├── profile/               # Stored, versioned search profile (single source of queries and the evaluator prompt)
+│   ├── errors.py          # Typed profile errors (validation, version conflict, compile, legacy import, export refused)
+│   ├── snapshot.py        # Plain dataclasses + strict dict/YAML shape of a whole profile
+│   ├── store.py           # The only code touching the profile tables (consistent read, optimistic-version write)
+│   ├── ops.py             # Closed operation set, validation, diff, versions, undo/restore, starter profile
+│   ├── compiler.py        # Pure snapshot -> CompiledProfile (queries, prompt, estimate, warnings)
+│   ├── importer.py        # Legacy queries.json / .candidate_profile.md auto-import, YAML export / import
+│   └── legacy_seed.py     # Today's pre-filter regexes and rubric text as data (seed rules)
 ├── storage/
 │   ├── models.py          # Dataclasses (JobPosting, JobEvaluationResult, ScrapeRun)
 │   ├── db.py              # SQLite WAL repository with SHA-256 deduplication
@@ -90,17 +98,17 @@ docs/
 ### B. Job Board Quirks by Country
 1. **Glassdoor**:
    - In `python-jobspy`, Glassdoor throws `Glassdoor: Glassdoor is not available for POLAND`.
-   - **Rule**: Never query Glassdoor with a country it does not support (e.g. `country_code="poland"`). Only include Glassdoor in US/Global remote queries (`Q-GL-REM`).
+   - **Rule**: Never query Glassdoor with a country it does not support (e.g. `country_code="poland"`). The profile compiler enforces this with a country-support code table (a market with no country skips Indeed and Glassdoor and says why).
 2. **ZipRecruiter**:
    - ZipRecruiter blocks European IP traffic with HTTP 307 redirects.
-   - **Rule**: Only include ZipRecruiter on US/UK/Canada queries; never on European queries (`Q-EU-REM`).
+   - **Rule**: ZipRecruiter only for US/UK/Canada countries; the compiler's code table enforces it for expanded queries and warns for pinned ones.
 3. **Indeed** (verified live against `python-jobspy` 1.4.0):
    - Indeed searches **one country at a time**. A pan-regional location such as `"Europe"` returns 0 rows (also under `country_indeed="usa"`), and defaulting `country_indeed` to `"usa"` for queries without a `country_code` silently searches the wrong market. **Rule**: Indeed and Glassdoor require `query.country_code`; the scraper skips them (one warning per process, then DEBUG) when it is missing. Never default to `"usa"`.
    - **Quotes are always stripped** from the Indeed search term (`"Career Coach"` becomes `Career Coach`), with or without `is_remote`; LinkedIn and Google keep them. Live probe (one country, 10 results): a quoted term at 48h returned 1 row vs 8 unquoted, so quotes cut yield several-fold even without the remote filter.
    - **Minimum 168 h window for Indeed**: the scraper passes `hours_old = max(HOURS_OLD_WINDOW, INDEED_MIN_HOURS_OLD=168)` to Indeed only (unquoted: 8 rows at 48h vs 10 at 168h and wider); other boards keep `HOURS_OLD_WINDOW`. Dedup hashes make re-seen postings harmless.
    - In 1.4.0 the Indeed filters (`hours_old`, `job_type`, `is_remote`, `easy_apply`) are AND-combined, not mutually exclusive (older versions documented exclusive groups), so `hours_old` and `is_remote` are both passed.
 4. **Google Jobs**:
-   - The scraper passes an explicit `google_search_term` (`<term> jobs near <location> <time window> [remote]`, same shape python-jobspy derives itself; per-query override via `google_search_term` in `queries.json`). Time windows: <=24h "since yesterday", <=72h "in the last 3 days", <=168h "in the last week", else "in the last month".
+   - The scraper passes an explicit `google_search_term` (`<term> jobs near <location> <time window> [remote]`, same shape python-jobspy derives itself; per-query override via `google_search_term` on a pinned query, imported from `queries.json`). Time windows: <=24h "since yesterday", <=72h "in the last 3 days", <=168h "in the last week", else "in the last month".
    - From some networks Google answers the request with a JavaScript/bot-challenge page, so python-jobspy reports `no job data returned` regardless of the query string. The scraper logs this once per process (WARNING) instead of returning nothing silently; remove `google` from `site_names` if it persists.
 
 ### C. LLM Evaluation (NVIDIA NIM + OpenRouter)
@@ -136,6 +144,15 @@ docs/
 3. **Stale Records Cleanup**: If bad scrape runs populate the database with stub records (e.g. empty descriptions), use `Database.delete_empty_description_jobs("linkedin")` to remove them so deduplication hashes don't permanently suppress valid future scrapes.
 4. **Schema changes** go through `src/storage/migrations.py` (ordered, add-only: no renames, no drops; tracked in `schema_version`), never ad-hoc `ALTER TABLE`. New columns include `jobs.source_query`, `jobs.remote_status`, `jobs.eval_raw_score/eval_is_core_role/eval_bonus_flag/eval_hard_reject` (filled for new evaluations only) and the `scrape_runs`/`job_hits` additions.
 
+### F. Search Profile (`src/profile/`)
+1. **Source of truth**: the profile tables (`profile`, `roles`, `role_terms`, `markets`, `pinned_queries`, `rules`, `profile_versions`) are the only source of search queries and of the evaluator system prompt. There is no default query catalog and no fallback to one; `queries or get_active_queries()` no longer exists.
+2. **Auto-import (CLI only)**: the `@app.callback()` in `src/cli.py` runs `auto_import` before every CLI command: when no profile exists and `queries.json` / `.candidate_profile.md` exist in the working directory, they are imported idempotently (files untouched; each `queries.json` entry becomes one pinned query; a persona with bonus criteria keeps bonus enabled). The daemon never auto-imports; it only reads the profile. A broken legacy file or an unknown board/country in `queries.json` stops every command with exit code 1 and a message naming the file and entry; nothing is imported. Tests that can reach the CLI must `monkeypatch.chdir(tmp_path)`.
+3. **"No profile" behaviour**: with neither a profile nor legacy files, `run` prints `no profile, run \`jobspy-coach init\`` and exits 1 before building the daemon. A daemon that is already running and finds no profile skips scraping and alerts once.
+4. **Changes go through `ops`**: every change (CLI `profile import`, restore, later the bot) is operations -> validation (including a compile) -> one transaction with an optimistic version check -> a new `profile_versions` row (the last 10 snapshots are kept). Threshold invariants: `3.0 < digest <= wow - 0.1`, `wow <= 10`; free text at most 8,000 characters.
+5. **Daemon cycle**: the profile is compiled once at the start of each cycle and that immutable result is used for scraping and evaluation. An empty query list skips scraping and alerts once. A compile failure skips scraping, alerts once per distinct (redacted, truncated) error and keeps evaluating with the last good profile (in memory, else the newest compilable stored version). An alert is recorded as sent only after Telegram accepted it, so a failed send is retried next cycle. `paused` stops scraping only (evaluation and digests continue).
+6. **Not yet consumed (Branch 3)**: stored thresholds, rules (including seed rules) and role/dealbreaker definitions are validated and versioned but the daemon still scores with the `.env` thresholds, `src/filters/pre_filter.py`, `role_is_direct_coaching` and `DIGEST_MAX_SCORE`. The compiled `system_prompt` equals `build_system_prompt(persona)`.
+7. **Export**: `profile export` writes YAML (mode 0600) only to a git-ignored path (default `local/profile-export.yaml`; `profile-export*.yaml` is in `.gitignore`) unless `--force`. It contains private data; never commit or paste it.
+
 ---
 
 ## 4. Agent Operating Guidelines & Rules of Engagement
@@ -167,7 +184,7 @@ Any AI agent working on this codebase must adhere strictly to these principles:
 ## 5. Quick CLI & Testing Reference
 
 ```bash
-# Run full automated test suite (~790 tests, no network; the `live` smoke test is skipped)
+# Run full automated test suite (~1,040 tests, no network; the `live` smoke test is skipped)
 .venv/bin/pytest -v
 
 # Optional: 2 real calls through the provider chain (needs keys in .env)
@@ -197,6 +214,12 @@ Any AI agent working on this codebase must adhere strictly to these principles:
 
 # Live single-cycle scrape & alert
 .venv/bin/jobspy-coach scrape
+
+# Profile: create an empty paused one (new install), inspect, export (to git-ignored local/), import
+.venv/bin/jobspy-coach init
+.venv/bin/jobspy-coach profile preview
+.venv/bin/jobspy-coach profile export
+.venv/bin/jobspy-coach profile import local/profile-export.yaml
 
 # Start 24/7 background daemon scheduler
 .venv/bin/jobspy-coach run

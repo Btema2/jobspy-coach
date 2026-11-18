@@ -44,7 +44,7 @@ The daemon operates autonomously around the clock, continuously scraping configu
 ## Key Features
 
 1. **Multi-Board Scraping with JobSpy**:
-   - Queries LinkedIn, Indeed, and Glassdoor through a curated catalog of search terms.
+   - Queries LinkedIn, Indeed, Glassdoor and Google Jobs for the search terms of your stored profile (roles x markets x boards, plus any pinned queries).
    - Built-in inter-board jitter delays (`SCRAPER_JITTER_MIN_SECONDS` to `SCRAPER_JITTER_MAX_SECONDS`) and exponential backoff retry to prevent rate-limiting and IP bans.
    - URL cleaning that strips ephemeral tracking parameters (`utm_*`, `refId`, `trackingId`, `fbclid`).
 
@@ -82,7 +82,7 @@ The daemon operates autonomously around the clock, continuously scraping configu
 ```mermaid
 flowchart TD
     subgraph Ingestion["1. Ingestion & Pre-Filtering"]
-        QC[Search Query Catalog] --> Scraper[JobSpy Scraper]
+        QC[Stored Search Profile] --> Scraper[JobSpy Scraper]
         Scraper -->|LinkedIn, Indeed, Glassdoor| Jitter[Inter-Board Jitter Delay]
         Jitter --> URLClean[URL Tracking Param Cleaning]
         URLClean --> PreFilter{Deterministic Pre-Filter}
@@ -166,6 +166,15 @@ Edit `.env` with your preferred editor:
 nano .env
 ```
 
+### 5. Create Your Search Profile
+
+The search queries and the candidate persona live in a stored, versioned profile (in the SQLite database), not in `.env`.
+
+- **Existing install** (you already have `queries.json` and/or `.candidate_profile.md` in the project directory): nothing to do. The first `jobspy-coach` command you run imports them automatically (the files are left untouched; the import happens once). A broken `queries.json` stops every command with a message naming the file and the entry to fix; there is no fallback to built-in queries.
+- **New install**: run `jobspy-coach init` to create an empty, paused profile, then `jobspy-coach profile export`, edit the YAML file (it is written under the git-ignored `local/`), and `jobspy-coach profile import <file>`. Check the result with `jobspy-coach profile preview`.
+
+`jobspy-coach run` refuses to start without a profile (`no profile, run jobspy-coach init`). There are no built-in default queries.
+
 ---
 
 ## Configuration Reference
@@ -226,7 +235,8 @@ Everything specific to you stays in git-ignored local files and is never committ
 
 - `.env`: API keys, bot token, thresholds.
 - `.candidate_profile.md`: your private candidate persona (read at runtime by the evaluator; a generic template is used if it is absent). Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details).
-- `queries.json`: your search queries (see `queries.example.json` for the format; the built-in defaults are location-neutral). Per query, `country_code` is required for Indeed and Glassdoor (they search one country at a time; queries without it skip those boards with a logged warning, e.g. pan-regional "Europe" queries should list only LinkedIn/Google), and the optional `google_search_term` overrides the Google Jobs query string that is otherwise derived as `<search_term> jobs near <location> <time window> [remote]`. Note that Google Jobs currently returns no data to python-jobspy from some networks (it serves a JavaScript challenge page); the scraper logs this once instead of failing silently.
+- `queries.json` (legacy, optional): your former search queries (see `queries.example.json` for the format). It is only read once, to import it into the stored profile (1:1, as pinned queries); afterwards the stored profile is the source of truth and the file is no longer used. Per query, `country_code` is required for Indeed and Glassdoor (they search one country at a time; queries without it skip those boards with a logged warning, e.g. pan-regional "Europe" queries should list only LinkedIn/Google), and the optional `google_search_term` overrides the Google Jobs query string that is otherwise derived as `<search_term> jobs near <location> <time window> [remote]`. Note that Google Jobs currently returns no data to python-jobspy from some networks (it serves a JavaScript challenge page); the scraper logs this once instead of failing silently.
+- `local/profile-export.yaml` (`profile-export*.yaml` is git-ignored): the YAML export of your profile; it contains private data, so `profile export` refuses paths that git would not ignore unless you pass `--force`.
 
 ### Log Hygiene
 
@@ -287,6 +297,16 @@ The package exposes the command line executable `jobspy-coach` (or `python -m sr
 # General CLI help
 jobspy-coach --help
 ```
+
+### 0. `init` and `profile`
+Every command first imports a legacy `queries.json` / `.candidate_profile.md` if no stored profile exists yet (see Create Your Search Profile).
+```bash
+jobspy-coach init                       # empty, paused starter profile (does nothing if a profile exists)
+jobspy-coach profile preview            # compiled queries, calls per cycle, estimated duration, warnings
+jobspy-coach profile export             # writes local/profile-export.yaml (--path PATH, --force)
+jobspy-coach profile import FILE.yaml   # validated, versioned (the last 10 versions are kept); prints the diff
+```
+A paused profile stops scraping only; evaluation and digests continue. Thresholds, rules and role definitions stored in the profile are validated and versioned but not yet used for scoring: scoring still uses the `.env` thresholds.
 
 ### 1. `test-telegram`
 Validates Telegram bot token, chat ID, and network connectivity by delivering a verification message.
@@ -357,7 +377,7 @@ jobspy-coach digest --dry-run
 ```
 
 ### 6. `run`
-Starts the long-running 24/7 background scheduler daemon. Runs an initial scraping cycle on startup, schedules recurring scraping every `SCRAPE_INTERVAL_HOURS`, and triggers the daily morning digest at `DIGEST_TIME_CET`. Handles `SIGINT` and `SIGTERM` gracefully.
+Starts the long-running 24/7 background scheduler daemon (requires a stored profile). Runs an initial scraping cycle on startup, schedules recurring scraping every `SCRAPE_INTERVAL_HOURS`, and triggers the daily morning digest at `DIGEST_TIME_CET`. Handles `SIGINT` and `SIGTERM` gracefully.
 ```bash
 jobspy-coach run
 ```
