@@ -27,6 +27,7 @@ class RebucketResult:
     to_digest: int
     to_dismissed: int
     samples: Tuple[str, ...]
+    too_old: int = 0
 
 
 def requeue_prefiltered(
@@ -54,13 +55,21 @@ def requeue_prefiltered(
     return RequeueResult(len(rows), requeued, len(rows) - len(revive), too_old, tuple(samples))
 
 
-def rebucket_evaluated(db: Database, policy: ScoringPolicy, *, dry_run: bool = False) -> RebucketResult:
+def rebucket_evaluated(
+    db: Database,
+    policy: ScoringPolicy,
+    *,
+    dry_run: bool = False,
+    max_age_days: int = STALE_PENDING_DAYS,
+) -> RebucketResult:
     """Recompute the final score and bucket of evaluated rows from their stored model output.
 
     Only ``pending`` and ``dismissed`` rows are looked at; a row that now reaches the WOW level simply joins
-    the digest (no instant alert is ever sent from here). Rows without the stored fields are skipped.
+    the digest (no instant alert is ever sent from here). Rows without the stored fields are skipped, and rows
+    older than ``max_age_days`` are only counted (``too_old``): a revived one would expire at the next digest.
     """
-    rows = db.get_rebucket_candidates()
+    rows = db.get_rebucket_candidates(max_age_days)
+    too_old = db.count_rebucket_older_than(max_age_days)
     changes: List[Tuple[int, float, str]] = []
     samples: List[str] = []
     skipped = to_digest = to_dismissed = 0
@@ -88,4 +97,4 @@ def rebucket_evaluated(db: Database, policy: ScoringPolicy, *, dry_run: bool = F
         if len(samples) < SAMPLE_LIMIT:
             samples.append(job.title)
     changed = len(changes) if dry_run else db.apply_rebucket(changes)
-    return RebucketResult(len(rows), changed, skipped, to_digest, to_dismissed, tuple(samples))
+    return RebucketResult(len(rows), changed, skipped, to_digest, to_dismissed, tuple(samples), too_old)

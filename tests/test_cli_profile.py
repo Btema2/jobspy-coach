@@ -428,3 +428,98 @@ def test_profile_import_prints_backtest_line(tmp_path, isolated):
 
     assert result.exit_code == 0, result.output
     assert "backtest not meaningful: only 0 stored jobs (needs 200)" in result.output
+
+
+def test_requeue_with_an_unreadable_profile_is_a_clean_error(tmp_path, isolated):
+    runner.invoke(app, ["init"])
+    (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
+    assert runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")]).exit_code == 0
+    with Database(isolated)._get_connection() as conn:
+        conn.execute("UPDATE markets SET countries = 'not json'")
+        conn.commit()
+
+    result = runner.invoke(app, ["requeue"])
+
+    assert result.exit_code == 1
+    assert "unreadable" in result.output
+    assert isinstance(result.exception, SystemExit)  # a message, not a traceback
+
+
+def test_profile_import_survives_a_failing_backtest(tmp_path, isolated, monkeypatch):
+    import sqlite3
+
+    runner.invoke(app, ["init"])
+    (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("src.cli.backtest_snapshots", locked)
+
+    result = runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")])
+
+    assert result.exit_code == 0, result.output
+    assert "Profile is now at version 2." in result.output
+    assert _store(isolated).read_snapshot().version == 2
+
+
+def test_profile_import_backtests_against_the_applied_snapshots(tmp_path, isolated, monkeypatch):
+    seen = {}
+
+    def spy(db, old, new):
+        seen["old"], seen["new"] = old, new
+
+    monkeypatch.setattr("src.cli.backtest_snapshots", spy)
+    runner.invoke(app, ["init"])
+    (tmp_path / "in.yaml").write_text(_IMPORT_YAML, encoding="utf-8")
+
+    result = runner.invoke(app, ["profile", "import", str(tmp_path / "in.yaml")])
+
+    assert result.exit_code == 0, result.output
+    assert (seen["old"].version, seen["new"].version) == (1, 2)
+
+
+def test_requeue_dry_run_never_initialises_or_migrates(isolated, monkeypatch):
+    import sqlite3
+
+    runner.invoke(app, ["init"])
+    calls = []
+    real_init = Database.init_db
+    monkeypatch.setattr(Database, "init_db", lambda self: calls.append(1) or real_init(self))
+
+    for args in (["requeue", "--dry-run"], ["requeue", "--thresholds", "--dry-run"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_requeue_dry_run_reports_an_uninitialised_database_and_writes_nothing(isolated):
+    import sqlite3
+
+    raw = sqlite3.connect(isolated)
+    raw.execute("CREATE TABLE jobs (id INTEGER)")
+    raw.commit()
+    raw.close()
+    before = isolated.read_bytes()
+
+    result = runner.invoke(app, ["requeue", "--dry-run"])
+
+    assert result.exit_code == 1
+    assert "schema_version" in result.output
+    assert isolated.read_bytes() == before
+    assert not Path(str(isolated) + "-wal").exists()
+
+
+def test_requeue_dry_run_reports_an_outdated_schema(isolated):
+    import sqlite3
+
+    runner.invoke(app, ["init"])
+    conn = sqlite3.connect(isolated)
+    conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(app, ["requeue", "--dry-run"])
+
+    assert result.exit_code == 1
+    assert "schema version" in result.output

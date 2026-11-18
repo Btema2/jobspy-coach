@@ -158,6 +158,8 @@ class ApplyResult:
     version: int
     diff: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    old: Optional[ProfileSnapshot] = None  # the profile this change was applied to (None: there was none)
+    new: Optional[ProfileSnapshot] = None  # the stored result, carrying its new version
 
 
 # --- apply_operation ---------------------------------------------------------------------------
@@ -615,7 +617,7 @@ def apply_changes(
         raise ProfileValidationError(problems)
     version = store.write_snapshot(new, expected_version=base.version, label=label)
     warnings = list(compile_profile(new).warnings)
-    return ApplyResult(version, diff_snapshots(current, new), warnings)
+    return ApplyResult(version, diff_snapshots(current, new), warnings, current, replace(new, version=version))
 
 
 def history(store: ProfileStore) -> List[VersionInfo]:

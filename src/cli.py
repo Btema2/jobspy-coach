@@ -1,4 +1,5 @@
 import importlib.metadata
+import sqlite3
 from pathlib import Path
 from typing import Optional
 import typer
@@ -27,6 +28,7 @@ from src.profile.store import ProfileStore
 from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
+from src.storage.migrations import MIGRATIONS
 
 _SUBCOMMAND_ARGS = "jobspy_coach.subcommand_args"
 
@@ -82,10 +84,16 @@ def _help_requested(ctx: typer.Context) -> bool:
     return ctx.resilient_parsing or "--help" in ctx.meta.get(_SUBCOMMAND_ARGS, [])
 
 
+def _read_only_requested(ctx: typer.Context) -> bool:
+    """True for `requeue ... --dry-run`: it must not initialise, migrate or import anything."""
+    args = ctx.meta.get(_SUBCOMMAND_ARGS, [])
+    return bool(args) and args[0] == "requeue" and "--dry-run" in args
+
+
 @app.callback()
 def main(ctx: typer.Context) -> None:
     """Open the database and import the legacy queries.json / .candidate_profile.md once, before any command."""
-    if _help_requested(ctx):
+    if _help_requested(ctx) or _read_only_requested(ctx):
         return
     settings = get_settings()
     store = _profile_store()
@@ -222,16 +230,14 @@ def profile_import(file: Path = typer.Argument(..., help="YAML file written by `
     """Validate a YAML profile file and apply it as a new profile version."""
     store = _profile_store()
     try:
-        old = store.read_snapshot()
         result = apply_changes(store, [ReplaceProfile(load_profile_yaml(file))], label=f"import {file.name}")
     except ProfileError as exc:
         raise _fail_profile_error(exc, hint="Nothing was changed.") from None
     for line in result.diff:
         console.print(line, markup=False, highlight=False)
     try:  # the import is already applied: a backtest problem must not turn it into a failure
-        new = store.read_snapshot()
-        backtest = backtest_snapshots(Database(get_settings().db_path), old, new) if new is not None else None
-    except ProfileError:
+        backtest = backtest_snapshots(Database(get_settings().db_path), result.old, result.new)
+    except (ProfileError, sqlite3.Error):
         backtest = None
     if backtest is not None:
         for line in render_backtest(backtest):
@@ -239,6 +245,36 @@ def profile_import(file: Path = typer.Argument(..., help="YAML file written by `
     for warning in result.warnings:
         console.print(f"Warning: {warning}", style="yellow", markup=False, highlight=False)
     console.print(f"Profile is now at version {result.version}.", markup=False)
+
+
+def _open_initialised(path: Path) -> Database:
+    db = Database(path)
+    db.init_db()
+    return db
+
+
+def _open_read_only(path: Path) -> Database:
+    """A database for a dry run: never created, initialised or migrated (a problem is a one-line message)."""
+    if not Path(path).exists():
+        raise _fail(f"no database at {path}; nothing to check")
+    latest = MIGRATIONS[-1][0]
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            current = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        raise _fail(
+            "the database has no schema_version table (not initialised); run `jobspy-coach init` or any "
+            "command without --dry-run once"
+        ) from None
+    if current is None or current < latest:
+        raise _fail(
+            f"the database is at schema version {current or 0}, this version needs {latest}; run any "
+            "command without --dry-run once to migrate it"
+        )
+    return Database(path)
 
 
 @app.command()
@@ -253,22 +289,21 @@ def requeue(
     Never run while the daemon is running. Re-bucketed rows never send instant alerts.
     """
     settings = get_settings()
-    db = Database(settings.db_path)
-    db.init_db()
-    snapshot = ProfileStore(db).read_snapshot()
-    if snapshot is None:
-        raise _fail("no profile, run `jobspy-coach init`")
+    db = _open_read_only(settings.db_path) if dry_run else _open_initialised(settings.db_path)
     try:
+        snapshot = ProfileStore(db).read_snapshot()
+        if snapshot is None:
+            raise _fail("no profile, run `jobspy-coach init`")
         compiled = compile_profile(snapshot, scrape_interval_hours=settings.scrape_interval_hours)
-    except ProfileCompileError as exc:
-        raise _fail(f"profile cannot be compiled: {exc}") from None
+    except (ProfileError, sqlite3.Error) as exc:  # an unreadable or uncompilable profile, a locked database
+        raise _fail(f"profile cannot be used: {exc}") from None
     prefix = "dry run: " if dry_run else ""
     if thresholds:
         rebucket = rebucket_evaluated(db, compiled.scoring, dry_run=dry_run)
         console.print(
             f"{prefix}checked: {rebucket.checked}, changed: {rebucket.changed}, "
             f"skipped (missing stored fields): {rebucket.skipped_missing}, to digest: {rebucket.to_digest}, "
-            f"to dismissed: {rebucket.to_dismissed}",
+            f"to dismissed: {rebucket.to_dismissed}, too old: {rebucket.too_old}",
             markup=False,
             soft_wrap=True,
         )

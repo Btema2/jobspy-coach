@@ -209,6 +209,22 @@ def test_apply_changes_on_absent_profile_diffs_against_nothing(store: ProfileSto
     assert result.diff == ["paused: False -> True", "+ role <ROLE>"]
 
 
+def test_apply_result_carries_the_before_and_after_snapshots(started: ProfileStore):
+    before = started.read_snapshot()
+
+    result = apply_changes(started, [AddRole("<ROLE>")], label="add role")
+
+    assert result.old == before and result.old.version == 1 and result.old.roles == ()
+    assert result.new == started.read_snapshot()
+    assert result.new.version == result.version == 2
+    assert [r.name for r in result.new.roles] == ["<ROLE>"]
+
+
+def test_apply_result_old_is_none_without_a_profile(store: ProfileStore):
+    result = apply_changes(store, [SetField("paused", True)], label="first", expected_version=0)
+    assert result.old is None and result.new.version == 1
+
+
 # --- undo / restore ----------------------------------------------------------------------------
 
 

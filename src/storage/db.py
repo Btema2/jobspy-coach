@@ -674,14 +674,32 @@ class Database:
             conn.commit()
         return revived
 
-    def get_rebucket_candidates(self) -> List[JobPosting]:
-        """Evaluated rows whose bucket may still change (never alerted rows)."""
+    def get_rebucket_candidates(self, max_age_days: Optional[int] = None) -> List[JobPosting]:
+        """Evaluated rows whose bucket may still change (never alerted rows).
+
+        With ``max_age_days`` only rows created within that window: an older row that became ``pending``
+        would be expired by the next digest before it could be sent.
+        """
+        sql = (
+            "SELECT * FROM jobs WHERE eval_status = 'evaluated' "
+            "AND notification_status IN ('pending', 'dismissed')"
+        )
+        params: tuple = ()
+        if max_age_days is not None:
+            sql += " AND datetime(created_at) >= datetime('now', '-' || ? || ' days')"
+            params = (max_age_days,)
         with self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE eval_status = 'evaluated' "
-                "AND notification_status IN ('pending', 'dismissed') ORDER BY id ASC"
-            ).fetchall()
+            rows = conn.execute(sql + " ORDER BY id ASC", params).fetchall()
         return [self._row_to_job(r) for r in rows]
+
+    def count_rebucket_older_than(self, max_age_days: int) -> int:
+        with self._get_connection() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE eval_status = 'evaluated' "
+                "AND notification_status IN ('pending', 'dismissed') "
+                "AND datetime(created_at) < datetime('now', '-' || ? || ' days')",
+                (max_age_days,),
+            ).fetchone()[0]
 
     def apply_rebucket(self, changes: Sequence[Tuple[int, float, str]]) -> int:
         """Write ``(id, score, notification_status)`` changes in one transaction; returns rows updated.

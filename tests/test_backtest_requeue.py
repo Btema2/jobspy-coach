@@ -317,3 +317,20 @@ def test_apply_rebucket_guards_status(db):
     assert _row(db, sent_id).notification_status == "digest_sent"
     assert _row(db, pending_id).notification_status == "dismissed"
     assert db.apply_rebucket([]) == 0
+
+
+def test_rebucket_skips_rows_older_than_the_pending_expiry_window(db):
+    old_id = _evaluated(db, 1, raw=7.0, score=3.0, status="dismissed")
+    old_pending = _evaluated(db, 2, raw=7.0, score=7.0)
+    fresh_id = _evaluated(db, 3, raw=7.0, score=3.0, status="dismissed")
+    with db._get_connection() as conn:
+        conn.execute("UPDATE jobs SET created_at = datetime('now', '-8 days') WHERE id IN (?, ?)", (old_id, old_pending))
+        conn.commit()
+
+    result = rebucket_evaluated(db, _policy(digest_threshold=6.5))
+
+    assert (result.checked, result.changed, result.too_old, result.to_digest) == (1, 1, 2, 1)
+    assert _row(db, fresh_id).notification_status == "pending"
+    assert _row(db, old_id).notification_status == "dismissed"  # would only expire at the next digest
+    assert _row(db, old_pending).eval_score == 7.0
+    assert rebucket_evaluated(db, _policy(), dry_run=True).too_old == 2
