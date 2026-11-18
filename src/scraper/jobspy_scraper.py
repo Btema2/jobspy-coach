@@ -10,7 +10,7 @@ import pandas as pd
 
 from src.filters.pre_filter import classify_title, pre_filter_job
 from src.scraper.outcome import ScrapeOutcome
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries
+from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries, query_key
 from src.storage.db import compute_dedup_hash
 from src.storage.models import JobPosting
 
@@ -459,11 +459,14 @@ class JobSpyScraper:
             raw_direct_url = _clean_str(row.get("job_url_direct"))
             job_url_direct = clean_job_url(raw_direct_url) if raw_direct_url else None
 
+            # The board's own flag is positive-only evidence: True is verified remote; False or a missing
+            # value is merely unverified. The query's own is_remote flag is never substituted for it.
             is_remote_val = row.get("is_remote")
             if is_remote_val is None or pd.isna(is_remote_val):
-                is_remote = query.is_remote
+                is_remote = False
             else:
                 is_remote = bool(is_remote_val)
+            remote_status = "verified" if is_remote else "unverified"
 
             date_posted_val = _clean_str(row.get("date_posted")) or ""
             external_id_val = _clean_str(row.get("id")) or ""
@@ -485,6 +488,8 @@ class JobSpyScraper:
                     salary_currency=_clean_str(row.get("currency")),
                     salary_interval=_clean_str(row.get("interval")),
                     is_remote=is_remote,
+                    remote_status=remote_status,
+                    source_query=query_key(query, site_name),
                     date_posted=date_posted_val,
                     pre_filtered=is_prefiltered,
                     pre_filter_reason=pre_filter_reason,

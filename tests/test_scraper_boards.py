@@ -224,3 +224,56 @@ def test_example_queries_json_is_loadable_and_generic(tmp_path, monkeypatch):
     qs = load_custom_queries()
     assert qs and all(q.query_id and q.search_term for q in qs)
     assert any(q.google_search_term for q in qs)
+
+
+# ---------------------------------------------------------------- remote status / attribution
+
+
+def _row_frame(**over):
+    row = {
+        "title": "Career Coach",
+        "job_url": "https://example.com/job/1",
+        "company": "Acme",
+        "location": "Testland",
+        "description": "word " * 80,
+        "is_remote": True,
+    }
+    row.update(over)
+    return pd.DataFrame([row])
+
+
+def _convert(df, query=None, site="indeed"):
+    postings, _ = _scraper()._rows_to_postings(df, site, query or _query())
+    assert len(postings) == 1
+    return postings[0]
+
+
+def test_remote_true_is_verified():
+    p = _convert(_row_frame(is_remote=True))
+    assert p.is_remote is True
+    assert p.remote_status == "verified"
+
+
+def test_remote_false_is_unverified_and_kept():
+    p = _convert(_row_frame(is_remote=False), _query(is_remote=True))
+    assert p.is_remote is False
+    assert p.remote_status == "unverified"
+
+
+@pytest.mark.parametrize("missing", [float("nan"), None])
+def test_missing_remote_value_does_not_use_query_flag(missing):
+    p = _convert(_row_frame(is_remote=missing), _query(is_remote=True))
+    assert p.is_remote is False
+    assert p.remote_status == "unverified"
+
+
+def test_missing_remote_column_does_not_use_query_flag():
+    df = _row_frame().drop(columns=["is_remote"])
+    p = _convert(df, _query(is_remote=True))
+    assert p.is_remote is False
+    assert p.remote_status == "unverified"
+
+
+def test_postings_carry_source_query():
+    p = _convert(_row_frame(), _query(query_id="Q-X"), site="LinkedIn")
+    assert p.source_query == "Q-X|linkedin"
