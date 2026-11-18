@@ -288,3 +288,38 @@ def test_constants():
     assert compiler.EXPANSION_BOARDS == ("linkedin", "google", "zip_recruiter", "indeed", "glassdoor")
     assert compiler.COUNTRY_BOUND_BOARDS == frozenset({"indeed", "glassdoor"})
     assert compiler.ZIPRECRUITER_COUNTRIES == frozenset({"usa", "uk", "canada"})
+
+
+# Coverage moved here from the removed default-catalog tests in test_scraper.py / test_scraper_progress.py.
+
+
+def test_empty_snapshot_compiles_to_no_queries():
+    """There is no built-in query catalog to fall back on."""
+    assert compile_profile(_snap()).queries == ()
+
+
+def test_compiled_boards_respect_country_support_invariants():
+    markets = (
+        Market("<US>", "Remote", countries=("usa", "canada", "uk"), remote=True),
+        Market("<EU>", "<L2>", countries=("germany", "poland", "france")),
+        Market("<NONE>", "Europe", remote=True),
+    )
+    pinned = (PinnedQuery("Q-PIN", "<T>", "<L>", ("linkedin", "indeed"), country="poland"),)
+    compiled = compile_profile(
+        _snap(roles=(Role("<ROLE>", terms=(RoleTerm("<T2>"),)),), markets=markets, pinned_queries=pinned)
+    )
+
+    assert compiled.queries
+    for q in compiled.queries:
+        boards = set(q.site_names)
+        if boards & {"indeed", "glassdoor"}:
+            assert q.country_code, f"{q.query_id} sends a country-bound board without a country"
+        if "glassdoor" in boards:
+            assert q.country_code in compiler.GLASSDOOR_COUNTRIES
+        if "zip_recruiter" in boards:
+            assert q.country_code is None or q.country_code in compiler.ZIPRECRUITER_COUNTRIES
+    eu_base = [q for q in compiled.queries if q.location == "<L2>" and q.country_code is None]
+    assert eu_base and all("zip_recruiter" not in q.site_names for q in eu_base)
+    # Poland has no Glassdoor support, so only Indeed is sent for it.
+    poland = [q for q in compiled.queries if q.country_code == "poland" and q.query_id != "Q-PIN"]
+    assert poland and all(q.site_names == ["indeed"] for q in poland)

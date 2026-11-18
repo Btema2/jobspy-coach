@@ -1,5 +1,4 @@
 """Per-board kwargs passed to python-jobspy (no network: scrape_jobs is monkeypatched)."""
-import json
 import logging
 from unittest.mock import MagicMock
 
@@ -7,7 +6,7 @@ import pandas as pd
 import pytest
 
 from src.scraper.jobspy_scraper import JobSpyScraper, build_google_search_term
-from src.scraper.query_catalog import SearchQuery, load_custom_queries
+from src.scraper.query_catalog import SearchQuery
 
 
 @pytest.fixture
@@ -193,37 +192,6 @@ def test_indeed_hours_old_keeps_a_wider_window(mock_scrape):
 def test_other_boards_hours_old_unchanged(mock_scrape, board):
     _scraper(hours_old=48).scrape_board(board, _query(site_names=[board], country_code=None))
     assert mock_scrape.call_args.kwargs["hours_old"] == 48
-
-
-# ---------------------------------------------------------------- loader
-
-
-def test_loader_reads_optional_google_search_term(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "queries.json").write_text(
-        json.dumps(
-            [
-                {"query_id": "A", "search_term": "t", "location": "l", "site_names": ["google"],
-                 "google_search_term": "override"},
-                {"query_id": "B", "search_term": "t", "location": "l", "site_names": ["google"]},
-            ]
-        ),
-        encoding="utf-8",
-    )
-    a, b = load_custom_queries()
-    assert a.google_search_term == "override"
-    assert b.google_search_term is None
-
-
-def test_example_queries_json_is_loadable_and_generic(tmp_path, monkeypatch):
-    from pathlib import Path
-
-    src = Path(__file__).resolve().parent.parent / "queries.example.json"
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "queries.json").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    qs = load_custom_queries()
-    assert qs and all(q.query_id and q.search_term for q in qs)
-    assert any(q.google_search_term for q in qs)
 
 
 # ---------------------------------------------------------------- remote status / attribution

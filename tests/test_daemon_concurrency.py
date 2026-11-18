@@ -712,7 +712,6 @@ def test_start_survives_config_error_in_real_startup_cycle(monkeypatch, tmp_path
     scheduler_cls = MagicMock()
     monkeypatch.setattr("src.scheduler.daemon.BlockingScheduler", scheduler_cls)
     monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
-    monkeypatch.setattr("src.scheduler.daemon.get_active_queries", lambda: [])
     monkeypatch.setattr("signal.signal", lambda sig, handler: None)
     builder = MagicMock(side_effect=ConfigurationError("No LLM provider is configured"))
     monkeypatch.setattr("src.scheduler.daemon.build_chain_from_settings", builder)

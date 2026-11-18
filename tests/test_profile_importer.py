@@ -67,7 +67,7 @@ def legacy_dir(tmp_path: Path) -> Path:
 
 
 def _legacy_parse(path: Path) -> List[SearchQuery]:
-    """Copy of the load_custom_queries mapping that import replaces (kept to prove equivalence)."""
+    """Copy of the former queries.json loader mapping that import replaces (kept to prove equivalence)."""
     data = json.loads(path.read_text(encoding="utf-8"))
     return [
         SearchQuery(

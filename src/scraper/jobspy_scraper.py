@@ -11,7 +11,7 @@ import pandas as pd
 from src.filters.pre_filter import classify_title, pre_filter_job
 from src.scraper.coordinator import ScrapeCoordinator
 from src.scraper.outcome import ScrapeOutcome
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries, query_key
+from src.scraper.query_catalog import SearchQuery, query_key
 from src.storage.db import compute_dedup_hash
 from src.storage.models import JobPosting
 
@@ -537,12 +537,11 @@ class JobSpyScraper:
                 self.end_cycle()
         return all_postings
 
-    def scrape_all_queries(self, queries: Optional[List[SearchQuery]] = None) -> List[JobPosting]:
-        active_queries = queries or get_active_queries()
-        self.begin_cycle(active_queries)
+    def scrape_all_queries(self, queries: List[SearchQuery]) -> List[JobPosting]:
+        self.begin_cycle(queries)
         aggregated: List[JobPosting] = []
         try:
-            for q in active_queries:
+            for q in queries:
                 aggregated.extend(self.scrape_query(q))
         finally:
             self.end_cycle()

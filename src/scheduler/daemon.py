@@ -1,7 +1,9 @@
+import html
 import logging
 import math
 import random
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -22,11 +24,14 @@ from src.config import get_settings
 from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.errors import ConfigurationError, EvaluationRejected, ProvidersUnavailable, StopRequested
 from src.logging_config import redact_secrets
+from src.profile.compiler import CompiledProfile, compile_profile
+from src.profile.errors import ProfileCompileError
+from src.profile.store import ProfileStore
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.notifier.templates import format_version_update_notice
 from src.scraper.jobspy_scraper import JobSpyScraper
 from src.scraper.outcome import ScrapeOutcome
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries, query_key
+from src.scraper.query_catalog import SearchQuery, query_key
 from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
 from src.storage.models import JobPosting
@@ -110,14 +115,86 @@ class DaemonService:
             chat_id=settings.telegram_chat_id,
         )
         self.scheduler: Optional[BlockingScheduler] = None
+        # The daemon only reads the profile; it never auto-imports legacy files (the CLI does).
+        self.profile_store = ProfileStore(self.db)
+        self._last_good: Optional[CompiledProfile] = None
+        self._alerted: set = set()
+        self._alert_lock = threading.Lock()
+
+    # ----- profile -----
+
+    def _alert_once(self, key: str, text: str) -> None:
+        """Telegram alert the first time ``key`` is seen in this process; failures are logged only."""
+        with self._alert_lock:
+            if key in self._alerted:
+                return
+            self._alerted.add(key)
+        try:
+            self.notifier.send_message(html.escape(text, quote=False))
+        except Exception as exc:  # an alert must never break a cycle
+            logger.warning("Could not send profile alert (%s): %s", type(exc).__name__, redact_secrets(str(exc)))
+
+    def _rearm_alerts(self, prefix: str) -> None:
+        with self._alert_lock:
+            self._alerted = {k for k in self._alerted if not k.startswith(prefix)}
+
+    def _rebuild_from_versions(self) -> Optional[CompiledProfile]:
+        """Newest ``profile_versions`` snapshot that still compiles (None when there is none)."""
+        try:
+            versions = self.profile_store.list_versions()
+        except sqlite3.Error as exc:
+            logger.error("Could not list profile versions: %s", exc)
+            return None
+        for info in versions:
+            try:
+                compiled = compile_profile(
+                    self.profile_store.load_version(info.version),
+                    scrape_interval_hours=self.settings.scrape_interval_hours,
+                )
+            except Exception as exc:  # a stored snapshot that cannot be read or compiled is skipped
+                logger.warning("Profile version %s is not usable: %s", info.version, exc)
+                continue
+            logger.warning("Using profile version %s as the last good profile.", info.version)
+            return compiled
+        return None
+
+    def current_profile(self, alert: bool = True) -> Tuple[Optional[CompiledProfile], Optional[str]]:
+        """Compile the stored profile; ``(profile, problem)`` with problem ``None``, ``no_profile`` or ``compile_error``.
+
+        On a compile or snapshot-read error the fallback is the last good profile (in memory), else the
+        newest stored version that compiles, else None; the error is alerted once per distinct text.
+        """
+        try:
+            snapshot = self.profile_store.read_snapshot()
+            if snapshot is None:
+                return None, "no_profile"
+            compiled = compile_profile(snapshot, scrape_interval_hours=self.settings.scrape_interval_hours)
+        except (ProfileCompileError, sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+            message = f"profile cannot be compiled: {exc}"
+            logger.error(message)
+            if alert:
+                self._alert_once(f"compile:{message}", message)
+            if self._last_good is None:
+                self._last_good = self._rebuild_from_versions()
+            return self._last_good, "compile_error"
+        self._last_good = compiled
+        self._rearm_alerts("compile:")
+        return compiled, None
 
     # ----- evaluation engine -----
 
-    def _get_evaluator(self) -> Any:
-        """Return the provider chain, building it on first use (raises ConfigurationError)."""
+    def _get_evaluator(self, profile: Optional[CompiledProfile] = None) -> Any:
+        """Return the provider chain, building it on first use (raises ConfigurationError).
+
+        The chain is built once; the profile's bonus flag is applied at that first build (a per-call
+        bonus is a later branch).
+        """
         with self._chain_lock:
             if self.evaluator is None:
-                self.evaluator = build_chain_from_settings(self.settings, stop_event=self._stop_event)
+                kwargs: Dict[str, Any] = {"stop_event": self._stop_event}
+                if profile is not None:
+                    kwargs["bonus_enabled"] = profile.bonus_enabled
+                self.evaluator = build_chain_from_settings(self.settings, **kwargs)
             return self.evaluator
 
     def _stop_chain(self) -> None:
@@ -165,7 +242,9 @@ class DaemonService:
                 return str(getattr(provider, "name", "unknown"))
         return "unknown"
 
-    def evaluate_unprocessed(self, limit: Optional[int] = None, dry_run: bool = False) -> Tuple[int, int]:
+    def evaluate_unprocessed(
+        self, limit: Optional[int] = None, dry_run: bool = False, profile: Optional[CompiledProfile] = None
+    ) -> Tuple[int, int]:
         """Evaluate queued jobs concurrently; return ``(evaluated_count, wow_sent)``.
 
         Invariant: the thread that calls this method is the only one that touches the
@@ -183,7 +262,11 @@ class DaemonService:
         if not jobs:
             return 0, 0
 
-        chain = self._get_evaluator()
+        if profile is None:
+            profile = self.current_profile(alert=not dry_run)[0]
+        system_prompt = profile.system_prompt if profile is not None else None
+
+        chain = self._get_evaluator(profile)
         if not self._rearm_stop_event(chain) or self._shutdown_requested.is_set():
             return 0, 0
         total = len(jobs)
@@ -212,7 +295,9 @@ class DaemonService:
                 in_flight += 1
                 in_flight_peak = max(in_flight_peak, in_flight)
             try:
-                return chain.evaluate_job(job), time.monotonic() - started
+                if system_prompt is None:  # no profile: the legacy one-argument call
+                    return chain.evaluate_job(job), time.monotonic() - started
+                return chain.evaluate_job(job, system_prompt=system_prompt), time.monotonic() - started
             finally:
                 with stats_lock:
                     in_flight -= 1
@@ -379,7 +464,52 @@ class DaemonService:
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
     ) -> Tuple[int, int]:
-        active_queries = queries or get_active_queries()
+        # One snapshot per cycle: the profile is compiled once here and drives both scraping and
+        # evaluation, so a change committed mid-cycle only takes effect in the next cycle.
+        profile, problem = self.current_profile(alert=not dry_run)
+        if queries is None:
+            queries = self._profile_queries(profile, problem, dry_run)
+
+        total_new_saved = self._scrape_queries(queries, dry_run) if queries else 0
+
+        if dry_run:
+            return 0, 0
+
+        # Process evaluations
+        _, wow_sent = self.evaluate_unprocessed(
+            limit=self.settings.eval_batch_limit, dry_run=False, profile=profile
+        )
+        logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {wow_sent}")
+        return total_new_saved, wow_sent
+
+    def _profile_queries(
+        self, profile: Optional[CompiledProfile], problem: Optional[str], dry_run: bool
+    ) -> List[SearchQuery]:
+        """The queries a profile-driven cycle scrapes (empty = skip scraping, with the reason logged/alerted)."""
+        if problem == "no_profile":
+            logger.warning("No profile: scraping skipped. Run `jobspy-coach init`.")
+            if not dry_run:
+                self._alert_once("no_profile", "no profile: run jobspy-coach init")
+            return []
+        self._rearm_alerts("no_profile")
+        if problem == "compile_error":
+            logger.warning("Profile does not compile: scraping skipped this cycle.")
+            return []
+        assert profile is not None
+        if profile.paused:
+            logger.info("Profile is paused: scraping skipped, evaluation continues.")
+            return []
+        if not profile.queries:
+            logger.warning("The profile compiles to no search queries: scraping skipped.")
+            if not dry_run:
+                self._alert_once(
+                    "empty_queries", "the profile has no search queries to run; add roles and markets"
+                )
+            return []
+        self._rearm_alerts("empty_queries")
+        return list(profile.queries)
+
+    def _scrape_queries(self, active_queries: List[SearchQuery], dry_run: bool) -> int:
         logger.info("Starting pipeline scrape cycle across queries...")
         total_new_saved = 0
 
@@ -458,14 +588,7 @@ class DaemonService:
             end_cycle = getattr(self.scraper, "end_cycle", None)
             if callable(end_cycle):
                 end_cycle()
-
-        if dry_run:
-            return 0, 0
-
-        # Process evaluations
-        _, wow_sent = self.evaluate_unprocessed(limit=self.settings.eval_batch_limit, dry_run=False)
-        logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {wow_sent}")
-        return total_new_saved, wow_sent
+        return total_new_saved
 
     def run_daily_digest_cycle(self, dry_run: bool = False) -> int:
         if not dry_run:

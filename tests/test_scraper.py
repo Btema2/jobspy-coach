@@ -1,17 +1,9 @@
-import logging
-from pathlib import Path
 from unittest.mock import MagicMock
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.scraper.jobspy_scraper import JobSpyScraper, clean_job_url
-from src.scraper.query_catalog import (
-    DEFAULT_QUERY_CATALOG,
-    SearchQuery,
-    get_active_queries,
-    load_custom_queries,
-)
+from src.scraper.query_catalog import SearchQuery
 
 
 def test_clean_job_url():
@@ -335,13 +327,6 @@ def test_jobspy_scraper_exhausted_retries_returns_empty(monkeypatch):
 
 
 def test_query_catalog_and_cycle(monkeypatch):
-    assert len(DEFAULT_QUERY_CATALOG) == 2
-    for q in DEFAULT_QUERY_CATALOG:
-        assert q.query_id.startswith("Q-")
-        assert len(q.search_term) > 0
-        assert len(q.location) > 0
-        assert len(q.site_names) > 0
-
     scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
     mock_scrape_query = MagicMock(return_value=[])
     scraper.scrape_query = mock_scrape_query
@@ -398,37 +383,6 @@ def test_jobspy_scraper_corrupted_salary(monkeypatch):
     assert len(results) == 1
     assert results[0].salary_min is None
     assert results[0].salary_max is None
-
-
-def test_query_catalog_incompatible_boards_excluded():
-    queries_by_id = {q.query_id: q for q in DEFAULT_QUERY_CATALOG}
-
-    # Glassdoor only supports a limited set of countries; the default catalog only uses it for US/global remote.
-    for q in DEFAULT_QUERY_CATALOG:
-        if "glassdoor" in q.site_names:
-            assert q.country_code == "usa", f"Query {q.query_id} uses glassdoor outside a supported country"
-
-    # ZipRecruiter blocks European traffic: never on queries without an explicit US/UK/CA country.
-    for q in DEFAULT_QUERY_CATALOG:
-        if "zip_recruiter" in q.site_names:
-            assert q.country_code in ("usa", "uk", "canada"), f"Query {q.query_id} must not use zip_recruiter"
-
-    # Q-EU-REM never uses zip_recruiter
-    assert "Q-EU-REM" in queries_by_id
-    assert "zip_recruiter" not in queries_by_id["Q-EU-REM"].site_names
-
-    # Q-GL-REM retains ["linkedin", "indeed", "glassdoor", "google"]
-    assert "Q-GL-REM" in queries_by_id
-    assert queries_by_id["Q-GL-REM"].site_names == ["linkedin", "indeed", "glassdoor", "google"]
-
-
-def test_default_query_catalog_has_no_personal_location_targeting():
-    """Privacy guard: the tracked default catalog must stay location-neutral (personal targets live in queries.json)."""
-    blob = " ".join(
-        f"{q.query_id} {q.search_term} {q.location} {q.country_code or ''}" for q in DEFAULT_QUERY_CATALOG
-    ).lower()
-    for forbidden in ("poland", "polska", "warsaw", "warszawa", "krak", "wroc", "trener"):
-        assert forbidden not in blob
 
 
 def test_scrape_board_never_defaults_to_usa(monkeypatch):
@@ -566,125 +520,3 @@ def test_jobspy_scraper_passes_fetch_description(monkeypatch):
     assert mock_scrape.call_count == 1
     _, kwargs_no_desc = mock_scrape.call_args
     assert kwargs_no_desc.get("fetch_description") is False
-
-
-def test_load_custom_queries_valid(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    custom_data = [
-        {
-            "query_id": "CUSTOM-1",
-            "search_term": "Executive Leadership Coach",
-            "location": "Warsaw, Poland",
-            "site_names": ["linkedin", "indeed"],
-            "country_code": "poland",
-            "is_remote": False,
-        },
-        {
-            "query_id": "CUSTOM-REMOTE",
-            "search_term": "Agile Coach",
-            "location": "Remote",
-            "site_names": ["glassdoor"],
-            "is_remote": True,
-        },
-    ]
-
-    # Test loading from queries.json
-    queries_file = tmp_path / "queries.json"
-    import json
-    queries_file.write_text(json.dumps(custom_data), encoding="utf-8")
-
-    queries = load_custom_queries()
-    assert queries is not None
-    assert len(queries) == 2
-    assert queries[0] == SearchQuery(
-        query_id="CUSTOM-1",
-        search_term="Executive Leadership Coach",
-        location="Warsaw, Poland",
-        site_names=["linkedin", "indeed"],
-        country_code="poland",
-        is_remote=False,
-    )
-    assert queries[1] == SearchQuery(
-        query_id="CUSTOM-REMOTE",
-        search_term="Agile Coach",
-        location="Remote",
-        site_names=["glassdoor"],
-        country_code=None,
-        is_remote=True,
-    )
-
-    # Test loading from config/queries.json when queries.json is removed
-    queries_file.unlink()
-    config_dir = tmp_path / "config"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "queries.json").write_text(json.dumps([custom_data[0]]), encoding="utf-8")
-
-    queries_config = load_custom_queries()
-    assert queries_config is not None
-    assert len(queries_config) == 1
-    assert queries_config[0].query_id == "CUSTOM-1"
-
-
-def test_load_custom_queries_invalid_json(tmp_path, monkeypatch, caplog):
-    monkeypatch.chdir(tmp_path)
-    bad_file = tmp_path / "queries.json"
-    bad_file.write_text("{\"query_id\": INVALID_JSON...", encoding="utf-8")
-
-    with caplog.at_level(logging.WARNING):
-        res = load_custom_queries()
-
-    assert res is None
-    assert "Could not load custom queries" in caplog.text
-
-
-def test_load_custom_queries_missing(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    # Neither queries.json nor config/queries.json exists
-    assert load_custom_queries() is None
-
-
-def test_get_active_queries(monkeypatch):
-    # 1. When custom queries exist, get_active_queries returns custom queries
-    mock_custom = [
-        SearchQuery(
-            query_id="MOCK-Q",
-            search_term="Mock Coach",
-            location="Remote",
-            site_names=["indeed"],
-        )
-    ]
-    monkeypatch.setattr("src.scraper.query_catalog.load_custom_queries", lambda: mock_custom)
-    active = get_active_queries()
-    assert active == mock_custom
-
-    # 2. When custom queries is None, get_active_queries returns DEFAULT_QUERY_CATALOG
-    monkeypatch.setattr("src.scraper.query_catalog.load_custom_queries", lambda: None)
-    active_default = get_active_queries()
-    assert active_default == DEFAULT_QUERY_CATALOG
-
-
-def test_jobspy_scraper_scrape_all_queries_defaults_to_active_queries(monkeypatch):
-    scraper = JobSpyScraper(jitter_min=0.0, jitter_max=0.0)
-    mock_scrape_query = MagicMock(return_value=[])
-    scraper.scrape_query = mock_scrape_query
-
-    mock_custom_queries = [
-        SearchQuery(query_id="Q-ACTIVE-1", search_term="Coach", location="Warsaw", site_names=["linkedin"]),
-    ]
-    monkeypatch.setattr("src.scraper.jobspy_scraper.get_active_queries", lambda: mock_custom_queries)
-
-    # Calling scrape_all_queries with queries=None uses get_active_queries
-    res = scraper.scrape_all_queries(None)
-    assert res == []
-    assert mock_scrape_query.call_count == 1
-    assert mock_scrape_query.call_args[0][0] == mock_custom_queries[0]
-
-    # Calling run_scraping_cycle with queries=None also uses get_active_queries
-    mock_scrape_query.reset_mock()
-    res_cycle = scraper.run_scraping_cycle()
-    assert res_cycle == []
-    assert mock_scrape_query.call_count == 1
-    assert mock_scrape_query.call_args[0][0] == mock_custom_queries[0]
-
-
-

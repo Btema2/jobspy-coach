@@ -9,7 +9,7 @@ import pytest
 
 from src.scheduler.daemon import DaemonService
 from src.scraper.jobspy_scraper import JobSpyScraper
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery
+from src.scraper.query_catalog import SearchQuery
 
 LOGGER = "src.scraper.jobspy_scraper"
 LONG_DESC = "Coaching role working with clients one to one on their careers. " * 5
@@ -271,15 +271,6 @@ def test_non_google_board_errors_logged_once_per_board_and_message(monkeypatch, 
     assert len(msgs) == 2
     assert "unexpected page with no jobs (blocked?)" in msgs[0] and msgs[0].startswith("Linkedin reported an error")
     assert "HTTP 429" in msgs[1]
-
-
-# --------------------------------------------------------------- catalog invariant
-
-
-@pytest.mark.parametrize("query", DEFAULT_QUERY_CATALOG, ids=lambda q: q.query_id)
-def test_default_catalog_country_bound_boards_have_country_code(query):
-    if {"indeed", "glassdoor"} & {s.lower() for s in query.site_names}:
-        assert query.country_code
 
 
 # ------------------------------------------- skipped boards stay visible on the daemon path
