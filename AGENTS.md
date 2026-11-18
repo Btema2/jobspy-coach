@@ -10,9 +10,9 @@
 > **STRICT PRIVACY MANDATE FOR ALL AI AGENTS & DEVELOPERS**:
 > Under **NO circumstances** should private user data (candidate name, specific personal background, city/country of residence, native languages, personal credentials, or customized search targets) be committed, documented, or pushed to any public or remote repository.
 > 
-> - **Local Storage Only**: All actual candidate profiles and user-specific personas are stored exclusively in local, git-ignored configuration files (such as `.candidate_profile.md` and `.env`).
+> - **Local Storage Only**: All actual candidate profiles and user-specific personas are stored exclusively in local, git-ignored places: `.env`, the legacy `.candidate_profile.md` / `queries.json` (imported once) and the SQLite database `data/jobs.db`, which holds the stored profile (persona, queries, rules and the last 10 versions) after the import. Never commit the database or a profile export.
 > - **Public Neutrality**: Tracked repository files, documentation, commit messages, and PRs must strictly use sanitized, generic templates and configurable placeholders (e.g., `<TARGET_ROLE>`, `<TARGET_REGION>`).
-> - **Runtime Persona Injection**: When running locally, agents and the evaluator engine read `.candidate_profile.md` to evaluate vacancies against the user's private persona. If missing, the engine falls back to a generic professional template.
+> - **Runtime Persona Injection**: When running locally, the evaluator uses the persona stored in the profile (SQLite) to evaluate vacancies against the user's private persona; a legacy `.candidate_profile.md` is only imported once, after which editing it changes nothing (use `profile export` / `profile import`). If the profile has no persona, the engine falls back to a generic professional template.
 
 
 ---
@@ -22,7 +22,7 @@
 ```
 src/
 ├── config.py              # Pydantic Settings with comma-separated list validators
-├── cli.py                 # Unified Typer CLI (scrape, evaluate, digest, stats, run)
+├── cli.py                 # Unified Typer CLI (scrape, evaluate, digest, stats, run, init, rehash, cleanup-empty, test-telegram, profile preview|export|import); a callback auto-imports legacy files before each command (not for --help)
 ├── logging_config.py      # configure_logging(): httpx/httpcore at WARNING + secret-redacting log filter
 ├── filters/
 │   └── pre_filter.py      # Zero-cost deterministic filters: sports/pets noise, title traps, seniority (classify_title), stub descriptions
@@ -146,10 +146,10 @@ docs/
 
 ### F. Search Profile (`src/profile/`)
 1. **Source of truth**: the profile tables (`profile`, `roles`, `role_terms`, `markets`, `pinned_queries`, `rules`, `profile_versions`) are the only source of search queries and of the evaluator system prompt. There is no default query catalog and no fallback to one; `queries or get_active_queries()` no longer exists.
-2. **Auto-import (CLI only)**: the `@app.callback()` in `src/cli.py` runs `auto_import` before every CLI command: when no profile exists and `queries.json` / `.candidate_profile.md` exist in the working directory, they are imported idempotently (files untouched; each `queries.json` entry becomes one pinned query; a persona with bonus criteria keeps bonus enabled). The daemon never auto-imports; it only reads the profile. A broken legacy file or an unknown board/country in `queries.json` stops every command with exit code 1 and a message naming the file and entry; nothing is imported. Tests that can reach the CLI must `monkeypatch.chdir(tmp_path)`.
+2. **Auto-import (CLI only)**: the `@app.callback()` in `src/cli.py` runs `auto_import` before every CLI command: when no profile exists and `queries.json` / `.candidate_profile.md` exist in the working directory, they are imported idempotently (files untouched; each `queries.json` entry becomes one pinned query; a persona with bonus criteria keeps bonus enabled; python-jobspy country aliases such as `us` are normalised to their canonical value; `query_id`s are kept exactly, case-only twins get a `~N` suffix and a note; a persona without `queries.json` is imported paused, with a note). After the import the persona lives in the profile database: editing `.candidate_profile.md` no longer changes scoring. The daemon never auto-imports; it only reads the profile. A broken legacy file or an unknown board/country in `queries.json` stops every command with exit code 1 and a message naming the file and entry; nothing is imported. Tests that can reach the CLI must `monkeypatch.chdir(tmp_path)`.
 3. **"No profile" behaviour**: with neither a profile nor legacy files, `run` prints `no profile, run \`jobspy-coach init\`` and exits 1 before building the daemon. A daemon that is already running and finds no profile skips scraping and alerts once.
 4. **Changes go through `ops`**: every change (CLI `profile import`, restore, later the bot) is operations -> validation (including a compile) -> one transaction with an optimistic version check -> a new `profile_versions` row (the last 10 snapshots are kept). Threshold invariants: `3.0 < digest <= wow - 0.1`, `wow <= 10`; free text at most 8,000 characters.
-5. **Daemon cycle**: the profile is compiled once at the start of each cycle and that immutable result is used for scraping and evaluation. An empty query list skips scraping and alerts once. A compile failure skips scraping, alerts once per distinct (redacted, truncated) error and keeps evaluating with the last good profile (in memory, else the newest compilable stored version). An alert is recorded as sent only after Telegram accepted it, so a failed send is retried next cycle. `paused` stops scraping only (evaluation and digests continue).
+5. **Daemon cycle**: the profile is compiled once at the start of each cycle and that immutable result is used for scraping and for the per-call system prompt. The one exception is the chain's bonus flag: it is fixed when the evaluator chain is first built, so after a profile change that adds or removes `bonus_criteria` the daemon must be restarted until Branch 3 makes it per call. An empty query list skips scraping and alerts once. A compile failure skips scraping, alerts once per distinct (redacted, truncated) error and keeps evaluating with the last good profile (in memory, else the newest compilable stored version). An alert is recorded as sent only after Telegram accepted it, so a failed send is retried next cycle. `paused` stops scraping only (evaluation and digests continue).
 6. **Not yet consumed (Branch 3)**: stored thresholds, rules (including seed rules) and role/dealbreaker definitions are validated and versioned but the daemon still scores with the `.env` thresholds, `src/filters/pre_filter.py`, `role_is_direct_coaching` and `DIGEST_MAX_SCORE`. The compiled `system_prompt` equals `build_system_prompt(persona)`.
 7. **Export**: `profile export` writes YAML (mode 0600) only to a git-ignored path (default `local/profile-export.yaml`; `profile-export*.yaml` is in `.gitignore`) unless `--force`. It contains private data; never commit or paste it.
 
@@ -174,7 +174,7 @@ Any AI agent working on this codebase must adhere strictly to these principles:
 4. **Security, Privacy & Secrets**:
    - **NEVER hardcode or commit secrets** (OpenRouter API keys, Telegram bot tokens, chat IDs, proxy credentials).
    - **NEVER commit private user/candidate data** (name, background, residence, native languages, target locations, or custom prompts).
-   - All secrets belong in `.env` (which is in `.gitignore`). All private candidate personas belong in `.candidate_profile.md` (which is in `.gitignore`).
+   - All secrets belong in `.env` (which is in `.gitignore`). Private candidate personas live in the stored profile (git-ignored `data/jobs.db`) and in the legacy `.candidate_profile.md` (also in `.gitignore`).
    - Use `.env.example` with sanitized placeholders for documentation.
 5. **BypassSandbox Execution**:
    - Shell commands that modify files, run tests, or execute git commands (`pytest`, `git`, `python`) require `BypassSandbox: true` to avoid sandbox read-only filesystem errors.
