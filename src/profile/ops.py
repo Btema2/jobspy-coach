@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field, fields as dc_fields, replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar, Union
 
+from src.filters.seniority import SENIORITY_LEVELS
 from src.profile.compiler import (
     KNOWN_COUNTRIES,
     RULE_KINDS,
@@ -63,6 +64,7 @@ _LONG_TEXT_FIELDS = frozenset(
 )
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_ID_SEPARATOR_RE = re.compile(r"[;=]")  # keep parse_expanded_query_id unambiguous
 _SEED_BY_KEY = {(s.kind, s.pattern, s.reason) for s in SEED_RULES}
 
 
@@ -338,6 +340,8 @@ def threshold_problems(wow: float, digest: float) -> List[str]:
 def _name_problems(kind: str, names: List[str], problems: List[str]) -> None:
     seen: set = set()
     for name in names:
+        if _ID_SEPARATOR_RE.search(name):
+            problems.append(f"{kind} name '{name[:20]}' must not contain ';' or '='")
         if not 1 <= len(name.strip()) <= MAX_NAME_CHARS:
             problems.append(f"{kind} name '{name[:20]}' must be 1-{MAX_NAME_CHARS} characters")
         key = name.strip().casefold()
@@ -347,6 +351,10 @@ def _name_problems(kind: str, names: List[str], problems: List[str]) -> None:
 
 
 def _validate_fields(f: ProfileFields, problems: List[str]) -> None:
+    if f.target_level is not None and f.target_level not in SENIORITY_LEVELS:
+        problems.append(
+            f"target_level '{f.target_level[:20]}' must be one of {', '.join(SENIORITY_LEVELS)} or unset"
+        )
     for name in _TEXT_FIELDS:
         value = getattr(f, name)
         if value is not None and len(value) > MAX_TEXT_CHARS:
@@ -373,6 +381,8 @@ def _validate_roles(snap: ProfileSnapshot, problems: List[str]) -> None:
                     f"role '{role.name}': term '{t.term}' has language tag '{t.language}', "
                     "expected a 2-3 letter lowercase code"
                 )
+            if _ID_SEPARATOR_RE.search(t.term):
+                problems.append(f"role '{role.name}': term '{t.term[:20]}' must not contain ';' or '='")
             key = (t.term.strip().casefold(), t.language)
             if key in seen:
                 problems.append(f"role '{role.name}': duplicate term '{t.term}'")

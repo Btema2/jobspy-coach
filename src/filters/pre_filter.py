@@ -1,12 +1,15 @@
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
+
+from src.filters.rules import CompiledRule, match_title
 
 
 @dataclass(frozen=True)
 class PreFilterResult:
     passed: bool
     reason: Optional[str] = None
+    rule_key: Optional[str] = None
 
 
 # Compiled exclusion regex matching sports, fitness, vocal, and pet training (EN, PL, UK)
@@ -105,44 +108,24 @@ RESCUE_REGEX = re.compile(
 )
 
 
-def classify_title(title: Optional[str]) -> Optional[str]:
+def classify_title(title: Optional[str], rules: Optional[Sequence[CompiledRule]] = None) -> Optional[str]:
     """Return a drop reason for a job title, or None if the title may proceed.
 
-    Single implementation shared by the pre-filter and the evaluator safety net.
-    Order: sports/pets/gaming regex, hard traps, soft traps (unless rescued),
-    seniority (unless rescued). Empty titles are not classified (None).
+    Single implementation shared by the pre-filter and the evaluator safety net. ``rules=None`` uses the
+    legacy seed ruleset; the module regexes above document that seed and no longer drive the logic.
+    Order: block rules, rescue, soft rules, seniority rules. Empty titles are not classified (None).
     """
-    clean_title = (title or "").strip()
-    if not clean_title:
-        return None
-
-    match = EXCLUSION_TITLE_REGEX.search(clean_title)
-    if match:
-        return f"EXCLUDED_TITLE_REGEX: '{match.group(0)}'"
-
-    match = HARD_TRAP_REGEX.search(clean_title)
-    if match:
-        return f"EXCLUDED_TITLE_TRAP: '{match.group(0)}'"
-
-    if RESCUE_REGEX.search(clean_title):
-        return None
-
-    match = SOFT_TRAP_REGEX.search(clean_title)
-    if match:
-        return f"EXCLUDED_TITLE_TRAP: '{match.group(0)}'"
-
-    match = SENIORITY_REGEX.search(clean_title)
-    if match:
-        return f"EXCLUDED_SENIORITY: '{match.group(0)}'"
-
-    return None
+    hit = match_title(title, rules)
+    return hit.reason if hit else None
 
 
 MIN_DESCRIPTION_CHARS = 150
 MIN_DESCRIPTION_WORDS = 30
 
 
-def pre_filter_job(title: str, description: str) -> PreFilterResult:
+def pre_filter_job(
+    title: str, description: str, rules: Optional[Sequence[CompiledRule]] = None
+) -> PreFilterResult:
     """Deterministic pre-filter evaluating title exclusions and description quality.
 
     Filters out athletic, sports, fitness, vocal, gaming, and animal training positions,
@@ -153,9 +136,9 @@ def pre_filter_job(title: str, description: str) -> PreFilterResult:
     if not clean_title:
         return PreFilterResult(passed=False, reason="TITLE_EMPTY")
 
-    reason = classify_title(clean_title)
-    if reason:
-        return PreFilterResult(passed=False, reason=reason)
+    hit = match_title(clean_title, rules)
+    if hit:
+        return PreFilterResult(passed=False, reason=hit.reason, rule_key=hit.rule_key)
 
     clean_desc = (description or "").strip()
     if len(clean_desc) < MIN_DESCRIPTION_CHARS:

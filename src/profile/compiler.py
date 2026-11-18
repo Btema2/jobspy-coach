@@ -5,11 +5,12 @@ boards expansion), compiled rules, the evaluator system prompt and a cost estima
 (Indeed quote stripping and 168 h window, Google term derivation, LinkedIn pacing) stay in the scraper;
 only what decides *which* (query, board) calls exist lives here.
 """
-import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from src.evaluator.prompts import DEFAULT_CANDIDATE_PERSONA, render_system_prompt
+from src.filters.rules import RULE_KINDS, RULE_MODES, CompiledRule, compile_rule
+from src.filters.seniority import seniority_rules
 from src.profile.errors import ProfileCompileError
 from src.profile.snapshot import ProfileSnapshot
 from src.scraper.query_catalog import SearchQuery
@@ -63,18 +64,7 @@ GLASSDOOR_COUNTRIES = frozenset({
 })
 ZIPRECRUITER_COUNTRIES = frozenset({"usa", "uk", "canada"})
 
-RULE_KINDS = frozenset({"block", "soft", "seniority", "rescue"})
-RULE_MODES = frozenset({"exact", "prefix", "pattern"})
-
 _COUNTRY_LABELS = {"usa": "United States", "uk": "United Kingdom"}
-
-
-@dataclass(frozen=True)
-class CompiledRule:
-    kind: str
-    regex: "re.Pattern[str]"
-    reason: str
-    source: str
 
 
 @dataclass(frozen=True)
@@ -104,26 +94,31 @@ def expanded_query_id(role: str, term: str, market: str, country: Optional[str] 
     return f"{base};country={country}" if country else base
 
 
+def parse_expanded_query_id(query_id: str) -> Optional[Dict[str, str]]:
+    """Inverse of ``expanded_query_id``; None for ids that are not expanded (pinned ids)."""
+    if not query_id.startswith("role="):
+        return None
+    parsed: Dict[str, str] = {}
+    for part in query_id.split(";"):
+        key, sep, value = part.partition("=")
+        if not sep or key in parsed:
+            return None
+        parsed[key] = value
+    keys = list(parsed)
+    if keys not in (["role", "term", "market"], ["role", "term", "market", "country"]):
+        return None
+    return parsed
+
+
 def _country_label(country: str) -> str:
     return _COUNTRY_LABELS.get(country, country.title())
 
 
 def _compile_rule(kind: str, term: str, mode: str, reason: str, source: str) -> CompiledRule:
-    if kind not in RULE_KINDS:
-        raise ProfileCompileError(f"rule '{term}': unknown kind '{kind}'")
-    if mode == "exact":
-        pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
-    elif mode == "prefix":
-        pattern = rf"(?<!\w){re.escape(term)}\w*"
-    elif mode == "pattern":
-        pattern = term
-    else:
-        raise ProfileCompileError(f"rule '{term}': unknown match mode '{mode}'")
     try:
-        regex = re.compile(pattern, re.IGNORECASE | re.UNICODE)
-    except re.error as exc:
-        raise ProfileCompileError(f"rule '{term}': invalid regular expression ({exc})") from exc
-    return CompiledRule(kind, regex, reason, source)
+        return compile_rule(kind, term, mode, reason, source)
+    except ValueError as exc:
+        raise ProfileCompileError(f"rule '{term}': {exc}") from exc
 
 
 def _expand(snapshot: ProfileSnapshot, warnings: List[str]) -> List[SearchQuery]:
@@ -210,8 +205,14 @@ def compile_profile(
             f"interval of {scrape_interval_hours:g} h"
         )
 
-    rules = tuple(_compile_rule(r.kind, r.term, r.match_mode, r.reason, r.source) for r in snapshot.rules)
     f = snapshot.fields
+    languages: List[str] = []
+    for market in snapshot.markets:
+        if market.enabled:
+            languages.extend(x.lower() for x in market.languages)
+    rules = tuple(
+        _compile_rule(r.kind, r.term, r.match_mode, r.reason, r.source) for r in snapshot.rules
+    ) + seniority_rules(f.target_level, languages)
     return CompiledProfile(
         version=snapshot.version,
         queries=final,

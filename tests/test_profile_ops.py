@@ -768,3 +768,24 @@ def test_starter_profile_with_invalid_thresholds_falls_back_with_a_note(store: P
     assert snap is not None
     assert (snap.fields.wow_threshold, snap.fields.digest_threshold) == (8.5, 6.5)
     assert any("8.5" in w and "6.5" in w for w in result.warnings)
+
+
+def test_target_level_must_be_known(started: ProfileStore):
+    with pytest.raises(ProfileValidationError) as exc:
+        apply_changes(started, [SetField("target_level", "boss")], label="x")
+    assert "target_level" in _messages(exc)
+    apply_changes(started, [SetField("target_level", "senior")], label="x")
+    apply_changes(started, [SetField("target_level", None)], label="x")
+
+
+def test_names_reject_semicolon_and_equals(started: ProfileStore):
+    with pytest.raises(ProfileValidationError) as exc:
+        apply_changes(started, [AddRole("a;b")], label="x")
+    assert "a;b" in _messages(exc)
+    apply_changes(started, [AddRole("<ROLE>")], label="x")
+    with pytest.raises(ProfileValidationError) as exc:
+        apply_changes(started, [AddRoleTerm("<ROLE>", "x=y")], label="x")
+    assert "x=y" in _messages(exc)
+    with pytest.raises(ProfileValidationError) as exc:
+        apply_changes(started, [AddMarket(_market(name="m;n"))], label="x")
+    assert "m;n" in _messages(exc)

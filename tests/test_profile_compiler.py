@@ -323,3 +323,26 @@ def test_compiled_boards_respect_country_support_invariants():
     # Poland has no Glassdoor support, so only Indeed is sent for it.
     poland = [q for q in compiled.queries if q.country_code == "poland" and q.query_id != "Q-PIN"]
     assert poland and all(q.site_names == ["indeed"] for q in poland)
+
+
+def test_compiled_rules_carry_keys_and_level_terms():
+    snap = _snap(
+        fields=ProfileFields(target_level="mid"),
+        rules=(Rule("block", "Developer", "exact", "r", "user"), Rule("block", "x", "pattern", "R", "seed")),
+        markets=(_usa_market(languages=("en",)),),
+    )
+    rules = compile_profile(snap).rules
+    assert [r.key for r in rules[:2]] == ["block:exact:developer", "seed:block:R"]
+    level = [r for r in rules[2:]]
+    assert level and all(r.key.startswith("level:") and r.kind == "seniority" for r in level)
+    assert not [r for r in compile_profile(_snap()).rules if r.source == "level"]
+
+
+def test_parse_expanded_query_id_roundtrip():
+    parse = compiler.parse_expanded_query_id
+    assert parse(expanded_query_id("r", "t", "m")) == {"role": "r", "term": "t", "market": "m"}
+    assert parse(expanded_query_id("r", "t", "m", "usa")) == {
+        "role": "r", "term": "t", "market": "m", "country": "usa",
+    }
+    assert parse("Q-EU-REM") is None
+    assert parse("role=r") is None
