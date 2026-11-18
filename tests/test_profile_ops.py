@@ -666,3 +666,51 @@ def test_module_exposes_operation_union():
         "RemoveMarket", "AddPinnedQuery", "RemovePinnedQuery", "SetEnabled", "AddRule",
         "RemoveRule", "ReplaceProfile",
     }
+
+
+# --- review fixes ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["wow_threshold", "digest_threshold", "bonus_points"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_numbers_are_validation_errors(started: ProfileStore, name, value):
+    with pytest.raises(ProfileValidationError):
+        apply_changes(started, [SetField(name, value)], label="x")
+
+    assert started.read_snapshot().version == 1  # type: ignore[union-attr]
+
+
+def test_threshold_problems_reject_non_finite():
+    assert ops.threshold_problems(float("nan"), 6.5)
+    assert ops.threshold_problems(8.5, float("nan"))
+    assert ops.threshold_problems(float("inf"), 6.5)
+
+
+def test_rule_reason_is_capped(started: ProfileStore):
+    ok = Rule("block", "abc", "exact", "r" * 60, "user")
+    apply_changes(started, [AddRule(ok)], label="x")
+    with pytest.raises(ProfileValidationError):
+        apply_changes(started, [AddRule(Rule("block", "abd", "exact", "r" * 61, "user"))], label="x")
+
+
+@pytest.mark.parametrize("term", ["a\nb", "ab\rc", "a\tb", "ab\x00c", "ab\x1bc"])
+@pytest.mark.parametrize("mode", ["exact", "prefix"])
+def test_rule_terms_reject_control_characters(started: ProfileStore, term, mode):
+    with pytest.raises(ProfileValidationError):
+        apply_changes(started, [AddRule(Rule("block", term, mode, "r", "user"))], label="x")
+
+
+def test_pinned_query_ids_unique_case_insensitively(started: ProfileStore):
+    apply_changes(started, [AddPinnedQuery(_pinned(query_id="Q-A"))], label="x")
+    with pytest.raises(ProfileValidationError):
+        apply_changes(started, [AddPinnedQuery(_pinned(query_id="q-a"))], label="x")
+
+
+def test_restore_only_maps_a_missing_version_to_a_validation_error(started: ProfileStore, monkeypatch):
+    def broken(*args, **kwargs):
+        raise KeyError("unrelated")
+
+    monkeypatch.setattr(ops, "apply_changes", broken)
+
+    with pytest.raises(KeyError):
+        restore(started, 1)

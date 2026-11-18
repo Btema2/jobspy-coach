@@ -572,3 +572,84 @@ def test_load_profile_yaml_errors_are_validation_errors(tmp_path: Path, text):
 def test_load_profile_yaml_missing_file(tmp_path: Path):
     with pytest.raises(ProfileValidationError):
         load_profile_yaml(tmp_path / "nope.yaml")
+
+
+# --- review fixes ------------------------------------------------------------------------------
+
+
+def test_yaml_nan_and_inf_are_validation_errors_and_nothing_is_written(
+    store: ProfileStore, legacy_dir: Path, tmp_path: Path
+):
+    import yaml
+
+    snap = _full_snapshot(store, legacy_dir)
+    for literal in (".nan", ".inf"):
+        data = snapshot_to_dict(snap)
+        text = yaml.safe_dump(data, sort_keys=False).replace(
+            "wow_threshold: 8.5", f"wow_threshold: {literal}"
+        )
+        path = tmp_path / f"bad{literal}.yaml"
+        path.write_text(text, encoding="utf-8")
+
+        with pytest.raises(ProfileValidationError):
+            apply_changes(store, [ReplaceProfile(load_profile_yaml(path))], label="y", expected_version=1)
+
+    assert [v.version for v in store.list_versions()] == [1]
+
+
+def test_empty_country_code_is_treated_as_absent(tmp_path: Path):
+    path = _write(tmp_path, [{**_GOOD, "country_code": ""}])
+
+    (query,) = parse_queries_json(path)
+
+    assert query.country is None
+
+
+def test_export_refuses_symlink_target(store: ProfileStore, legacy_dir: Path, tmp_path: Path):
+    _full_snapshot(store, legacy_dir)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep", encoding="utf-8")
+    link = tmp_path / "link.yaml"
+    link.symlink_to(victim)
+
+    with pytest.raises(ExportRefused):
+        export_profile(store, link, force=True)
+
+    assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_export_never_leaves_a_wide_mode_file_even_while_writing(
+    store: ProfileStore, legacy_dir: Path, tmp_path: Path, monkeypatch
+):
+    _full_snapshot(store, legacy_dir)
+    target = tmp_path / "wide.yaml"
+    target.write_text("old", encoding="utf-8")
+    os.chmod(target, 0o644)
+    seen = []
+    real_fdopen = os.fdopen
+
+    def spying_fdopen(fd, *args, **kwargs):
+        seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", spying_fdopen)
+
+    export_profile(store, target)
+
+    assert seen == [0o600]
+
+
+@needs_git
+def test_export_refuses_tracked_path_without_force(store: ProfileStore, legacy_dir: Path, tmp_path: Path):
+    _full_snapshot(store, legacy_dir)
+    repo = tmp_path / "repo3"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    target = repo / "tracked.yaml"
+    target.write_text("old", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.yaml"], check=True)
+
+    with pytest.raises(ExportRefused):
+        export_profile(store, target)
+
+    assert target.read_text(encoding="utf-8") == "old"

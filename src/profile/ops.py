@@ -7,6 +7,7 @@ normalises text that has one obvious canonical form (case and surrounding spaces
 and board names) before validating, so a value such as ``"USA "`` is stored as ``"usa"`` while a typo such
 as ``"polnad"`` is rejected instead of silently losing the country-bound boards.
 """
+import math
 import re
 from dataclasses import dataclass, field, fields as dc_fields, replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar, Union
@@ -42,6 +43,7 @@ MAX_NAME_CHARS = 80
 MIN_ROLE_TERM_CHARS = 2
 MIN_RULE_TERM_CHARS = 3
 MAX_RULE_TERM_CHARS = 60
+MAX_RULE_REASON_CHARS = 60
 MAX_RULES = 500
 MAX_BONUS_POINTS = 5.0
 MIN_DIGEST_EXCLUSIVE = 3.0
@@ -56,6 +58,7 @@ _LONG_TEXT_FIELDS = frozenset(
     {"persona", "core_role_definition", "adjacent_role_definition", "dealbreakers", "bonus_criteria"}
 )
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SEED_BY_KEY = {(s.kind, s.pattern, s.reason) for s in SEED_RULES}
 
 
@@ -314,7 +317,9 @@ def _normalise(snap: ProfileSnapshot) -> ProfileSnapshot:
 
 
 def threshold_problems(wow: float, digest: float) -> List[str]:
-    """Violations of ``3.0 < digest <= wow - 0.1`` and ``wow <= 10``."""
+    """Violations of ``3.0 < digest <= wow - 0.1`` and ``wow <= 10`` (NaN and infinity are rejected)."""
+    if not (math.isfinite(wow) and math.isfinite(digest)):
+        return ["wow_threshold and digest_threshold must be finite numbers"]
     problems: List[str] = []
     if wow > MAX_WOW:
         problems.append(f"wow_threshold {wow:g} is above the maximum of {MAX_WOW:g}")
@@ -344,7 +349,7 @@ def _validate_fields(f: ProfileFields, problems: List[str]) -> None:
         if value is not None and len(value) > MAX_TEXT_CHARS:
             problems.append(f"{name} is {len(value)} characters; the limit is {MAX_TEXT_CHARS}")
     problems.extend(threshold_problems(f.wow_threshold, f.digest_threshold))
-    if not 0 <= f.bonus_points <= MAX_BONUS_POINTS:
+    if not (math.isfinite(f.bonus_points) and 0 <= f.bonus_points <= MAX_BONUS_POINTS):
         problems.append(f"bonus_points {f.bonus_points:g} must be between 0 and {MAX_BONUS_POINTS:g}")
     if f.max_calls_per_cycle < 1:
         problems.append(f"max_calls_per_cycle {f.max_calls_per_cycle} must be at least 1")
@@ -394,9 +399,9 @@ def _validate_pinned(snap: ProfileSnapshot, problems: List[str]) -> None:
         label = f"pinned query '{q.query_id}'"
         if not q.query_id.strip():
             problems.append("pinned query: query_id must not be empty")
-        elif q.query_id in seen:
+        elif q.query_id.casefold() in seen:
             problems.append(f"{label}: duplicate query_id")
-        seen.add(q.query_id)
+        seen.add(q.query_id.casefold())
         if not q.term.strip():
             problems.append(f"{label}: term must not be empty")
         if not q.boards:
@@ -420,10 +425,14 @@ def _validate_rules(snap: ProfileSnapshot, problems: List[str]) -> None:
             problems.append(f"{label}: unknown match mode '{r.match_mode}'")
         if r.source not in RULE_SOURCES:
             problems.append(f"{label}: unknown source '{r.source}'")
+        if len(r.reason) > MAX_RULE_REASON_CHARS:
+            problems.append(f"{label}: reason is {len(r.reason)} characters; the limit is {MAX_RULE_REASON_CHARS}")
         if r.match_mode == "pattern":
             if r.source != "seed" or (r.kind, r.term, r.reason) not in _SEED_BY_KEY:
                 problems.append(f"{label}: pattern rules are only allowed as an unchanged legacy seed entry")
         elif r.match_mode in ("exact", "prefix"):
+            if _CONTROL_RE.search(r.term):
+                problems.append(f"{label}: term must not contain control characters or line breaks")
             if not MIN_RULE_TERM_CHARS <= len(r.term.strip()) <= MAX_RULE_TERM_CHARS or r.term != r.term.strip():
                 problems.append(
                     f"{label}: term must be {MIN_RULE_TERM_CHARS}-{MAX_RULE_TERM_CHARS} characters "
@@ -623,11 +632,14 @@ def restore(store: ProfileStore, version: int) -> ApplyResult:
     try:
         if current is None:
             raise KeyError(version)
-        return _restore_version(store, current.version, version, f"restore v{version}")
+        snapshot = store.load_version(version)
     except KeyError:
         raise ProfileValidationError(
             f"version {version} is not among the last {KEEP_VERSIONS}"
         ) from None
+    return apply_changes(
+        store, [ReplaceProfile(snapshot)], label=f"restore v{version}", expected_version=current.version
+    )
 
 
 def create_starter_profile(

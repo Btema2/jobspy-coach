@@ -116,6 +116,8 @@ def parse_queries_json(path: Path) -> Tuple[PinnedQuery, ...]:
         country = item.get("country_code")
         if country is not None and not isinstance(country, str):
             raise _entry_error(path, i, "'country_code' must be text or null")
+        if country is not None and not country.strip():
+            country = None  # the scraper treats an empty country code as absent
         is_remote = item.get("is_remote", False)
         if not isinstance(is_remote, bool):
             raise _entry_error(path, i, "'is_remote' must be true or false")
@@ -252,7 +254,12 @@ def _existing_ancestor(path: Path) -> Path:
 
 
 def _is_unignored_in_git(path: Path) -> bool:
-    """True only when git says the path is inside a work tree and not ignored (exit code 1)."""
+    """True only when git says the path is inside a work tree and not ignored (exit code 1).
+
+    Deliberately fails open when git is missing, times out or reports anything else (including 128,
+    "not a work tree"): without git there is no checkout this guard could protect, and the brief allows
+    exit codes 0 and 128. A user with a checkout but no git binary can still export into the repo.
+    """
     try:
         proc = subprocess.run(
             ["git", "-C", str(_existing_ancestor(path.parent)), "check-ignore", "-q", str(path)],
@@ -276,12 +283,21 @@ def export_profile(store: ProfileStore, path: Path, *, force: bool = False) -> P
             f"{path} is inside a git work tree and not git-ignored; the export contains private "
             "profile data. Use a git-ignored path (for example under local/) or --force."
         )
+    if target.is_symlink():
+        raise ExportRefused(f"{path} is a symbolic link; refusing to write the export through it.")
     target.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(snapshot_to_dict(snapshot), sort_keys=False, allow_unicode=True)
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_NOFOLLOW guards against a link created after the check; fchmod before writing means a
+    # pre-existing wider-mode file never holds the private data.
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+    except BaseException:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
-    os.chmod(target, 0o600)
     return Path(path)
 
 
