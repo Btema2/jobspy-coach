@@ -6,6 +6,7 @@ reply never exceeds Telegram's limit. ``/setup``, ``/stats`` and ``/test`` are p
 and probe modules (see ``_register_features``) through ``register`` / ``register_callback`` /
 ``set_text_handler``.
 """
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.bot.client import TelegramBotClient
 from src.bot.countries import resolve_country
-from src.bot.render import chunk_html, esc, paginate, render_apply
+from src.bot.render import PAGE_SIZE, chunk_html, esc, paginate, render_apply
 from src.bot.updates import OutgoingMessage, Update
 from src.config import Settings
 from src.profile.backtest import backtest_snapshots, render_backtest
@@ -44,6 +45,8 @@ from src.profile.requeue import rebucket_evaluated, requeue_prefiltered
 from src.profile.snapshot import Market, ProfileSnapshot, Role, RoleTerm, Rule
 from src.profile.store import ProfileStore
 from src.storage.db import Database
+
+logger = logging.getLogger(__name__)
 
 TRIGGER_STARTED = "started"
 TRIGGER_BUSY = "running"
@@ -128,6 +131,8 @@ def _page_arg(args: str) -> Optional[int]:
 def _paged(command: str, lines: Sequence[str], page: int, tail: Sequence[str] = ()) -> str:
     shown, page, pages = paginate(lines, page)
     out = list(shown)
+    while out and not out[-1]:  # padding that keeps a group header off the end of a page
+        out.pop()
     out.extend(tail if page == pages else ())
     if pages > 1:
         footer = f"page {page}/{pages}"
@@ -334,6 +339,8 @@ class CommandRouter:
         for kind in kinds:
             rules = [r for r in snapshot.rules if r.kind == kind and r.source != "seed"]
             if rules:
+                if len(lines) % PAGE_SIZE == PAGE_SIZE - 1:
+                    lines.append("")  # a header alone at the end of a page moves to the next one
                 lines.append(f"<b>{esc(kind)}:</b>")
                 lines.extend(f"  {esc(r.term)} ({esc(r.match_mode)})" for r in rules)
         seeds = sum(1 for r in snapshot.rules if r.source == "seed")
@@ -476,9 +483,13 @@ class CommandRouter:
     def _resume(self, update: Update) -> List[OutgoingMessage]:
         snapshot = self._snapshot()
         if snapshot is not None and not snapshot.fields.paused:
-            return _reply("Scraping is not paused.")
+            return _reply("Scraping is not paused. Send /run_now to start a cycle.")
         result = self._apply([SetField("paused", False)], "resume")
-        outcome = self._ctx.trigger_cycle()
+        try:
+            outcome = self._ctx.trigger_cycle()
+        except Exception as exc:  # the profile is already changed: the reply must still be sent
+            logger.warning("trigger_cycle failed: %s", type(exc).__name__)
+            outcome = TRIGGER_NOT_READY
         if outcome == TRIGGER_STARTED:
             note = "A cycle starts now."
         elif outcome == TRIGGER_BUSY:

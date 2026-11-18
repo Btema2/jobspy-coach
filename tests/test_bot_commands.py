@@ -1,5 +1,6 @@
 """CommandRouter: read, change and safety commands through ops (no network, no real .env)."""
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import List
 
@@ -130,7 +131,7 @@ def test_add_role_with_synonyms_bumps_version_and_shows_diff(router, store):
     versions = len(store.list_versions())
     reply = send(router, "/add_role Career Coach = life coach, mentor")
     assert version(store) == before + 1
-    assert len(store.list_versions()) == versions + 1 or versions == 10
+    assert len(store.list_versions()) == versions + 1
     assert "+ role Career Coach" in reply
     assert "+ term life coach" in reply
     assert "+ term mentor" in reply
@@ -232,6 +233,9 @@ def test_exclude_exact_and_usage(router, store):
     send(router, "/exclude intern")
     rule = [r for r in store.read_snapshot().rules if r.source == "user"][0]
     assert rule.match_mode == "exact"
+    send(router, "/exclude prefix")  # a lone "prefix" is the term, not the mode flag
+    terms = {(r.term, r.match_mode) for r in store.read_snapshot().rules if r.source == "user"}
+    assert ("prefix", "exact") in terms
     assert "Usage: /exclude" in send(router, "/exclude")
 
 
@@ -254,7 +258,9 @@ def test_threshold_comma_decimal_and_invariant_error(router, store):
     assert store.read_snapshot().fields.digest_threshold == 7.0
 
 
-@pytest.mark.parametrize("args", ["", "wow", "wow abc", "other 7", "wow 7 8", "wow nan", "digest inf"])
+@pytest.mark.parametrize(
+    "args", ["", "wow", "wow abc", "other 7", "wow 7 8", "wow nan", "digest inf", "wow 11", "wow -1", "digest 3"]
+)
 def test_threshold_usage_or_rejection(router, store, args):
     before = version(store)
     reply = send(router, f"/threshold {args}".strip())
@@ -270,8 +276,22 @@ def test_pause_resume_triggers_cycle(router, store, control):
     reply = send(router, "/resume")
     assert "paused: True -&gt; False" in reply and "A cycle starts now." in reply
     assert control.trigger_calls == 1
-    assert "not paused" in send(router, "/resume")
+    assert send(router, "/resume") == "Scraping is not paused. Send /run_now to start a cycle."
     assert control.trigger_calls == 1
+
+
+def test_resume_keeps_the_reply_when_the_trigger_raises(router, store, control):
+    send(router, "/pause")
+
+    def boom():
+        raise RuntimeError("scheduler gone")
+
+    control.trigger = boom  # type: ignore[assignment]
+    router._ctx.trigger_cycle = boom
+    reply = send(router, "/resume")
+    assert "paused: True -&gt; False" in reply
+    assert "Scraping resumes at the next scheduled cycle." in reply
+    assert not store.read_snapshot().fields.paused
 
 
 @pytest.mark.parametrize(
@@ -347,6 +367,11 @@ def test_history_and_restore(router, store):
     assert "not among the last 10" in send(router, "/restore 999")
     assert "Usage: /restore" in send(router, "/restore")
     assert "Usage: /restore" in send(router, "/restore x")
+    for bad in ("0", "-3"):
+        before = version(store)
+        reply = send(router, f"/restore {bad}")
+        assert reply.startswith(("Usage: /restore", "Not applied")), bad
+        assert version(store) == before
 
 
 def test_requeue_refused_while_cycle_running(router, db, control):
@@ -375,6 +400,21 @@ def test_requeue_and_thresholds_report_counts(router, db):
     reply = send(router, "/requeue thresholds")
     assert "checked: 0, changed: 0, skipped (missing stored fields): 0, to digest: 0, to dismissed: 0, too old: 0" in reply
     assert "Usage: /requeue" in send(router, "/requeue bogus")
+
+
+def test_requeue_thresholds_reports_a_non_zero_rebucket(router, db, store):
+    job_id, _ = db.save_job(_job(1, "<b>Scored</b>", eval_status="evaluated", eval_score=5.0,
+                                 notification_status="dismissed"))
+    with db._get_connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET eval_raw_score = 7.0, eval_is_core_role = 1, eval_bonus_flag = 0, "
+            "eval_hard_reject = 0 WHERE id = ?",
+            (job_id,),
+        )
+    reply = send(router, "/requeue thresholds")
+    assert "checked: 1, changed: 1, skipped (missing stored fields): 0, to digest: 1, to dismissed: 0" in reply
+    assert "  - &lt;b&gt;Scored&lt;/b&gt;" in reply and "<b>" not in reply
+    assert db.get_job_by_id(job_id).notification_status == "pending"
 
 
 def test_requeue_samples_are_escaped_and_capped(router, db):
@@ -486,6 +526,32 @@ def test_user_terms_escaped_everywhere(router, store):
     assert "&lt;b&gt;&amp; R&amp;D" in send(router, "/roles")
     assert "&lt;i&gt;&amp;amp;x&lt;/i&gt;" in send(router, "/exclusions")
     assert "&lt;b&gt;" in send(router, "/profile")
+
+
+def test_exclusions_header_is_never_orphaned_at_a_page_end(router, store):
+    block = [AddRule(Rule("block", f"term{n:02d}", "exact", USER_RULE_REASON, "user")) for n in range(28)]
+    soft = [AddRule(Rule("soft", f"soft{n:02d}", "exact", "SOFT", "user")) for n in range(3)]
+    apply_changes(store, block + soft, label="rules")
+    first = send(router, "/exclusions").splitlines()
+    assert first[0] == "<b>block:</b>"
+    body = [line for line in first if not line.startswith("page ")]
+    assert not body[-1].startswith("<b>")
+    second = send(router, "/exclusions 2").splitlines()
+    assert second[0] == "<b>soft:</b>"
+    assert second.count("<b>soft:</b>") == 1
+
+
+def test_long_emoji_term_in_storage_is_chunked_through_roles(router, store, db):
+    snapshot = store.read_snapshot()
+    huge = RoleTerm("<b>& R&D \U0001F600" * 400, None)  # about 5,000 characters, bypassing ops limits
+    role = replace(snapshot.roles[0], terms=snapshot.roles[0].terms + (huge,))
+    store.write_snapshot(replace(snapshot, roles=(role,)), expected_version=snapshot.version, label="huge")
+    messages = router.handle(parse_update(message_update(1, "/roles")))
+    assert len(messages) >= 2
+    for message in messages:
+        assert utf16_len(message.text) <= 3800
+        assert "<b>" not in message.text
+        assert not re.search(r"&[#\w]*$", message.text)
 
 
 def test_long_output_is_chunked_within_limits(router, store):
