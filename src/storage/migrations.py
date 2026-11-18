@@ -148,10 +148,30 @@ def _migration_3_rules_and_rubric(conn: sqlite3.Connection) -> None:
             conn.execute(f"UPDATE profile SET {field} = ? WHERE {field} = ?", (new, old))
 
 
+def _migration_4_bot_core(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            update_offset INTEGER NOT NULL DEFAULT 0,
+            paired_user_id INTEGER, paired_chat_id INTEGER,
+            pairing_code_hash TEXT, pairing_expires_at REAL,
+            pairing_attempts INTEGER NOT NULL DEFAULT 0,
+            wizard_state TEXT,
+            updated_at TEXT NOT NULL)
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO bot_state (id, updated_at) VALUES (1, ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "foundations", _migration_1_foundations),
     (2, "profile_core", _migration_2_profile_core),
     (3, "rules_and_rubric", _migration_3_rules_and_rubric),
+    (4, "bot_core", _migration_4_bot_core),
 ]
 
 

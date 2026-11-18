@@ -37,7 +37,7 @@ def test_fresh_db_has_foundations_schema(tmp_path: Path):
     assert _JOBS_NEW <= _cols(db_file, "jobs")
     assert _RUNS_NEW <= _cols(db_file, "scrape_runs")
     assert {"job_id", "query_key", "first_seen", "last_seen"} <= _cols(db_file, "job_hits")
-    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 3
+    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 4
     assert _scalar(
         db_file,
         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='job_hits' "
@@ -64,7 +64,7 @@ def test_old_schema_db_keeps_rows_and_gains_schema(tmp_path: Path):
     assert job is not None and job.title == "t"
     assert _JOBS_NEW <= _cols(db_file, "jobs")
     assert _RUNS_NEW <= _cols(db_file, "scrape_runs")
-    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 3
+    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 4
     assert _scalar(db_file, "SELECT remote_status FROM jobs WHERE dedup_hash='h1'") == "unverified"
 
 
@@ -87,7 +87,7 @@ def test_init_db_is_safe_when_run_concurrently(tmp_path: Path):
         t.join(timeout=30)
 
     assert errors == []
-    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 3
+    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 4
 
 
 def test_existing_ensure_column_import_still_works():
@@ -108,10 +108,10 @@ def test_profile_tables_created(tmp_path: Path):
     assert {
         "profile", "roles", "role_terms", "markets", "pinned_queries", "rules", "profile_versions",
     } <= tables
-    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 3
+    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 4
 
 
-def test_bot_tables_not_created(tmp_path: Path):
+def test_migration_4_creates_no_branch5_tables(tmp_path: Path):
     db_file = tmp_path / "nobot.db"
     Database(db_file).init_db()
 
@@ -120,7 +120,30 @@ def test_bot_tables_not_created(tmp_path: Path):
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         conn.close()
-    assert not ({"pending_change", "conversation", "bot_state", "llm_consent"} & tables)
+    assert "bot_state" in tables
+    assert not ({"pending_change", "conversation", "llm_consent"} & tables)
+
+
+def test_migration_4_creates_bot_state_single_row(tmp_path: Path):
+    db_file = tmp_path / "m4.db"
+    Database(db_file).init_db()
+
+    assert _scalar(db_file, "SELECT name FROM schema_version WHERE version = 4") == "bot_core"
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM bot_state").fetchone()
+        assert row["id"] == 1 and row["update_offset"] == 0 and row["pairing_attempts"] == 0
+        assert row["paired_user_id"] is None and row["paired_chat_id"] is None
+        assert row["pairing_code_hash"] is None and row["pairing_expires_at"] is None
+        assert row["wizard_state"] is None
+        assert apply_migrations(conn) == 4
+        conn.execute("DELETE FROM schema_version WHERE version = 4")
+        assert apply_migrations(conn) == 4
+        conn.commit()
+    finally:
+        conn.close()
+    assert _scalar(db_file, "SELECT COUNT(*) FROM bot_state") == 1
 
 
 def test_migration_3_adds_pre_filter_rule_column(tmp_path: Path):
@@ -152,7 +175,7 @@ def test_migration_3_rewrites_only_unedited_seed_text(tmp_path: Path):
     conn.execute("DELETE FROM schema_version WHERE version = 3")
     conn.commit()
 
-    assert apply_migrations(conn) == 3
+    assert apply_migrations(conn) == 4
     conn.commit()
     row = conn.execute(
         "SELECT version, core_role_definition, adjacent_role_definition, dealbreakers FROM profile"

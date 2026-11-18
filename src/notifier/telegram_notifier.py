@@ -108,8 +108,8 @@ class TelegramNotifier:
                 logger.error(f"Failed to send Telegram notification: {type(e).__name__}: {redact_secrets(str(e))}")
                 return False
 
-    def send_wow_alert(self, job: JobPosting) -> bool:
-        text, markup = format_wow_alert(job)
+    def send_wow_alert(self, job: JobPosting, lang: Optional[str] = None) -> bool:
+        text, markup = format_wow_alert(job, lang=lang)
         return self.send_message(text, reply_markup=markup)
 
     def send_daily_digest(
@@ -117,11 +117,12 @@ class TelegramNotifier:
         jobs: List[JobPosting],
         date_str: str,
         update_notice: Optional[str] = None,
+        lang: Optional[str] = None,
     ) -> int:
         if not jobs:
             return 0
 
-        chunks = format_digest_chunks(jobs, date_str=date_str, update_notice=update_notice)
+        chunks = format_digest_chunks(jobs, date_str=date_str, update_notice=update_notice, lang=lang)
         sent_count = 0
         for chunk in chunks:
             if self.send_message(chunk):

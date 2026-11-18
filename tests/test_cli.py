@@ -269,3 +269,32 @@ def test_cli_stats_without_profile_uses_env_threshold(monkeypatch):
     monkeypatch.setenv("DIGEST_SCORE_THRESHOLD", "6.8")
 
     assert _stats_threshold(monkeypatch) == 6.8
+
+
+def test_cli_test_telegram_uses_profile_language(monkeypatch, isolate_cli_test_db):
+    from src.i18n import t
+    from src.profile.ops import ReplaceProfile, apply_changes
+    from src.profile.snapshot import ProfileFields, ProfileSnapshot
+    from src.profile.store import ProfileStore
+    from src.storage.db import Database
+
+    sent = []
+
+    def fake_send(self, text, reply_markup=None):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr("src.notifier.telegram_notifier.TelegramNotifier.send_message", fake_send)
+
+    assert runner.invoke(app, ["test-telegram"]).exit_code == 0
+    assert sent[-1] == t("test_telegram", None)
+    assert sent[-1] == "👋 <b>JobSpy Coach Daemon</b> | Підключення успішне! Тестове сповіщення доставлено."
+
+    db = Database(isolate_cli_test_db)
+    db.init_db()
+    snapshot = ProfileSnapshot(ProfileFields(paused=True, output_language="en"))
+    apply_changes(ProfileStore(db), [ReplaceProfile(snapshot)], label="test", expected_version=0)
+
+    assert runner.invoke(app, ["test-telegram"]).exit_code == 0
+    assert sent[-1] == t("test_telegram", "en")
+    assert sent[-1] != sent[0]

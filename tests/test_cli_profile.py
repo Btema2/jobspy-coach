@@ -515,7 +515,7 @@ def test_requeue_dry_run_reports_an_outdated_schema(isolated):
 
     runner.invoke(app, ["init"])
     conn = sqlite3.connect(isolated)
-    conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.execute("DELETE FROM schema_version WHERE version >= 3")
     conn.commit()
     conn.close()
 

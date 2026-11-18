@@ -62,6 +62,11 @@ def test_role_market_expansion():
     assert len(compiled.queries) == 2
 
 
+def test_compiled_profile_carries_output_language():
+    assert compile_profile(_snap()).output_language is None
+    assert compile_profile(_snap(fields=ProfileFields(output_language="en"))).output_language == "en"
+
+
 def test_expanded_query_id_format():
     assert expanded_query_id("r", "t", "m") == "role=r;term=t;market=m"
     assert expanded_query_id("r", "t", "m", "usa") == "role=r;term=t;market=m;country=usa"

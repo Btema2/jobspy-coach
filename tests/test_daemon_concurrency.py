@@ -150,7 +150,7 @@ def test_only_caller_thread_touches_db_and_telegram(tmp_path):
         touched.append(threading.get_ident())
         return real_mark(*args, **kwargs)
 
-    def alert(job):
+    def alert(job, lang=None):
         touched.append(threading.get_ident())
         return True
 

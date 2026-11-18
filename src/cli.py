@@ -10,6 +10,7 @@ from rich.table import Table
 
 from src.config import get_settings
 from src.evaluator.errors import ConfigurationError
+from src.i18n import t
 from src.logging_config import configure_logging
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.profile.backtest import backtest_snapshots, render_backtest
@@ -365,11 +366,22 @@ def digest(
     console.print(f"[bold green]Digest completed. Processed {count} jobs.[/bold green]")
 
 
+def _stored_output_language(settings) -> Optional[str]:
+    """The stored profile's ``output_language``; None when there is no profile or it cannot be read."""
+    try:
+        db = Database(settings.db_path)
+        db.init_db()
+        snapshot = ProfileStore(db).read_snapshot()
+    except (ProfileError, sqlite3.Error):
+        return None
+    return snapshot.fields.output_language if snapshot is not None else None
+
+
 @app.command(name="test-telegram")
 def test_telegram():
     """Send an authentication and connectivity test message to Telegram."""
     settings = get_settings()
-    msg = "👋 <b>JobSpy Coach Daemon</b> | Підключення успішне! Тестове сповіщення доставлено."
+    msg = t("test_telegram", _stored_output_language(settings))
     with TelegramNotifier(token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id) as notifier:
         success = notifier.send_message(msg)
     if success:

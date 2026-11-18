@@ -441,7 +441,9 @@ class DaemonService:
                     job.eval_languages = eval_res.language_requirements
                     job.eval_pros = eval_res.pros
                     job.eval_cons = eval_res.cons
-                    sent = self.notifier.send_wow_alert(job)
+                    sent = self.notifier.send_wow_alert(
+                        job, lang=profile.output_language if profile else None
+                    )
                     if sent:
                         self.db.mark_instant_sent(job.id)
                         wow_sent += 1
@@ -692,6 +694,7 @@ class DaemonService:
                 )
 
         profile = self.current_profile(alert=False)[0]
+        lang = profile.output_language if profile else None
         digest_threshold = (
             profile.scoring.digest_threshold if profile is not None else self.settings.digest_score_threshold
         )
@@ -712,11 +715,13 @@ class DaemonService:
         try:
             version_info = check_jobspy_update()
             if version_info and version_info.has_update:
-                update_notice = format_version_update_notice(version_info)
+                update_notice = format_version_update_notice(version_info, lang=lang)
         except Exception as e:
             logger.debug("Failed checking JobSpy update for daily digest: %s", e)
 
-        sent_count = self.notifier.send_daily_digest(pending, date_str=date_str, update_notice=update_notice)
+        sent_count = self.notifier.send_daily_digest(
+            pending, date_str=date_str, update_notice=update_notice, lang=lang
+        )
         if sent_count > 0:
             self.db.mark_digest_sent([j.id for j in pending if j.id is not None])
         return len(pending)

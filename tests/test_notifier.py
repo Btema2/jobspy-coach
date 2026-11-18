@@ -1,4 +1,7 @@
 import html
+import json
+import re
+from pathlib import Path
 from unittest.mock import MagicMock
 import httpx
 import pytest
@@ -480,7 +483,7 @@ def test_send_daily_digest_forwards_update_notice(monkeypatch):
     count = notifier.send_daily_digest([job], date_str="22.10.2026", update_notice=notice)
 
     assert count == 2
-    mock_format.assert_called_once_with([job], date_str="22.10.2026", update_notice=notice)
+    mock_format.assert_called_once_with([job], date_str="22.10.2026", update_notice=notice, lang=None)
     notifier.close()
 
 
@@ -521,3 +524,81 @@ def test_notifier_connect_error_logged_redacted_but_diagnosable(caplog):
     assert fake_token not in own
     assert "Name or service not known" in own
     assert "bot<redacted>" in own
+
+
+# --- i18n: unset output_language keeps today's strings byte-identical ----------------------------
+
+LEGACY_FIXTURE = Path(__file__).parent / "fixtures" / "legacy_alert_strings.json"
+
+
+def _legacy_jobs(count: int):
+    return [
+        JobPosting(
+            dedup_hash=f"legacy_{i}",
+            site="indeed",
+            job_url=f"https://example.com/job/{i}?a=1&b=2",
+            title=f"<ROLE> {i} & Partner",
+            company=f"Company {i} <PL>",
+            location="<MARKET>",
+            description="Long description",
+            eval_score=8.0 - (i % 10) * 0.1,
+            eval_summary_uk="Опис ролі та ключові обов'язки. " * 3,
+            eval_reasoning="Reasoning & detail",
+            eval_languages=["English", "Polish"],
+            salary_min=1000.0 + i,
+            salary_max=2000.0 if i % 2 else None,
+            salary_currency="PLN",
+        )
+        for i in range(count)
+    ]
+
+
+def legacy_alert_strings(**kwargs):
+    """Every alert/digest/update string for fixed inputs; ``kwargs`` (e.g. lang=) go to each formatter."""
+    notice = format_version_update_notice(VersionCheckResult(True, "1.4.0", "1.5.0"), **kwargs)
+    jobs_wow = _legacy_jobs(4)
+    jobs_wow[0].salary_min, jobs_wow[0].salary_max = None, None
+    jobs_wow[1].salary_min, jobs_wow[1].salary_max = None, 3000.0
+    jobs_wow[2].salary_min, jobs_wow[2].salary_max = 1500.0, 2500.5
+    jobs_wow[3].eval_summary_uk, jobs_wow[3].eval_reasoning, jobs_wow[3].eval_languages = None, None, []
+    jobs_wow[3].eval_score = None
+    wow = []
+    for j in jobs_wow:
+        text, markup = format_wow_alert(j, **kwargs)
+        wow.append({"text": text, "markup": markup})
+    return {
+        "wow": wow,
+        "update_notice": notice,
+        "digest_1": format_digest_chunks(_legacy_jobs(1), "15.10.2026", update_notice=notice, **kwargs),
+        "digest_40": format_digest_chunks(_legacy_jobs(40), "15.10.2026", update_notice=notice, **kwargs),
+        "digest_empty_notice": format_digest_chunks(_legacy_jobs(3), "15.10.2026", **kwargs),
+    }
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"lang": None}, {"lang": "uk"}])
+def test_unset_language_output_identical(kwargs):
+    golden = json.loads(LEGACY_FIXTURE.read_text(encoding="utf-8"))
+    assert legacy_alert_strings(**kwargs) == golden
+
+
+def test_english_alert_strings():
+    cyrillic = re.compile("[Ѐ-ӿ]")
+    job = _legacy_jobs(1)[0]
+    job.eval_summary_uk, job.eval_reasoning = "Role summary.", "Strong match."
+    text, markup = format_wow_alert(job, lang="en")
+    assert "WOW" in text
+    assert not cyrillic.search(text)
+    assert not cyrillic.search(json.dumps(markup, ensure_ascii=False))
+    missing = _legacy_jobs(1)[0]
+    missing.eval_summary_uk, missing.eval_reasoning = None, None
+    assert not cyrillic.search(format_wow_alert(missing, lang="en")[0])
+    notice = format_version_update_notice(VersionCheckResult(True, "1.4.0", "1.5.0"), lang="en")
+    assert not cyrillic.search(notice)
+    jobs = _legacy_jobs(40)
+    for j in jobs:
+        j.eval_summary_uk = "Summary of the role."
+    chunks = format_digest_chunks(jobs, "15.10.2026", update_notice=notice, lang="en")
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len(chunk) <= 3800
+        assert not cyrillic.search(chunk)

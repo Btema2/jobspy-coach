@@ -792,6 +792,42 @@ def test_digest_without_profile_uses_env_threshold(tmp_path):
     assert daemon.run_daily_digest_cycle(dry_run=True) == 0
 
 
+def test_alert_and_digest_pass_the_profile_language(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", lambda: None)
+    chain = RecordingChain({"Core A": 8.6, "Core B": 7.0})
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    daemon.settings = _settings()
+    daemon.notifier.send_wow_alert.return_value = True
+    daemon.notifier.send_daily_digest.return_value = 1
+    _profile(daemon, wow_threshold=8.5, digest_threshold=6.5, core_role_definition="<CORE>", output_language="en")
+    _save(daemon, 1, "Core A")
+    _save(daemon, 2, "Core B")
+
+    daemon.evaluate_unprocessed()
+    daemon.run_daily_digest_cycle()
+
+    assert daemon.notifier.send_wow_alert.call_args.kwargs == {"lang": "en"}
+    assert daemon.notifier.send_daily_digest.call_args.kwargs["lang"] == "en"
+
+
+def test_alert_and_digest_language_is_none_without_a_language(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", lambda: None)
+    chain = RecordingChain({"Core A": 8.6, "Core B": 7.0})
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    daemon.settings = _settings()
+    daemon.notifier.send_wow_alert.return_value = True
+    daemon.notifier.send_daily_digest.return_value = 1
+    _profile(daemon, wow_threshold=8.5, digest_threshold=6.5, core_role_definition="<CORE>")
+    _save(daemon, 1, "Core A")
+    _save(daemon, 2, "Core B")
+
+    daemon.evaluate_unprocessed()
+    daemon.run_daily_digest_cycle()
+
+    assert daemon.notifier.send_wow_alert.call_args.kwargs == {"lang": None}
+    assert daemon.notifier.send_daily_digest.call_args.kwargs["lang"] is None
+
+
 # --- removed catalog ----------------------------------------------------------------------------
 
 

@@ -91,6 +91,7 @@ class CompiledProfile:
     digest_threshold: float
     estimate: CallEstimate
     warnings: Tuple[str, ...]
+    output_language: Optional[str] = None
 
 
 def expanded_query_id(role: str, term: str, market: str, country: Optional[str] = None) -> str:
@@ -266,4 +267,5 @@ def compile_profile(
         digest_threshold=f.digest_threshold,
         estimate=estimate,
         warnings=tuple(warnings),
+        output_language=f.output_language,
     )
