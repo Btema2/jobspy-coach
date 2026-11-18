@@ -30,7 +30,11 @@ def load_candidate_persona() -> Optional[str]:
 
 def build_system_prompt(custom_persona: str | None = None) -> str:
     """Build the generic scoring prompt. Persona and bonus-criteria wording come only from the local profile."""
-    persona = custom_persona or load_candidate_persona() or DEFAULT_CANDIDATE_PERSONA
+    return render_system_prompt(custom_persona or load_candidate_persona() or DEFAULT_CANDIDATE_PERSONA)
+
+
+def render_system_prompt(persona: str) -> str:
+    """Pure rendering of the scoring prompt for an already resolved persona text."""
     return f"""You are an expert talent acquisition specialist and career advisor.
 Your job is to evaluate whether a scraped job vacancy is a strong match for a specific professional candidate.
 

@@ -35,7 +35,7 @@ def test_fresh_db_has_foundations_schema(tmp_path: Path):
     assert _JOBS_NEW <= _cols(db_file, "jobs")
     assert _RUNS_NEW <= _cols(db_file, "scrape_runs")
     assert {"job_id", "query_key", "first_seen", "last_seen"} <= _cols(db_file, "job_hits")
-    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 1
+    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 2
     assert _scalar(
         db_file,
         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='job_hits' "
@@ -62,7 +62,7 @@ def test_old_schema_db_keeps_rows_and_gains_schema(tmp_path: Path):
     assert job is not None and job.title == "t"
     assert _JOBS_NEW <= _cols(db_file, "jobs")
     assert _RUNS_NEW <= _cols(db_file, "scrape_runs")
-    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 1
+    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 2
     assert _scalar(db_file, "SELECT remote_status FROM jobs WHERE dedup_hash='h1'") == "unverified"
 
 
@@ -85,10 +85,37 @@ def test_init_db_is_safe_when_run_concurrently(tmp_path: Path):
         t.join(timeout=30)
 
     assert errors == []
-    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 1
+    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 2
 
 
 def test_existing_ensure_column_import_still_works():
     from src.storage.db import _ensure_column
 
     assert callable(_ensure_column)
+
+
+def test_profile_tables_created(tmp_path: Path):
+    db_file = tmp_path / "profile.db"
+    Database(db_file).init_db()
+
+    conn = sqlite3.connect(db_file)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert {
+        "profile", "roles", "role_terms", "markets", "pinned_queries", "rules", "profile_versions",
+    } <= tables
+    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 2
+
+
+def test_bot_tables_not_created(tmp_path: Path):
+    db_file = tmp_path / "nobot.db"
+    Database(db_file).init_db()
+
+    conn = sqlite3.connect(db_file)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert not ({"pending_change", "conversation", "bot_state", "llm_consent"} & tables)
