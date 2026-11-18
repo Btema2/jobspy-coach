@@ -24,7 +24,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from src.config import get_settings
 from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.errors import ConfigurationError, EvaluationRejected, ProvidersUnavailable, StopRequested
-from src.evaluator.scoring import ScoringPolicy, decide_wow
+from src.evaluator.scoring import ScoringPolicy, decide_wow, no_profile_policy
 from src.filters.rules import CompiledRule
 from src.logging_config import redact_secrets
 from src.profile.compiler import CompiledProfile, compile_profile
@@ -47,6 +47,12 @@ _MAX_STORED_ERROR_CHARS = 300
 # Default of ``evaluate_unprocessed(profile=...)``: "resolve the profile now". An explicit ``None`` means
 # "this cycle has no profile" and is never re-resolved (a profile created mid-cycle waits for the next one).
 UNSET: Any = object()
+
+
+def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
+    """A lock or busy timeout (transient), as opposed to a missing table or an I/O error."""
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 def sanitize_error_message(message: Optional[str]) -> Optional[str]:
@@ -125,6 +131,7 @@ class DaemonService:
         # The daemon only reads the profile; it never auto-imports legacy files (the CLI does).
         self.profile_store = ProfileStore(self.db)
         self._last_good: Optional[CompiledProfile] = None
+        self._rules_dropped_warned = False
         self._alerted: set = set()
         self._alert_lock = threading.Lock()
 
@@ -173,6 +180,16 @@ class DaemonService:
             return compiled
         return None
 
+    def _profile_failure(self, message: str, alert: bool) -> Tuple[Optional[CompiledProfile], str]:
+        """A profile that cannot be read or compiled: log, alert once per distinct text, use the last good one."""
+        logger.error(message)
+        if alert:
+            self._alert_once(f"compile:{message}", message)
+        if self._last_good is None:
+            self._last_good = self._rebuild_from_versions()
+        self._rearm_alerts("no_profile")  # a profile exists again, even if it does not compile
+        return self._last_good, "compile_error"
+
     def current_profile(self, alert: bool = True) -> Tuple[Optional[CompiledProfile], Optional[str]]:
         """Compile the stored profile; ``(profile, problem)`` with problem ``None``, ``no_profile``, ``compile_error`` or ``db_busy``.
 
@@ -185,19 +202,17 @@ class DaemonService:
                 return None, "no_profile"
             compiled = compile_profile(snapshot, scrape_interval_hours=self.settings.scrape_interval_hours)
         except sqlite3.OperationalError as exc:
-            # A locked or briefly unavailable database says nothing about the profile: no alert, no
-            # scraping this cycle, and evaluation keeps the last good profile.
-            logger.warning("Profile database unavailable (%s); skipping scraping this cycle.", sanitize_error_message(str(exc)))
-            return self._last_good, "db_busy"
+            if _is_busy_error(exc):
+                # A locked database says nothing about the profile: no alert, no scraping this cycle,
+                # and evaluation keeps the last good profile (and is skipped when there is none).
+                logger.warning(
+                    "Profile database unavailable (%s); skipping scraping this cycle.", sanitize_error_message(str(exc))
+                )
+                return self._last_good, "db_busy"
+            # Anything else (no such table, disk I/O error, ...) will not go away by itself: alert once.
+            return self._profile_failure(f"profile cannot be read: {sanitize_error_message(str(exc))}", alert)
         except ProfileError as exc:
-            message = f"profile cannot be compiled: {sanitize_error_message(str(exc))}"
-            logger.error(message)
-            if alert:
-                self._alert_once(f"compile:{message}", message)
-            if self._last_good is None:
-                self._last_good = self._rebuild_from_versions()
-            self._rearm_alerts("no_profile")  # a profile exists again, even if it does not compile
-            return self._last_good, "compile_error"
+            return self._profile_failure(f"profile cannot be compiled: {sanitize_error_message(str(exc))}", alert)
         self._last_good = compiled
         self._rearm_alerts("compile:")
         self._rearm_alerts("no_profile")
@@ -220,10 +235,8 @@ class DaemonService:
         """The scoring policy of a cycle: the profile's, else the ``.env`` thresholds (bonus off, legacy rules)."""
         if profile is not None:
             return profile.scoring
-        return ScoringPolicy(
-            system_prompt="",
-            wow_threshold=self.settings.wow_score_threshold,
-            digest_threshold=self.settings.digest_score_threshold,
+        return no_profile_policy(
+            "", self.settings.wow_score_threshold, self.settings.digest_score_threshold
         )
 
     def _stop_chain(self) -> None:
@@ -295,7 +308,10 @@ class DaemonService:
             return 0, 0
 
         if profile is UNSET:
-            profile = self.current_profile(alert=not dry_run)[0]
+            profile, problem = self.current_profile(alert=not dry_run)
+            if problem == "db_busy" and profile is None:
+                self._skip_evaluation_without_profile()
+                return 0, 0
         policy = self._policy(profile)
         has_profile = profile is not None
 
@@ -484,6 +500,14 @@ class DaemonService:
         # Scraper without a call plan (e.g. a test double): run every configured board.
         return [(q, site) for q in queries for site in q.site_names]
 
+    @staticmethod
+    def _skip_evaluation_without_profile() -> None:
+        # A score computed against the no-profile prompt would dismiss rows for good; the jobs stay queued.
+        logger.warning(
+            "Profile database is busy and there is no last good profile: evaluation skipped this cycle "
+            "(jobs stay unprocessed)."
+        )
+
     def _scrape_call(
         self, site: str, query: SearchQuery, rules: Optional[Sequence[CompiledRule]] = None
     ) -> ScrapeOutcome:
@@ -497,6 +521,12 @@ class DaemonService:
             if rules is not None and self._accepts_rules(outcome_fn):
                 result = outcome_fn(site, query, rules=rules)
             else:
+                if rules is not None and not self._rules_dropped_warned:
+                    self._rules_dropped_warned = True
+                    logger.warning(
+                        "The scraper's scrape_board_outcome does not accept `rules`: the profile's rules are "
+                        "not applied while scraping (only the title safety net at evaluation uses them)."
+                    )
                 result = outcome_fn(site, query)
             if isinstance(result, ScrapeOutcome):
                 return result
@@ -527,6 +557,10 @@ class DaemonService:
 
         if dry_run:
             return 0, 0
+
+        if problem == "db_busy" and profile is None:
+            self._skip_evaluation_without_profile()
+            return total_new_saved, 0
 
         # Process evaluations
         _, wow_sent = self.evaluate_unprocessed(

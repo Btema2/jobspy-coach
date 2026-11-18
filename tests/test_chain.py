@@ -6,7 +6,7 @@ import time
 import pytest
 
 from src.evaluator import chain as chain_module
-from src.evaluator.chain import DIGEST_MAX_SCORE, ProviderChainEvaluator
+from src.evaluator.chain import DIGEST_MAX_SCORE, ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.circuit_breaker import CircuitBreaker
 from src.evaluator.errors import (
     AuthenticationFailed,
@@ -932,3 +932,60 @@ def test_postprocess_raw_score_ignores_non_core_cap_and_is_clamped():
     assert capped.raw_score == 9.5
 
     assert evaluate(score=14, is_core_role=True).raw_score == 10.0
+
+
+def test_old_model_keys_round_trip_to_the_stored_columns(tmp_path):
+    """A model that still answers with the old keys ends with eval_is_core_role / summary stored (not NULL)."""
+    from src.storage.db import Database
+
+    old = json.dumps({
+        "score": 9.0, "summary_uk": "Старе резюме вакансії для кандидата.", "reasoning": "r",
+        "role_is_direct_coaching": True,
+    })
+    result = make_chain(FakeProvider("nim", [old])).evaluate_job(make_job())
+    assert (result.summary, result.is_core_role, result.score) == ("Старе резюме вакансії для кандидата.", True, 9.0)
+
+    db = Database(tmp_path / "old_keys.db")
+    db.init_db()
+    job_id, _ = db.save_job(make_job(dedup_hash="old-keys"))
+    db.update_evaluation(job_id, result)
+    stored = db.get_job_by_id(job_id)
+    assert stored.eval_is_core_role is True
+    assert stored.eval_summary_uk == "Старе резюме вакансії для кандидата."
+
+
+def test_cap_log_uses_a_compact_number(caplog):
+    nim = FakeProvider("nim", [payload(score=9.0, is_core_role=False)])
+    policy = ScoringPolicy(system_prompt="P", wow_threshold=8.25, digest_threshold=8.15, core_cap=8.15)
+    with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
+        make_chain(nim).evaluate_job(make_job(), policy=policy)
+    text = " ".join(r.getMessage() for r in caplog.records if "Core-role cap" in r.getMessage())
+    assert "capped at 8.15" in text and "final score 8.15" in text
+
+
+def test_default_policy_is_built_once_without_taking_the_lock_again():
+    chain = make_chain(FakeProvider("nim", [payload()]))
+    first = chain._get_default_policy()
+    chain._default_lock.acquire()
+    try:  # a held lock must not block the fast path
+        assert chain._get_default_policy() is first
+    finally:
+        chain._default_lock.release()
+
+
+def test_default_policy_comes_from_the_shared_no_profile_helper():
+    from src.evaluator.scoring import no_profile_policy
+
+    chain = make_chain(FakeProvider("nim", [payload()]), bonus_enabled=True, wow_threshold=9.0, digest_threshold=7.0)
+    assert chain._get_default_policy() == no_profile_policy("SYSTEM PROMPT", 9.0, 7.0, bonus_enabled=True)
+    plain = make_chain(FakeProvider("nim", [payload()]))
+    assert plain._get_default_policy() == no_profile_policy("SYSTEM PROMPT")
+
+
+def test_build_chain_from_settings_forwards_the_env_thresholds():
+    from src.config import Settings
+
+    settings = Settings(_env_file=None, NVIDIA_API_KEY="k", WOW_SCORE_THRESHOLD=9.0, DIGEST_SCORE_THRESHOLD=7.0)
+    chain = build_chain_from_settings(settings, system_prompt="p")
+    policy = chain._get_default_policy()
+    assert (policy.wow_threshold, policy.digest_threshold, policy.core_cap) == (9.0, 7.0, 8.9)

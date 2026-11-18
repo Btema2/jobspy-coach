@@ -113,3 +113,13 @@ def test_found_with_remote_filter_uses_query_id_of_source_query():
     assert found_with_remote_filter("role=<R>;term=<T>;market=<M>|indeed", policy) is True
     assert found_with_remote_filter("other|linkedin", policy) is False
     assert found_with_remote_filter(None, policy) is False
+
+
+def test_no_profile_policy_defaults_and_cap():
+    from src.evaluator.scoring import DIGEST_MAX_SCORE, no_profile_policy
+
+    default = no_profile_policy("P")
+    assert (default.system_prompt, default.wow_threshold, default.digest_threshold) == ("P", 8.5, 6.5)
+    assert default.core_cap == DIGEST_MAX_SCORE and default.bonus_enabled is False and default.rules is None
+    assert no_profile_policy("P", 9.0, 7.0, bonus_enabled=True).core_cap == 8.9
+    assert no_profile_policy("P", 9.0, 7.0, bonus_enabled=True).bonus_enabled is True

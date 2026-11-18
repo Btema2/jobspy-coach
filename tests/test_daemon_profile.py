@@ -810,3 +810,103 @@ def test_scrape_all_queries_requires_queries(monkeypatch):
 def test_daemon_has_profile_store(tmp_path):
     daemon = _make(tmp_path)
     assert daemon.profile_store.has_profile() is False
+
+
+def _store_raises(daemon: DaemonService, monkeypatch, error: Exception) -> None:
+    def fail():
+        raise error
+
+    monkeypatch.setattr(daemon.profile_store, "read_snapshot", fail)
+
+
+def test_db_busy_without_a_last_good_profile_skips_evaluation(tmp_path, monkeypatch):
+    chain = RecordingChain()
+    daemon = _make(tmp_path, FakeScraper(), chain)
+    _import_fixture(daemon)  # stored, but this process never read it successfully
+    _seed_job(daemon)
+    _store_raises(daemon, monkeypatch, sqlite3.OperationalError("database is locked"))
+
+    assert daemon.run_pipeline_cycle() == (0, 0)
+    assert daemon.evaluate_unprocessed() == (0, 0)  # the UNSET default resolves the profile itself
+
+    assert chain.calls == 0
+    assert [j.eval_status for j in daemon.db.get_unprocessed_jobs()] == ["unprocessed"]
+    assert daemon.notifier.send_message.call_count == 0
+
+
+@pytest.mark.parametrize("message", ["database is locked", "database table is locked", "database is busy"])
+def test_busy_and_locked_errors_are_db_busy(tmp_path, monkeypatch, message):
+    daemon = _make(tmp_path)
+    _store_raises(daemon, monkeypatch, sqlite3.OperationalError(message))
+    assert daemon.current_profile() == (None, "db_busy")
+    assert daemon.notifier.send_message.call_count == 0
+
+
+def test_permanent_database_errors_alert_once_per_distinct_error(tmp_path, monkeypatch):
+    scraper = FakeScraper()
+    daemon = _make(tmp_path, scraper)
+    _store_raises(daemon, monkeypatch, sqlite3.OperationalError("no such table: profile"))
+
+    daemon.run_pipeline_cycle()
+    daemon.run_pipeline_cycle()
+
+    assert daemon.current_profile()[1] == "compile_error"
+    assert scraper.calls == []
+    assert len(_alerts(daemon)) == 1 and "no such table" in _alerts(daemon)[0]
+    _store_raises(daemon, monkeypatch, sqlite3.OperationalError("disk I/O error"))
+    daemon.run_pipeline_cycle()
+    assert len(_alerts(daemon)) == 2
+
+
+def test_legacy_profile_behaves_as_today_at_8_5_and_6_5(tmp_path):
+    """An imported legacy profile: core 8.5 alerts, core 6.4 is dismissed, non-core 9.0 lands at 8.4 in the digest."""
+    answers = {
+        "Core WOW": _answer(8.5, is_core_role=True),
+        "Core Low": _answer(6.4, is_core_role=True),
+        "Trainer": _answer(9.0, is_core_role=False),
+    }
+    daemon = _real_chain_daemon(tmp_path, ScriptedProvider(lambda title: answers[title]))
+    _import_fixture(daemon)
+    ids = {title: _save(daemon, n, title) for n, title in enumerate(answers, 1)}
+
+    evaluated, wow = daemon.evaluate_unprocessed()
+
+    assert (evaluated, wow) == (3, 1)
+    wow_job, low, trainer = (daemon.db.get_job_by_id(ids[t]) for t in ("Core WOW", "Core Low", "Trainer"))
+    assert (wow_job.eval_score, wow_job.notification_status, wow_job.eval_is_wow) == (8.5, "instant_sent", True)
+    assert (low.eval_score, low.notification_status) == (6.4, "dismissed")
+    assert (trainer.eval_score, trainer.notification_status, trainer.eval_is_wow) == (8.4, "pending", False)
+    assert daemon.notifier.send_wow_alert.call_count == 1
+
+
+class OldSignatureScraper:
+    """Scraper double whose scrape_board_outcome cannot take the cycle's rules."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def scrape_board_outcome(self, site, query):
+        self.calls += 1
+        return ScrapeOutcome(postings=[], rows=0, status=STATUS_EMPTY)
+
+
+def test_rules_not_forwarded_to_an_old_signature_is_logged_once(tmp_path, caplog):
+    scraper = OldSignatureScraper()
+    daemon = _make(tmp_path, scraper)
+    _import_fixture(daemon)
+
+    with caplog.at_level("WARNING", logger="src.scheduler.daemon"):
+        daemon.run_pipeline_cycle()
+        daemon.run_pipeline_cycle()
+
+    assert scraper.calls >= 2
+    warnings = [r for r in caplog.records if "rules" in r.getMessage() and r.levelname == "WARNING"]
+    assert len(warnings) == 1
+
+
+def test_no_profile_policy_has_one_source(tmp_path):
+    from src.evaluator.scoring import no_profile_policy
+
+    daemon = _make(tmp_path)
+    daemon.settings = _settings(WOW_SCORE_THRESHOLD=9.0, DIGEST_SCORE_THRESHOLD=7.0)
+    assert daemon._policy(None) == no_profile_policy("", 9.0, 7.0)

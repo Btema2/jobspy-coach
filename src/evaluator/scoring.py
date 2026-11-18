@@ -30,6 +30,26 @@ class ScoringPolicy:
     remote_filter_query_ids: FrozenSet[str] = frozenset()
 
 
+def no_profile_policy(
+    system_prompt: str,
+    wow_threshold: float = 8.5,
+    digest_threshold: float = 6.5,
+    *,
+    bonus_enabled: bool = False,
+) -> ScoringPolicy:
+    """The policy used when there is no (usable) profile: legacy rules, the non-core cap at ``wow - 0.1``.
+
+    The daemon and the chain both build it here, so they cannot drift apart.
+    """
+    return ScoringPolicy(
+        system_prompt=system_prompt,
+        wow_threshold=wow_threshold,
+        digest_threshold=digest_threshold,
+        bonus_enabled=bonus_enabled,
+        core_cap=round(wow_threshold - 0.1, 6),
+    )
+
+
 def final_score(
     raw: float,
     *,

@@ -66,6 +66,7 @@ from src.evaluator.scoring import (  # noqa: F401  (constants re-exported for ex
     ScoringPolicy,
     final_score,
     found_with_remote_filter,
+    no_profile_policy,
     remote_label,
 )
 from src.filters.rules import match_title
@@ -90,6 +91,8 @@ class ProviderChainEvaluator:
         system_prompt: Optional[str] = None,
         invalid_streak_threshold: int = INVALID_STREAK_BREAKER_THRESHOLD,
         bonus_enabled: Optional[bool] = None,
+        wow_threshold: float = 8.5,
+        digest_threshold: float = 6.5,
     ):
         if not providers:
             raise ValueError("ProviderChainEvaluator needs at least one provider")
@@ -102,6 +105,8 @@ class ProviderChainEvaluator:
         # default policy (``bonus_enabled`` as given, default off) is built on first use.
         self._system_prompt = system_prompt
         self._bonus_enabled = bool(bonus_enabled)
+        self._wow_threshold = wow_threshold
+        self._digest_threshold = digest_threshold
         self._default_policy: Optional[ScoringPolicy] = None
         self._default_lock = threading.Lock()
 
@@ -158,10 +163,15 @@ class ProviderChainEvaluator:
 
     def _get_default_policy(self) -> ScoringPolicy:
         """The policy used when the caller passes none; built once, on first use."""
+        policy = self._default_policy
+        if policy is not None:  # lock-free fast path: the attribute is only ever set once, to a frozen value
+            return policy
         with self._default_lock:
             if self._default_policy is None:
                 prompt = self._system_prompt if self._system_prompt is not None else build_system_prompt()
-                self._default_policy = ScoringPolicy(system_prompt=prompt, bonus_enabled=self._bonus_enabled)
+                self._default_policy = no_profile_policy(
+                    prompt, self._wow_threshold, self._digest_threshold, bonus_enabled=self._bonus_enabled
+                )
             return self._default_policy
 
     def _check_stop(self) -> None:
@@ -275,8 +285,8 @@ class ProviderChainEvaluator:
             )
             if uncapped > cap:
                 logger.info(
-                    "Core-role cap: %r raw model score %.1f, final score %.1f "
-                    "(is_core_role=false, capped at %.1f)",
+                    "Core-role cap: %r raw model score %.1f, final score %g "
+                    "(is_core_role=false, capped at %g)",
                     job.title, float(result.score), cap, cap,
                 )
 
@@ -348,5 +358,10 @@ def build_chain_from_settings(
             "together with OPENROUTER_MODELS (fallback), in .env."
         )
     return ProviderChainEvaluator(
-        providers, stop_event=stop_event, system_prompt=system_prompt, bonus_enabled=bonus_enabled
+        providers,
+        stop_event=stop_event,
+        system_prompt=system_prompt,
+        bonus_enabled=bonus_enabled,
+        wow_threshold=settings.wow_score_threshold,
+        digest_threshold=settings.digest_score_threshold,
     )
