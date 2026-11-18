@@ -67,6 +67,7 @@ config/candidate_profile.*
 config/custom_*
 config/queries.json
 queries.json
+profile-export*.yaml
 local/
 
 # SQLite / Databases
