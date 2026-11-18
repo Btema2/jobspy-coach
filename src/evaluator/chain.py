@@ -109,8 +109,14 @@ class ProviderChainEvaluator:
 
     # ----- public -----
 
-    def evaluate_job(self, job: JobPosting) -> JobEvaluationResult:
+    def evaluate_job(self, job: JobPosting, system_prompt: Optional[str] = None) -> JobEvaluationResult:
+        """Evaluate one job. ``system_prompt`` overrides the frozen prompt for this call only.
+
+        The override is passed down as an argument and never stored, so concurrent workers
+        cannot see each other's prompt. ``None`` keeps the prompt built at construction.
+        """
         self._check_stop()
+        prompt = self._system_prompt if system_prompt is None else system_prompt
         user_prompt = build_job_user_prompt(
             title=job.title,
             company=job.company,
@@ -124,7 +130,7 @@ class ProviderChainEvaluator:
             if not provider.is_available():
                 logger.debug("Skipping %s: unavailable (quota)", provider.name)
                 continue
-            status, result, model_used, latency = self._try_provider(provider, user_prompt)
+            status, result, model_used, latency = self._try_provider(provider, user_prompt, prompt)
             if status == _OK:
                 result.eval_model = model_used
                 final = self._postprocess(result, job)
@@ -146,7 +152,7 @@ class ProviderChainEvaluator:
             raise StopRequested("stop requested")
 
     def _try_provider(
-        self, provider: Any, user_prompt: str
+        self, provider: Any, user_prompt: str, system_prompt: str
     ) -> Tuple[str, Optional[JobEvaluationResult], Optional[str], float]:
         breaker: CircuitBreaker = provider.breaker
         if not breaker.allow():
@@ -160,7 +166,7 @@ class ProviderChainEvaluator:
             completion = None
             for _ in range(1 + INVALID_RETRIES_PER_PROVIDER):
                 try:
-                    completion = provider.complete(self._system_prompt, user_prompt, max_tokens)
+                    completion = provider.complete(system_prompt, user_prompt, max_tokens)
                     result = self._parse(completion.content)
                 except InvalidResponse as exc:
                     result = None

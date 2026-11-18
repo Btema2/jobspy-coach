@@ -139,6 +139,32 @@ def test_system_prompt_built_once_at_construction(monkeypatch):
     assert nim.calls[0]["system"] == "BUILT"
 
 
+def test_evaluate_job_uses_per_call_system_prompt():
+    nim = FakeProvider("nim", [payload()])
+    chain = make_chain(nim, system_prompt="FROZEN")
+    chain.evaluate_job(make_job(), system_prompt="X")
+    chain.evaluate_job(make_job())
+    assert nim.calls[0]["system"] == "X"
+    assert nim.calls[1]["system"] == "FROZEN"
+
+
+def test_per_call_prompt_does_not_change_chain_default():
+    nim = FakeProvider("nim", [payload()])
+    chain = make_chain(nim, system_prompt="FROZEN")
+    chain.evaluate_job(make_job(), system_prompt="OVERRIDE")
+    chain.evaluate_job(make_job())
+    assert nim.calls[-1]["system"] == "FROZEN"
+    assert chain._system_prompt == "FROZEN"
+
+
+def test_per_call_prompt_reaches_retry_and_fallback_provider():
+    nim = FakeProvider("nim", ["not json", "still not json"])
+    router = FakeProvider("openrouter", [payload()])
+    make_chain(nim, router, system_prompt="FROZEN").evaluate_job(make_job(), system_prompt="X")
+    assert [c["system"] for c in nim.calls] == ["X", "X"]
+    assert [c["system"] for c in router.calls] == ["X"]
+
+
 def test_requires_at_least_one_provider():
     with pytest.raises(ValueError):
         ProviderChainEvaluator([])
