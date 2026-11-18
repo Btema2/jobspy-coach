@@ -1,13 +1,25 @@
 import importlib.metadata
+from pathlib import Path
 from typing import Optional
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from src.config import get_settings
 from src.evaluator.errors import ConfigurationError
 from src.logging_config import configure_logging
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.profile.compiler import compile_profile
+from src.profile.errors import (
+    LegacyImportError,
+    ProfileCompileError,
+    ProfileError,
+    ProfileValidationError,
+)
+from src.profile.importer import DEFAULT_EXPORT_PATH, auto_import, export_profile, load_profile_yaml
+from src.profile.ops import ReplaceProfile, apply_changes, create_starter_profile
+from src.profile.store import ProfileStore
 from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
@@ -16,6 +28,60 @@ app = typer.Typer(help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
 console = Console()
 
 configure_logging()
+
+profile_app = typer.Typer(help="Inspect, export and import the stored search profile")
+app.add_typer(profile_app, name="profile")
+
+
+def _fail(message: str, *, hint: str = "") -> "typer.Exit":
+    """Print an error without Rich markup (messages contain brackets and backticks) and return Exit(1)."""
+    console.print(message, style="bold red", markup=False, highlight=False)
+    if hint:
+        console.print(hint, markup=False, highlight=False)
+    return typer.Exit(code=1)
+
+
+def _fail_profile_error(error: ProfileError, *, hint: str = "") -> "typer.Exit":
+    messages = error.messages if isinstance(error, ProfileValidationError) else [str(error)]
+    for message in messages:
+        console.print(f"- {message}", style="bold red", markup=False, highlight=False)
+    if hint:
+        console.print(hint, markup=False, highlight=False)
+    return typer.Exit(code=1)
+
+
+def _profile_store() -> ProfileStore:
+    db = Database(get_settings().db_path)
+    db.init_db()
+    return ProfileStore(db)
+
+
+_LEGACY_HINT = (
+    "Fix the file and entry named above (or move the file away), then run the command again. "
+    "Nothing was imported."
+)
+
+
+@app.callback()
+def main() -> None:
+    """Open the database and import the legacy queries.json / .candidate_profile.md once, before any command."""
+    settings = get_settings()
+    store = _profile_store()
+    try:
+        result = auto_import(
+            store,
+            Path.cwd(),
+            wow_threshold=settings.wow_score_threshold,
+            digest_threshold=settings.digest_score_threshold,
+        )
+    except LegacyImportError as exc:
+        raise _fail_profile_error(exc, hint=_LEGACY_HINT) from None
+    except ProfileValidationError as exc:
+        raise _fail_profile_error(exc, hint=_LEGACY_HINT) from None
+    if result is not None:
+        console.print(f"Imported legacy profile (version {result.version})", style="bold green", markup=False)
+        for note in result.warnings:
+            console.print(f"- {note}", style="yellow", markup=False, highlight=False)
 
 
 def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
@@ -26,12 +92,111 @@ def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
 @app.command()
 def run():
     """Start the 24/7 background daemon scheduler."""
+    if not _profile_store().has_profile():
+        raise _fail("no profile, run `jobspy-coach init`")
     console.print("[bold green]Starting JobSpy Coach Daemon...[/bold green]")
     daemon = DaemonService()
     try:
         daemon.start()
     except ConfigurationError as e:
         raise _exit_on_missing_provider(e) from None
+
+
+@app.command()
+def init() -> None:
+    """Create an empty, paused starter profile (does nothing when a profile exists). Never prompts."""
+    settings = get_settings()
+    store = _profile_store()
+    existing = store.read_snapshot()
+    if existing is not None:
+        console.print(f"Profile already exists (version {existing.version}); nothing to do.", markup=False)
+        return
+    try:
+        result = create_starter_profile(
+            store,
+            wow_threshold=settings.wow_score_threshold,
+            digest_threshold=settings.digest_score_threshold,
+        )
+    except ProfileError as exc:
+        raise _fail_profile_error(exc) from None
+    console.print(f"Created an empty starter profile (version {result.version}); it is paused.", markup=False)
+    console.print(
+        "Fill it in: run `jobspy-coach profile export`, edit the YAML file, then run "
+        "`jobspy-coach profile import <file>`.",
+        markup=False,
+    )
+
+
+@profile_app.command("preview")
+def profile_preview() -> None:
+    """Show the search queries the stored profile compiles to, with the cost estimate."""
+    store = _profile_store()
+    snapshot = store.read_snapshot()
+    if snapshot is None:
+        raise _fail("no profile, run `jobspy-coach init`")
+    try:
+        compiled = compile_profile(snapshot, scrape_interval_hours=get_settings().scrape_interval_hours)
+    except ProfileCompileError as exc:
+        raise _fail(f"profile cannot be compiled: {exc}") from None
+
+    table = Table(title=f"Profile version {compiled.version}: search queries")
+    table.add_column("Query id", style="cyan", no_wrap=True)
+    table.add_column("Term")
+    table.add_column("Location")
+    table.add_column("Country")
+    table.add_column("Boards")
+    table.add_column("Remote")
+    for q in compiled.queries:
+        table.add_row(
+            q.query_id,
+            escape(q.search_term),
+            escape(q.location),
+            q.country_code or "-",
+            ", ".join(q.site_names),
+            "yes" if q.is_remote else "no",
+        )
+    console.print(table)
+    estimate = compiled.estimate
+    minutes = estimate.duration_seconds / 60
+    console.print(
+        f"Calls per cycle: {estimate.total_calls} (LinkedIn: {estimate.linkedin_calls}), "
+        f"cap: {snapshot.fields.max_calls_per_cycle}, estimated duration: ~{minutes:.0f} min",
+        markup=False,
+    )
+    console.print(f"Paused: {'yes' if compiled.paused else 'no'}", markup=False)
+    for warning in compiled.warnings:
+        console.print(f"Warning: {warning}", style="yellow", markup=False, highlight=False)
+
+
+@profile_app.command("export")
+def profile_export(
+    path: Path = typer.Option(DEFAULT_EXPORT_PATH, "--path", help="Where to write the YAML export"),
+    force: bool = typer.Option(False, "--force", help="Write even when the path is not git-ignored"),
+) -> None:
+    """Write the stored profile as YAML (private data: only to a git-ignored path)."""
+    store = _profile_store()
+    if not store.has_profile():
+        raise _fail("no profile, run `jobspy-coach init`")
+    try:
+        written = export_profile(store, path, force=force)
+    except ProfileError as exc:  # includes ExportRefused
+        raise _fail(str(exc)) from None
+    console.print(f"Exported the profile to {written} (private data, file mode 0600).", markup=False)
+
+
+@profile_app.command("import")
+def profile_import(file: Path = typer.Argument(..., help="YAML file written by `profile export`")) -> None:
+    """Validate a YAML profile file and apply it as a new profile version."""
+    store = _profile_store()
+    try:
+        result = apply_changes(store, [ReplaceProfile(load_profile_yaml(file))], label=f"import {file.name}")
+    except ProfileError as exc:
+        raise _fail_profile_error(exc, hint="Nothing was changed.") from None
+    for line in result.diff:
+        console.print(line, markup=False, highlight=False)
+    for warning in result.warnings:
+        console.print(f"Warning: {warning}", style="yellow", markup=False, highlight=False)
+    console.print(f"Profile is now at version {result.version}.", markup=False)
 
 
 @app.command()

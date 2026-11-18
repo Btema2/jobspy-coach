@@ -13,6 +13,7 @@ def isolate_cli_test_db(tmp_path, monkeypatch):
     test_db = tmp_path / "test_cli.db"
     monkeypatch.setenv("DB_PATH", str(test_db))
     monkeypatch.setenv("DATABASE_PATH", str(test_db))
+    monkeypatch.chdir(tmp_path)  # the CLI auto-imports legacy files from the cwd: never the real ones
     from src.config import get_settings
 
     get_settings.cache_clear()
@@ -178,7 +179,13 @@ def test_cli_digest_command(monkeypatch):
     mock_digest.assert_called_once_with(dry_run=False)
 
 
+def _create_profile():
+    """`run` refuses to start without a stored profile."""
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+
 def test_cli_run_command(monkeypatch):
+    _create_profile()
     mock_start = MagicMock()
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.start", mock_start)
 
@@ -190,6 +197,7 @@ def test_cli_run_command(monkeypatch):
 
 def test_main_entrypoint(monkeypatch):
     import runpy
+    _create_profile()
     mock_start = MagicMock()
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.start", mock_start)
     monkeypatch.setattr("sys.argv", ["jobspy-coach", "run"])

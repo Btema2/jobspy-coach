@@ -236,8 +236,10 @@ def auto_import(
     except VersionConflict:
         return None  # another process imported first
     except ProfileValidationError as exc:
+        names = ", ".join(str(f) for f in (files.queries_path, files.persona_path) if f is not None)
         raise LegacyImportError(
-            "the legacy files do not make a valid profile: " + "; ".join(exc.messages)
+            f"the legacy files ({names}) do not make a valid profile: " + "; ".join(exc.messages)
+            + (f". For a pinned query, edit the entry with that query_id in {files.queries_path}" if files.queries_path else "")
         ) from exc
     result.warnings = notes + result.warnings
     return result
