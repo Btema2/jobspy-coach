@@ -3,12 +3,14 @@ import html
 import json
 import re
 import sqlite3
+import time
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
+from src.storage.migrations import apply_migrations, ensure_column
 from src.storage.models import JobEvaluationResult, JobPosting, ScrapeRun
 
 
@@ -129,16 +131,7 @@ def _parse_dt(val: Any) -> Optional[datetime]:
         return None
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
-    """Idempotently add a column; tolerant of a concurrent init_db winning the race."""
-    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if name in existing:
-        return
-    try:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            raise
+_ensure_column = ensure_column  # legacy name; tests import it from here
 
 
 class Database:
@@ -150,8 +143,18 @@ class Database:
     def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
+        # Switching a fresh file to WAL can fail immediately with "database is locked" (the busy
+        # handler is not always consulted) when another process is doing the same; retry briefly.
+        for attempt in range(50):
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 49:
+                    conn.close()
+                    raise
+                time.sleep(0.1)
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
         try:
@@ -226,6 +229,7 @@ class Database:
                 error_message TEXT
             );
             """)
+            apply_migrations(conn)
             conn.commit()
 
     def save_job(self, job: JobPosting) -> Tuple[int, bool]:
