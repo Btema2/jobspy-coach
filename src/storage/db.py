@@ -452,7 +452,12 @@ class Database:
         new_jobs_saved: int,
         duration_sec: float,
         status: str,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        *,
+        rows_returned: int = 0,
+        prefiltered: int = 0,
+        outcome: Optional[str] = None,
+        query_key: Optional[str] = None,
     ) -> int:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -460,11 +465,13 @@ class Database:
             cursor.execute("""
             INSERT INTO scrape_runs (
                 run_time, board, query, jobs_found, new_jobs_saved,
-                duration_sec, status, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                duration_sec, status, error_message,
+                rows_returned, prefiltered, outcome, query_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, board, query, jobs_found, new_jobs_saved,
-                duration_sec, status, error_message
+                duration_sec, status, error_message,
+                rows_returned, prefiltered, outcome, query_key
             ))
             conn.commit()
             return cursor.lastrowid

@@ -241,6 +241,29 @@ def test_database_record_scrape_run(tmp_path: Path):
         assert row["error_message"] is None
 
 
+def test_record_scrape_run_stores_outcome_fields(tmp_path: Path):
+    db = Database(tmp_path / "test_scrape_outcome.db")
+    db.init_db()
+
+    run_id = db.record_scrape_run(
+        "indeed", "Career Coach", 10, 2, 1.5, "completed",
+        rows_returned=10, prefiltered=3, outcome="empty", query_key="Q|indeed",
+    )
+    plain_id = db.record_scrape_run("indeed", "Career Coach", 0, 0, 0.5, "completed")
+
+    with db._get_connection() as conn:
+        row = conn.execute(
+            "SELECT rows_returned, prefiltered, outcome, query_key FROM scrape_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        assert tuple(row) == (10, 3, "empty", "Q|indeed")
+        plain = conn.execute(
+            "SELECT rows_returned, prefiltered, outcome, query_key FROM scrape_runs WHERE id = ?",
+            (plain_id,),
+        ).fetchone()
+        assert tuple(plain) == (0, 0, None, None)
+
+
 def test_database_get_job_by_id_and_not_found(tmp_path: Path):
     db_file = tmp_path / "test_get_by_id.db"
     db = Database(db_file)
