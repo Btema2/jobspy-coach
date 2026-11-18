@@ -1,4 +1,5 @@
 import logging
+import threading
 
 import httpx
 import pytest
@@ -54,19 +55,18 @@ def test_get_updates_sends_offset_and_long_poll_timeout():
     assert body["allowed_updates"] == ["message", "callback_query"]
 
 
-def test_get_updates_http_timeout_exceeds_long_poll(monkeypatch):
-    fake = FakeTelegram()
-    seen = {}
-    client = _client(fake)
-    real_call = client.call
+def test_get_updates_http_timeout_exceeds_long_poll():
+    seen = []
 
-    def spy(method, payload, *, timeout=None):
-        seen["timeout"] = timeout
-        return real_call(method, payload, timeout=timeout)
+    def handler(request):
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"ok": True, "result": []})
 
-    monkeypatch.setattr(client, "call", spy)
+    client = TelegramBotClient(TOKEN, transport=httpx.MockTransport(handler), timeout=15.0)
     client.get_updates(0, timeout=25)
-    assert seen["timeout"] == 35
+    client.get_me()
+    assert seen[0]["read"] == 35
+    assert seen[1]["read"] == 15
 
 
 def test_429_raises_retry_after_with_seconds():
@@ -99,6 +99,47 @@ def test_send_message_retries_once_after_short_retry_after(monkeypatch):
     assert isinstance(message_id, int)
     assert sleeps == [3]
     assert len(fake.calls("sendMessage")) == 2
+
+
+def test_send_message_retry_wait_is_interrupted_by_the_stop_event(monkeypatch):
+    monkeypatch.setattr("src.bot.client.time.sleep", lambda s: pytest.fail("must wait on the stop event"))
+    stop = threading.Event()
+    stop.set()
+    fake = FakeTelegram()
+    fake.respond("sendMessage", 429, _error(429, "Too Many Requests", retry_after=30))
+    client = TelegramBotClient(TOKEN, transport=fake.transport, stop_event=stop)
+
+    assert client.send_message(5, "hello") is None
+    assert len(fake.calls("sendMessage")) == 1  # no retry once stopping
+
+
+def test_send_message_retries_when_the_stop_event_stays_clear():
+    fake = FakeTelegram()
+    fake.respond("sendMessage", 429, _error(429, "Too Many Requests", retry_after=0.01))
+    client = TelegramBotClient(TOKEN, transport=fake.transport, stop_event=threading.Event())
+
+    assert isinstance(client.send_message(5, "hello"), int)
+    assert len(fake.calls("sendMessage")) == 2
+
+
+def test_empty_token_does_not_garble_error_text():
+    fake = FakeTelegram()
+    fake.respond("getMe", 400, _error(400, "plain description"))
+    with pytest.raises(TelegramApiError) as info:
+        TelegramBotClient("", transport=fake.transport).get_me()
+    assert info.value.description == "plain description"
+
+
+@pytest.mark.parametrize("error", [httpx.InvalidURL("bad"), httpx.StreamError("closed")])
+def test_other_httpx_errors_are_wrapped_like_transport_errors(error):
+    def boom(request):
+        raise error
+
+    client = TelegramBotClient(TOKEN, transport=httpx.MockTransport(boom))
+    with pytest.raises(TelegramNetworkError) as info:
+        client.get_me()
+    assert str(info.value) == type(error).__name__
+    assert client.send_message(5, "x") is None
 
 
 def test_send_message_does_not_wait_for_long_retry_after(monkeypatch):

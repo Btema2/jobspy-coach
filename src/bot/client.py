@@ -6,6 +6,7 @@ raises the URL or ``str()`` of an httpx exception; error text goes through ``red
 import html
 import logging
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -71,8 +72,10 @@ class TelegramBotClient:
         transport: Optional[httpx.BaseTransport] = None,
         timeout: float = 15.0,
         base_url: str = API_BASE,
+        stop_event: Optional[threading.Event] = None,
     ):
         self._token = token
+        self._stop = stop_event
         self._base_url = base_url.rstrip("/")
         self._client = httpx.Client(transport=transport, timeout=timeout)
 
@@ -87,7 +90,7 @@ class TelegramBotClient:
             kwargs["timeout"] = timeout
         try:
             response = self._client.post(url, **kwargs)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError) as exc:
             # No chaining: the httpx message (and a traceback showing it) embeds the URL with the token.
             raise TelegramNetworkError(method, type(exc).__name__) from None
 
@@ -104,7 +107,8 @@ class TelegramBotClient:
             status = code if isinstance(code, int) and code >= 400 else 502
         description = body.get("description") if isinstance(body, dict) else None
         text = str(description) if description else f"HTTP {response.status_code}"
-        text = text.replace(self._token, "<redacted>")
+        if self._token:
+            text = text.replace(self._token, "<redacted>")
         if status == 401:
             raise TelegramUnauthorized(method, status, text)
         if status == 409:
@@ -149,7 +153,11 @@ class TelegramBotClient:
             except TelegramRetryAfter as exc:
                 if not retried and exc.retry_after <= _MAX_SHORT_RETRY_AFTER:
                     retried = True
-                    time.sleep(exc.retry_after)
+                    if self._stop is not None:
+                        if self._stop.wait(exc.retry_after):  # shutting down: do not delay it, do not retry
+                            return None
+                    else:
+                        time.sleep(exc.retry_after)
                     continue
                 self._log_failure(exc)
                 return None
