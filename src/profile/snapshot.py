@@ -143,9 +143,10 @@ def snapshot_to_dict(s: ProfileSnapshot) -> Dict[str, Any]:
 def upgrade_snapshot_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     """Bring a stored dict up to ``SNAPSHOT_SCHEMA`` (a new dict; the input is not modified).
 
-    Stamp 1 becomes 2: a definition field that still equals the first-version seed text exactly is replaced
-    by the current seed body (the rubric template now supplies the band header and numbers); edited text is
-    left alone. Stamp 2 passes through; other stamps are refused.
+    A definition field that still equals an earlier seed text exactly is replaced by the current seed body
+    (the rubric template supplies the band header and numbers; the current bodies are declarative); edited
+    text is left alone. Stamp 1 becomes 2; stamp 2 gets the same replacement, so the short-lived first Branch 3
+    wording is upgraded too, and a current snapshot is returned unchanged. Other stamps are refused.
     """
     if not isinstance(d, dict):
         raise ProfileValidationError("snapshot must be a mapping")
@@ -156,9 +157,7 @@ def upgrade_snapshot_dict(d: Dict[str, Any]) -> Dict[str, Any]:
         raise ProfileValidationError(
             f"snapshot_schema {stamp} is newer than this version supports ({SNAPSHOT_SCHEMA})"
         )
-    if stamp == SNAPSHOT_SCHEMA:
-        return d
-    if stamp != 1:
+    if stamp not in (1, SNAPSHOT_SCHEMA):
         raise ProfileValidationError(f"unsupported snapshot_schema {stamp}")
     from src.profile.legacy_seed import LEGACY_FIELD_UPGRADES  # lazy: legacy_seed imports this module
 
@@ -166,8 +165,8 @@ def upgrade_snapshot_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     profile = d.get("profile")
     if isinstance(profile, dict):
         profile = dict(profile)
-        for name, (old, new) in LEGACY_FIELD_UPGRADES.items():
-            if profile.get(name) == old:
+        for name, (olds, new) in LEGACY_FIELD_UPGRADES.items():
+            if profile.get(name) in olds:
                 profile[name] = new
         upgraded["profile"] = profile
     upgraded["snapshot_schema"] = SNAPSHOT_SCHEMA

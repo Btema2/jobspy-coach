@@ -143,8 +143,9 @@ def _migration_3_rules_and_rubric(conn: sqlite3.Connection) -> None:
     # Unedited seed definitions get the current body (exact match only; the profile version is unchanged
     # because the meaning is unchanged and an older process still reads valid text). The profile table may
     # be empty, in which case nothing matches.
-    for field, (old, new) in LEGACY_FIELD_UPGRADES.items():
-        conn.execute(f"UPDATE profile SET {field} = ? WHERE {field} = ?", (new, old))
+    for field, (olds, new) in LEGACY_FIELD_UPGRADES.items():
+        for old in olds:
+            conn.execute(f"UPDATE profile SET {field} = ? WHERE {field} = ?", (new, old))
 
 
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [

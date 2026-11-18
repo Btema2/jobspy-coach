@@ -67,19 +67,53 @@ def test_new_seed_bodies_have_no_band_numbers_or_old_key():
         assert text.strip()
         for banned in ("8.5", "6.5", "role_is_direct_coaching", "- WOW", "- DIGEST", "- HARD REJECT", "hard_reject"):
             assert banned not in text, banned
-    assert legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION.endswith(
-        "Score as MARGINAL instead: mixed HR / recruitment responsibilities, unclear coaching scope, "
-        "administrative L&D."
-    )
     assert "core role" in legacy_seed.LEGACY_CORE_ROLE_DEFINITION
 
 
-def test_text_upgrades_map_v1_to_new_per_field():
+def test_new_seed_bodies_are_declarative_not_commands():
+    """The data block is declared data, so its text must describe roles, never instruct the model."""
+    bodies = (
+        legacy_seed.LEGACY_CORE_ROLE_DEFINITION,
+        legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION,
+        legacy_seed.LEGACY_DEALBREAKERS,
+    )
+    for text in bodies:
+        for command in ("Score as", "Set `", "Do not", "Never ", "Always ", "Ignore", "It is not a core role for"):
+            assert command not in text, command
+    assert "marginal matches" in legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION
+    assert "are not core roles" in legacy_seed.LEGACY_CORE_ROLE_DEFINITION
+    # The meaning is kept: the same role families are still named.
+    assert "mixed HR / recruitment responsibilities" in legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION
+    assert "administrative L&D focus" in legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION
+    assert "corporate trainer" in legacy_seed.LEGACY_CORE_ROLE_DEFINITION
+
+
+def test_text_upgrades_map_earlier_texts_to_new_per_field():
     assert legacy_seed.LEGACY_TEXT_UPGRADES == {
         legacy_seed.LEGACY_V1_CORE_ROLE_DEFINITION: legacy_seed.LEGACY_CORE_ROLE_DEFINITION,
+        legacy_seed.LEGACY_V2_CORE_ROLE_DEFINITION: legacy_seed.LEGACY_CORE_ROLE_DEFINITION,
         legacy_seed.LEGACY_V1_ADJACENT_ROLE_DEFINITION: legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION,
+        legacy_seed.LEGACY_V2_ADJACENT_ROLE_DEFINITION: legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION,
         legacy_seed.LEGACY_V1_DEALBREAKERS: legacy_seed.LEGACY_DEALBREAKERS,
     }
+    assert legacy_seed.LEGACY_V2_CORE_ROLE_DEFINITION != legacy_seed.LEGACY_CORE_ROLE_DEFINITION
+    assert legacy_seed.LEGACY_V2_ADJACENT_ROLE_DEFINITION != legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION
+
+
+def test_snapshot_schema_2_upgrades_the_first_branch_3_seed_text_only():
+    fields = ProfileFields(
+        core_role_definition=legacy_seed.LEGACY_V2_CORE_ROLE_DEFINITION,
+        adjacent_role_definition=legacy_seed.LEGACY_V2_ADJACENT_ROLE_DEFINITION + " Edited.",
+        dealbreakers=legacy_seed.LEGACY_DEALBREAKERS,
+    )
+    stored = snapshot_to_dict(ProfileSnapshot(fields))
+    assert stored["snapshot_schema"] == 2
+
+    loaded = snapshot_from_dict(stored).fields
+
+    assert loaded.core_role_definition == legacy_seed.LEGACY_CORE_ROLE_DEFINITION
+    assert loaded.adjacent_role_definition == legacy_seed.LEGACY_V2_ADJACENT_ROLE_DEFINITION + " Edited."
+    assert loaded.dealbreakers == legacy_seed.LEGACY_DEALBREAKERS
 
 
 def test_snapshot_schema_1_upgrades_seed_text():
@@ -102,12 +136,11 @@ def test_snapshot_schema_1_upgrades_seed_text():
     assert stored["profile"]["core_role_definition"] == legacy_seed.LEGACY_V1_CORE_ROLE_DEFINITION  # input intact
 
 
-def test_snapshot_schema_2_is_untouched():
-    stored = snapshot_to_dict(
-        ProfileSnapshot(ProfileFields(core_role_definition=legacy_seed.LEGACY_V1_CORE_ROLE_DEFINITION))
-    )
-    assert stored["snapshot_schema"] == 2
-    assert snapshot_from_dict(stored).fields.core_role_definition == legacy_seed.LEGACY_V1_CORE_ROLE_DEFINITION
+def test_snapshot_schema_2_with_current_or_edited_text_is_untouched():
+    for text in (legacy_seed.LEGACY_CORE_ROLE_DEFINITION, legacy_seed.LEGACY_V1_CORE_ROLE_DEFINITION + " Mine."):
+        stored = snapshot_to_dict(ProfileSnapshot(ProfileFields(core_role_definition=text)))
+        assert stored["snapshot_schema"] == 2
+        assert snapshot_from_dict(stored).fields.core_role_definition == text
 
 
 def test_seed_rules_pass_ops_validation():

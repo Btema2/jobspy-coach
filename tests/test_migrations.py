@@ -171,3 +171,27 @@ def test_migration_3_rewrites_only_unedited_seed_text(tmp_path: Path):
         legacy_seed.LEGACY_CORE_ROLE_DEFINITION
     )
     conn.close()
+
+
+def test_migration_3_rewrites_the_first_branch_3_wording_too(tmp_path: Path):
+    db_file = tmp_path / "m3v2.db"
+    Database(db_file).init_db()
+    conn = sqlite3.connect(db_file)
+    edited = legacy_seed.LEGACY_V2_CORE_ROLE_DEFINITION + " My own edit."
+    _insert_profile(
+        conn, edited, legacy_seed.LEGACY_V2_ADJACENT_ROLE_DEFINITION, legacy_seed.LEGACY_DEALBREAKERS
+    )
+    conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.commit()
+
+    apply_migrations(conn)
+    conn.commit()
+
+    row = conn.execute("SELECT core_role_definition, adjacent_role_definition, dealbreakers FROM profile").fetchone()
+    assert row == (edited, legacy_seed.LEGACY_ADJACENT_ROLE_DEFINITION, legacy_seed.LEGACY_DEALBREAKERS)
+    conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.commit()
+    before = conn.total_changes
+    apply_migrations(conn)
+    assert conn.total_changes - before == 1  # idempotent: only the schema_version row
+    conn.close()

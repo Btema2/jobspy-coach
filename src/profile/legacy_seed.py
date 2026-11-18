@@ -10,7 +10,8 @@ The non-core score cap is not stored: it is ``wow - 0.1`` once a core-role defin
 
 The ``LEGACY_V1_*`` texts are the definitions as first imported (with a band header and fixed numbers); they
 are kept only to recognise stored, unedited seed text. ``LEGACY_*`` (no ``V1``) are the current slot bodies the
-rubric template wraps; ``LEGACY_FIELD_UPGRADES`` maps each profile field to its (V1, current) pair.
+rubric template wraps (``LEGACY_V2_*`` is the short-lived first Branch 3 wording); ``LEGACY_FIELD_UPGRADES`` maps each
+profile field to its (earlier texts, current) pair.
 """
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -53,18 +54,32 @@ LEGACY_V1_ADJACENT_ROLE_DEFINITION = """- DIGEST (6.5 - 8.4): Corporate learning
 LEGACY_V1_DEALBREAKERS = """- HARD REJECT (1.0 - 2.0): Coaching or people development is only a secondary duty of an IT / Engineering / Sales / Project Management / Scrum Master role; the role requires coding, technical IT delivery or P&L management; the role is executive coaching of C-suite leaders that strictly requires native / C2-level proficiency in a language the candidate does not have at that level; or the required seniority is beyond what the candidate profile supports. Set `hard_reject` to true."""
 
 
-LEGACY_CORE_ROLE_DEFINITION = """Only direct 1-on-1 (or small-group) coaching or psychological-support roles, such as a coach, associate coach on a coaching platform, career coach or advisor, wellbeing coach, corporate psychologist, or a career / livelihoods coach for an NGO or education organisation.
+# V2: the first Branch 3 wording. It still held commands ("Score as MARGINAL instead", "It is not a core role
+# for ...") inside the data block, so the data notice contradicted it; kept only to recognise stored text.
+LEGACY_V2_CORE_ROLE_DEFINITION = """Only direct 1-on-1 (or small-group) coaching or psychological-support roles, such as a coach, associate coach on a coaching platform, career coach or advisor, wellbeing coach, corporate psychologist, or a career / livelihoods coach for an NGO or education organisation.
 A role is a core role only when the role's main duty is delivering 1-on-1 (or small-group) coaching or psychological support to clients. It is not a core role for a corporate trainer, a learning and development (L&D) specialist, leadership-development or programme / people-development roles, an internal training facilitator, and any role whose main duty is designing, running or coordinating training programmes."""
 
-LEGACY_ADJACENT_ROLE_DEFINITION = """Corporate learning and development specialist, talent development, people development, training coordinator, or career counselling / advisory roles where the candidate's background is transferable and the required language level is compatible with the candidate's languages. Score as MARGINAL instead: mixed HR / recruitment responsibilities, unclear coaching scope, administrative L&D."""
+LEGACY_V2_ADJACENT_ROLE_DEFINITION = """Corporate learning and development specialist, talent development, people development, training coordinator, or career counselling / advisory roles where the candidate's background is transferable and the required language level is compatible with the candidate's languages. Score as MARGINAL instead: mixed HR / recruitment responsibilities, unclear coaching scope, administrative L&D."""
+
+# Current bodies: declarative definitions (what a role is), never commands to the model.
+LEGACY_CORE_ROLE_DEFINITION = """Only direct 1-on-1 (or small-group) coaching or psychological-support roles, such as a coach, associate coach on a coaching platform, career coach or advisor, wellbeing coach, corporate psychologist, or a career / livelihoods coach for an NGO or education organisation.
+A role is a core role when its main duty is delivering 1-on-1 (or small-group) coaching or psychological support to clients. A corporate trainer, a learning and development (L&D) specialist, leadership-development and programme / people-development roles, an internal training facilitator, and any role whose main duty is designing, running or coordinating training programmes are not core roles."""
+
+LEGACY_ADJACENT_ROLE_DEFINITION = """Corporate learning and development specialist, talent development, people development, training coordinator, or career counselling / advisory roles where the candidate's background is transferable and the required language level is compatible with the candidate's languages.
+Roles with mixed HR / recruitment responsibilities, an unclear coaching scope or an administrative L&D focus are marginal matches, not adjacent roles."""
 
 LEGACY_DEALBREAKERS = """Coaching or people development is only a secondary duty of an IT / Engineering / Sales / Project Management / Scrum Master role; the role requires coding, technical IT delivery or P&L management; the role is executive coaching of C-suite leaders that strictly requires native / C2-level proficiency in a language the candidate does not have at that level; or the required seniority is beyond what the candidate profile supports."""
 
-LEGACY_FIELD_UPGRADES: Dict[str, Tuple[str, str]] = {
-    "core_role_definition": (LEGACY_V1_CORE_ROLE_DEFINITION, LEGACY_CORE_ROLE_DEFINITION),
-    "adjacent_role_definition": (LEGACY_V1_ADJACENT_ROLE_DEFINITION, LEGACY_ADJACENT_ROLE_DEFINITION),
-    "dealbreakers": (LEGACY_V1_DEALBREAKERS, LEGACY_DEALBREAKERS),
+LEGACY_FIELD_UPGRADES: Dict[str, Tuple[Tuple[str, ...], str]] = {
+    "core_role_definition": ((LEGACY_V1_CORE_ROLE_DEFINITION, LEGACY_V2_CORE_ROLE_DEFINITION), LEGACY_CORE_ROLE_DEFINITION),
+    "adjacent_role_definition": (
+        (LEGACY_V1_ADJACENT_ROLE_DEFINITION, LEGACY_V2_ADJACENT_ROLE_DEFINITION),
+        LEGACY_ADJACENT_ROLE_DEFINITION,
+    ),
+    "dealbreakers": ((LEGACY_V1_DEALBREAKERS,), LEGACY_DEALBREAKERS),
 }
 
-# V1 seed text -> current seed body (an exact match means the text was never edited).
-LEGACY_TEXT_UPGRADES: Dict[str, str] = {old: new for old, new in LEGACY_FIELD_UPGRADES.values()}
+# Earlier seed text -> current seed body (an exact match means the text was never edited).
+LEGACY_TEXT_UPGRADES: Dict[str, str] = {
+    old: new for olds, new in LEGACY_FIELD_UPGRADES.values() for old in olds
+}
