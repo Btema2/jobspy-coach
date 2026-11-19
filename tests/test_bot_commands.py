@@ -661,3 +661,15 @@ def test_mutating_set_matches_spec(router):
         assert not router.is_mutating(parse_update(message_update(1, command)))
     assert not router.is_mutating(parse_update(message_update(1, "plain text")))
     assert not router.is_mutating(parse_update(callback_update(1, "wz:1")))
+
+
+def test_market_from_match_is_what_add_market_stores():
+    from src.bot.commands import market_from_match
+    from src.bot.countries import resolve_country
+
+    match = resolve_country("Germany").match
+    assert market_from_match(match, False, False) == Market("Germany", "Germany", ("germany",), False, False, ("de", "en"))
+    remote_only = market_from_match(match, False, True)
+    assert remote_only.name == "Germany (remote only)" and remote_only.remote and remote_only.remote_only
+    region = market_from_match(resolve_country("Europe").match, True, False)
+    assert region.countries == () and region.location == "Europe" and region.remote

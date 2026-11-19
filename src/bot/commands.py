@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence, Tuple
 
 from src.bot.client import TelegramBotClient
-from src.bot.countries import resolve_country
+from src.bot.countries import CountryMatch, resolve_country
 from src.bot.render import PAGE_SIZE, chunk_html, esc, paginate, render_apply
 from src.bot.updates import OutgoingMessage, Update
 from src.config import Settings
@@ -109,6 +109,18 @@ class BotContext:
     # Atomically takes the cycle (and digest) locks for a data-changing command; yields False when one is held.
     cycle_guard: Optional[Callable[[], ContextManager[bool]]] = None
     stop_event: Optional[threading.Event] = None  # set at shutdown; makes waits of worker threads abortable
+
+
+def market_from_match(match: CountryMatch, remote: bool, remote_only: bool) -> Market:
+    """The market for a resolved country or region (shared by ``/add_market`` and the free-text translator)."""
+    return Market(
+        name=match.name + (" (remote only)" if remote_only else ""),
+        location=match.name,
+        countries=(match.country,) if match.country else (),
+        remote=remote or remote_only,
+        remote_only=remote_only,
+        languages=match.languages,
+    )
 
 
 def _reply(text: str) -> List[OutgoingMessage]:
@@ -435,15 +447,8 @@ class CommandRouter:
                 return _reply("Which one did you mean? " + ", ".join(esc(o.name) for o in resolution.options))
             return _reply(f"Unknown country '{esc(_clip(text, 60))}'. Try the English name, e.g. Germany.")
         match = resolution.match
-        name = match.name + (" (remote only)" if remote_only else "")
-        market = Market(
-            name=name,
-            location=match.name,
-            countries=(match.country,) if match.country else (),
-            remote=remote or remote_only,
-            remote_only=remote_only,
-            languages=match.languages,
-        )
+        market = market_from_match(match, remote, remote_only)
+        name = market.name
         snapshot = self._snapshot()
         ops: List[Operation] = []
         if snapshot is not None and any(m.name.strip().casefold() == name.casefold() for m in snapshot.markets):
