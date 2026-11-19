@@ -191,7 +191,7 @@ def _store_credentials(
     env_path: Path, updates: Dict[str, str], effective: Dict[str, str], out: Callable[[str], None]
 ) -> None:
     updates = dict(updates)
-    if effective.get("OPENROUTER_API_KEY") and not read_env_value(env_path, "OPENROUTER_MODELS"):
+    if effective.get("OPENROUTER_API_KEY") and read_env_value(env_path, "OPENROUTER_MODELS") is None:  # a blank value is deliberate
         updates["OPENROUTER_MODELS"] = DEFAULT_OPENROUTER_MODELS
     if updates:
         merge_env_file(env_path, updates)
@@ -232,6 +232,13 @@ def _profile_step(
     return True
 
 
+def _polling_enabled(env_path: Path, settings: Settings) -> bool:
+    raw = read_env_value(env_path, "TELEGRAM_BOT_POLLING")
+    if raw is None or not raw.strip():
+        return settings.telegram_bot_polling
+    return raw.strip().lower() not in ("false", "0", "no", "off")
+
+
 def _pairing_step(
     env_path: Path,
     state: BotStateStore,
@@ -249,11 +256,21 @@ def _pairing_step(
         return False
     if chat_id and chat_id.strip():
         out("TELEGRAM_CHAT_ID is set but is not a user id the bot can adopt; pairing will replace it.")
+    if not _polling_enabled(env_path, settings):
+        out(
+            "TELEGRAM_BOT_POLLING is off, so this daemon does not read bot messages and no pairing code "
+            "was issued. Set it to true and run jobspy-coach init again to pair."
+        )
+        return False
     code = issue_pairing_code(state, clock())
     minutes = PAIRING_TTL_SECONDS // 60
     out(
         f"Send /start {format_code(code)} to the bot in a private chat within {minutes} minutes "
         "(the daemon must be running)."
+    )
+    out(
+        "After 5 wrong codes pairing stays locked until the daemon is restarted; a new code only works "
+        "after that restart."
     )
     return True
 

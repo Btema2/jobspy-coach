@@ -216,6 +216,16 @@ def test_init_openrouter_keeps_existing_models_line(env):
     assert read_env_value(env.path, "OPENROUTER_MODELS") == "vendor/model:free"
 
 
+def test_init_keeps_a_deliberately_blank_models_line(env):
+    env.path.write_text("OPENROUTER_MODELS=\n")
+    prompter = ScriptedPrompter(secrets=["", "", OR])
+
+    assert env.run(prompter) == 0
+
+    assert read_env_value(env.path, "OPENROUTER_API_KEY") == OR
+    assert read_env_value(env.path, "OPENROUTER_MODELS") == ""
+
+
 def test_init_warns_without_any_llm_key(env):
     assert env.run(ScriptedPrompter()) == 0
 
@@ -281,6 +291,25 @@ def test_init_issues_code_when_unpaired(env):
     assert code.expires_at == NOW + PAIRING_TTL_SECONDS
     assert "pairing will replace" in env.output
     assert env.state.get_pairing() is None
+
+
+def test_init_pairing_note_says_a_lockout_needs_a_daemon_restart(env):
+    env.path.write_text("TELEGRAM_CHAT_ID=your_telegram_user_or_chat_id_here\n")
+
+    assert env.run(ScriptedPrompter(secrets=[BOT, "", ""])) == 0
+
+    assert "locked" in env.output and "restart" in env.output
+
+
+@pytest.mark.parametrize("line", ["TELEGRAM_BOT_POLLING=false\n", "TELEGRAM_BOT_POLLING=0\n"])
+def test_init_without_bot_polling_issues_no_pairing_code(env, line):
+    env.path.write_text("TELEGRAM_CHAT_ID=your_telegram_user_or_chat_id_here\n" + line)
+
+    assert env.run(ScriptedPrompter(secrets=[BOT, "", ""])) == 0
+
+    assert env.state.get_pairing_code() is None
+    assert not re.search(r"/start [0-9A-Z]{4}-[0-9A-Z]{4}", env.output)
+    assert "TELEGRAM_BOT_POLLING" in env.output
 
 
 def test_init_without_a_bot_token_skips_pairing(env):
