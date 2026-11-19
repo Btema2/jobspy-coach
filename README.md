@@ -508,7 +508,7 @@ sudo journalctl -u jobspy-coach.service -n 100 --no-pager
 
 ## Testing
 
-The project is covered by **~1,660 unit and end-to-end integration tests** (no network access needed). One additional `live` smoke test makes two real provider calls and is skipped by default.
+The project is covered by **~1,670 unit and end-to-end integration tests** (no network access needed). One additional `live` smoke test makes two real provider calls and is skipped by default.
 
 ### Run All Tests
 
