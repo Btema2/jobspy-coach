@@ -325,6 +325,16 @@ def test_run_now_replies(router, control):
     assert send(router, "/run_now") == "The scheduler is not ready yet."
 
 
+def test_run_now_on_a_paused_profile_says_it_will_not_scrape(router, control, store):
+    apply_changes(store, [SetField("paused", True)], label="pause")
+
+    text = send(router, "/run_now")
+
+    assert text != "Cycle started."
+    assert "paused" in text and "/resume" in text
+    assert control.trigger_calls == 1  # evaluation and digest still run
+
+
 def test_run_now_refused_while_running(router, control):
     control.trigger_result = TRIGGER_BUSY
     assert "already running" in send(router, "/run_now")

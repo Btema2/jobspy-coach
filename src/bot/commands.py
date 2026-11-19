@@ -509,6 +509,12 @@ class CommandRouter:
     def _run_now(self, update: Update) -> List[OutgoingMessage]:
         outcome = self._ctx.trigger_cycle()
         if outcome == TRIGGER_STARTED:
+            snapshot = self._snapshot()
+            if snapshot is not None and snapshot.fields.paused:
+                return _reply(
+                    "Profile is paused: the cycle runs evaluation and digest only, no scraping. "
+                    "Send /resume to scrape."
+                )
             return _reply("Cycle started.")
         if outcome == TRIGGER_BUSY:
             return _reply("A cycle is already running; try again when it has finished.")
