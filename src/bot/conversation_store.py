@@ -3,11 +3,12 @@
 
 Retention: ``pending_change`` holds the validated operation list only (never raw pasted text);
 ``conversation.context`` may hold raw earlier messages while a clarifying question is open and is purged
-on apply, cancel, supersede and expiry. Every connection sets ``PRAGMA secure_delete = ON`` before it
+on apply, cancel, supersede and expiry (expiry is enforced by the running daemon's sweep; rows left behind
+while it is stopped go on its next start). Every connection sets ``PRAGMA secure_delete = ON`` before it
 writes, so deleted text is overwritten in the database file; in WAL mode the old page images also sit in
-the ``-wal`` file until it is checkpointed, so every removal is followed by a best-effort
-``PRAGMA wal_checkpoint(PASSIVE)`` (it never raises and does not wait for readers). Retention is therefore
-bounded by that checkpoint plus the 24 h time-to-live of a context, not guaranteed to the byte.
+the ``-wal`` file until the WAL is reused, so every removal (including dropping a context) is followed by a
+best-effort ``PRAGMA wal_checkpoint(PASSIVE)`` (it never raises, does not wait for readers and does not overwrite
+old frames). Retention is therefore bounded by the 24 h time-to-live of a context, not guaranteed to the byte.
 """
 import json
 import logging
@@ -165,6 +166,8 @@ class ConversationStore:
                 "updated_at = excluded.updated_at",
                 (chat_id, state, payload, stamp),
             )
+        if context is None:  # earlier messages may just have been dropped: same best-effort scrub as the other removals
+            self._scrub()
 
     def purge_contexts(self, before: float) -> int:
         """Reset rows last touched before ``before`` to idle with no context; returns how many held one."""

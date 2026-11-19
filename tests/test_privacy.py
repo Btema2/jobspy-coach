@@ -147,6 +147,7 @@ def test_consent_notice_names_providers():
     assert "free" in notice.lower() and "logging" in notice.lower() and "training" in notice.lower()
     assert "names" in notice and "addresses" in notice and "phone numbers" in notice
     assert "e-mail addresses" in notice and "masked" in notice
+    assert "stored profile" in notice and "persona" in notice and "not masked" in notice
 
 
 def test_masking_is_linear_on_hostile_input():

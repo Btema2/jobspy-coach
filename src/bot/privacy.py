@@ -11,7 +11,8 @@ CONSENT_VERSION = 1
 
 CONSENT_NOTICE = (
     "Before I use a language model for free text: what you write is sent to NVIDIA NIM and, when that "
-    "is unavailable, to free models on OpenRouter. Their logging and training policies may differ, and I "
+    "is unavailable, to free models on OpenRouter, together with your stored profile (persona and definitions, "
+    "which are not masked) so that I can propose changes to it. Their logging and training policies may differ, and I "
     "cannot control what they keep. Please leave out names, addresses and phone numbers. Obvious e-mail addresses "
     "and phone numbers are masked here before sending when I recognise them, but that is best effort. "
     "Choose below to continue; the commands (/help) work without any language model."

@@ -212,6 +212,15 @@ def test_removals_checkpoint_the_wal(store, monkeypatch, action):
     assert any("wal_checkpoint(passive)" in s.lower().replace(" ", "") for s in seen)
 
 
+def test_clearing_a_context_checkpoints_the_wal(store, monkeypatch):
+    store.set_state(CHAT, "awaiting_clarification", {"k": "v"}, now=1.0)
+    seen = _spy_connect(monkeypatch)
+    store.set_state(CHAT, "awaiting_clarification", {"k": "w"}, now=2.0)  # replacing a context keeps it: no scrub needed
+    assert not any("wal_checkpoint" in sql.lower() for sql in seen)
+    store.set_state(CHAT, "idle", None, now=3.0)  # dropping the earlier messages is a removal like the others
+    assert any("wal_checkpoint(passive)" in sql.lower().replace(" ", "") for sql in seen)
+
+
 def test_checkpoint_failure_never_raises(store, monkeypatch):
     store.put_pending(pending("aaaa1111"))
     _spy_connect(monkeypatch, fail_on="wal_checkpoint")
