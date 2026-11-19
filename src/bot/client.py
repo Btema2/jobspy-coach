@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 import httpx
 
@@ -200,6 +201,47 @@ class TelegramBotClient:
         if text:
             payload["text"] = text
         return self._call_bool("answerCallbackQuery", payload)
+
+    def edit_message_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: Optional[dict] = None
+    ) -> bool:
+        """Replace the inline keyboard of a message; without ``reply_markup`` the buttons are removed."""
+        payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._call_bool("editMessageReplyMarkup", payload)
+
+    def get_file_path(self, file_id: str) -> Optional[str]:
+        """The server-side path of an uploaded file, or None when Telegram does not hand one out."""
+        try:
+            result = self.call("getFile", {"file_id": file_id})
+        except TelegramApiError as exc:
+            self._log_failure(exc)
+            return None
+        path = result.get("file_path") if isinstance(result, dict) else None
+        return path if isinstance(path, str) and path else None
+
+    def download_file(self, file_path: str, max_bytes: int) -> bytes:
+        """Download a file by its ``getFile`` path, streamed; more than ``max_bytes`` raises a 413 error.
+
+        Like ``call``, nothing here puts the URL (it embeds the token) into an error or a log line.
+        """
+        url = f"{self._base_url}/file/bot{self._token}/{quote(file_path, safe='/')}"
+        try:
+            with self._client.stream("GET", url) as response:
+                if response.status_code >= 400:
+                    raise TelegramApiError("download", response.status_code, f"HTTP {response.status_code}")
+                declared = response.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > max_bytes:
+                    raise TelegramApiError("download", 413, "file too large")
+                data = bytearray()
+                for chunk in response.iter_bytes():
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise TelegramApiError("download", 413, "file too large")
+                return bytes(data)
+        except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError) as exc:
+            raise TelegramNetworkError("download", type(exc).__name__) from None
 
     def set_my_commands(self, commands: Sequence[Tuple[str, str]]) -> bool:
         payload = {"commands": [{"command": c, "description": d} for c, d in commands]}

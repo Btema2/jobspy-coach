@@ -18,6 +18,7 @@ class FakeTelegram:
         self._unfiltered: set = set()
         self._overrides: Dict[str, List[Tuple[int, Any]]] = {}
         self._next_message_id = 100
+        self._files: Dict[str, Tuple[str, bytes]] = {}  # file_id -> (file_path, content)
         self.transport = httpx.MockTransport(self._handle)
 
     def queue_updates(self, batch: List[dict], *, ignore_offset: bool = False) -> None:
@@ -49,10 +50,25 @@ class FakeTelegram:
         """The next call of ``method`` answers with this status and JSON body (FIFO per method)."""
         self._overrides.setdefault(method, []).append((status, body))
 
+    def serve_file(self, file_id: str, file_path: str, content: bytes) -> None:
+        """``getFile`` answers for ``file_id`` with ``file_path``; ``GET /file/bot<token>/<file_path>`` serves ``content``."""
+        self._files[file_id] = (file_path, content)
+
     def calls(self, method: str) -> List[dict]:
         return [body for name, body in self.requests if name == method]
 
+    def _handle_download(self, request: httpx.Request) -> httpx.Response:
+        # /file/bot<token>/<file_path>: routed by the path (a file path has slashes), recorded without the token
+        path = request.url.path.split("/file/bot", 1)[1].split("/", 1)[1]
+        self.requests.append(("download", {"file_path": path}))
+        for file_path, content in self._files.values():
+            if file_path == path:
+                return httpx.Response(200, content=content)
+        return httpx.Response(404, json={"ok": False, "error_code": 404, "description": "Not Found"})
+
     def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/file/bot"):
+            return self._handle_download(request)
         method = request.url.path.rsplit("/", 1)[-1]
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
         self.requests.append((method, body))
@@ -65,6 +81,14 @@ class FakeTelegram:
         if method == "sendMessage":
             self._next_message_id += 1
             return httpx.Response(200, json={"ok": True, "result": {"message_id": self._next_message_id}})
+        if method == "getFile":
+            entry = self._files.get(body.get("file_id"))
+            if entry is None:
+                return httpx.Response(
+                    400, json={"ok": False, "error_code": 400, "description": "Bad Request: wrong file_id"}
+                )
+            result = {"file_id": body["file_id"], "file_path": entry[0], "file_size": len(entry[1])}
+            return httpx.Response(200, json={"ok": True, "result": result})
         if method == "getMe":
             return httpx.Response(200, json={"ok": True, "result": {"id": 1, "is_bot": True, "username": "fake_bot"}})
         return httpx.Response(200, json={"ok": True, "result": True})
@@ -113,3 +137,30 @@ def callback_update(
             },
         },
     }
+
+
+def document_update(
+    update_id: int,
+    file_id: str,
+    file_name: str,
+    *,
+    caption: Optional[str] = None,
+    file_size: Optional[int] = None,
+    mime_type: Optional[str] = "text/plain",
+    user_id: int = 111,
+    chat_id: int = 111,
+    chat_type: str = "private",
+    date: Optional[int] = None,
+) -> dict:
+    update = message_update(update_id, "", user_id=user_id, chat_id=chat_id, chat_type=chat_type, date=date)
+    message = update["message"]
+    del message["text"]
+    document: Dict[str, Any] = {"file_id": file_id, "file_unique_id": "u" + file_id, "file_name": file_name}
+    if file_size is not None:
+        document["file_size"] = file_size
+    if mime_type is not None:
+        document["mime_type"] = mime_type
+    message["document"] = document
+    if caption is not None:
+        message["caption"] = caption
+    return update

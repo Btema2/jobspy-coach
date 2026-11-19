@@ -261,3 +261,78 @@ def test_helpers_return_false_on_failure():
     assert client.edit_message_text(5, 9, "t") is False
     assert client.answer_callback_query("cb1") is False
     assert client.set_my_commands([("a", "b")]) is False
+
+
+# --- files and reply markup ----------------------------------------------------------------------
+
+
+def test_get_file_path_and_download_roundtrip():
+    fake = FakeTelegram()
+    fake.serve_file("f1", "documents/file_1.txt", b"hello <PLACEHOLDER>")
+    client = _client(fake)
+    path = client.get_file_path("f1")
+    assert path == "documents/file_1.txt"
+    assert client.download_file(path, 1024) == b"hello <PLACEHOLDER>"
+    assert fake.calls("getFile") == [{"file_id": "f1"}]
+    assert fake.calls("download") == [{"file_path": "documents/file_1.txt"}]
+
+
+def test_get_file_path_none_for_unknown_file():
+    fake = FakeTelegram()
+    assert _client(fake).get_file_path("nope") is None
+
+
+def test_download_limit_is_exact():
+    fake = FakeTelegram()
+    fake.serve_file("f1", "d/a.txt", b"x" * 100)
+    client = _client(fake)
+    assert len(client.download_file("d/a.txt", 100)) == 100
+    with pytest.raises(TelegramApiError) as info:
+        client.download_file("d/a.txt", 99)
+    assert (info.value.method, info.value.status, info.value.description) == ("download", 413, "file too large")
+
+
+def test_download_stops_reading_at_the_limit_without_content_length():
+    def handler(request):
+        def chunks():
+            for _ in range(1000):
+                yield b"x" * 1024
+
+        return httpx.Response(200, content=chunks())
+
+    client = TelegramBotClient(TOKEN, transport=httpx.MockTransport(handler))
+    with pytest.raises(TelegramApiError) as info:
+        client.download_file("d/a.txt", 4096)
+    assert info.value.status == 413
+
+
+def test_download_http_error_and_network_error_never_leak_token(caplog):
+    fake = FakeTelegram()
+    client = _client(fake)
+    with pytest.raises(TelegramApiError) as info:
+        client.download_file("d/missing.txt", 100)
+    assert info.value.status == 404
+
+    def boom(request):
+        raise httpx.ConnectError(f"cannot reach {request.url}", request=request)
+
+    broken = TelegramBotClient(TOKEN, transport=httpx.MockTransport(boom))
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TelegramNetworkError) as net:
+            broken.download_file("d/a.txt", 100)
+    assert str(net.value) == "ConnectError"
+    for text in (caplog.text, str(net.value), repr(net.value), str(info.value)):
+        assert TOKEN not in text and "api.telegram.org" not in text
+
+
+def test_edit_message_reply_markup_payloads():
+    fake = FakeTelegram()
+    client = _client(fake)
+    assert client.edit_message_reply_markup(5, 9) is True
+    assert client.edit_message_reply_markup(5, 9, {"inline_keyboard": []}) is True
+    assert fake.calls("editMessageReplyMarkup") == [
+        {"chat_id": 5, "message_id": 9},
+        {"chat_id": 5, "message_id": 9, "reply_markup": {"inline_keyboard": []}},
+    ]
+    fake.respond("editMessageReplyMarkup", 400, _error(400, "message is not modified"))
+    assert client.edit_message_reply_markup(5, 9) is False

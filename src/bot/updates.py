@@ -9,6 +9,19 @@ _FORWARD_KEYS = ("forward_origin", "forward_date", "forward_from", "forward_from
 _CHAT_TYPES = {"private", "group", "supergroup", "channel", "sender"}
 
 
+MAX_FILE_NAME = 255
+
+
+@dataclass(frozen=True)
+class DocumentRef:
+    """The document attached to a message (an upload); the bytes are fetched separately with ``getFile``."""
+
+    file_id: str
+    file_name: str
+    file_size: Optional[int]
+    mime_type: Optional[str]
+
+
 @dataclass(frozen=True)
 class Update:
     update_id: int
@@ -23,6 +36,7 @@ class Update:
     callback_id: Optional[str] = None
     message_id: Optional[int] = None  # the message a callback button sits on
     forwarded: bool = False  # a forwarded message is never a command
+    document: Optional[DocumentRef] = None  # an uploaded file; ``text`` is then its caption and ``command`` None
 
 
 @dataclass(frozen=True)
@@ -51,6 +65,19 @@ def _chat_type(chat: dict) -> Optional[str]:
     return value if value in _CHAT_TYPES else "unknown"
 
 
+def _document(value: Any) -> Optional[DocumentRef]:
+    if not isinstance(value, dict) or not isinstance(value.get("file_id"), str) or not value["file_id"]:
+        return None
+    size = _int(value.get("file_size"))
+    mime = value.get("mime_type")
+    return DocumentRef(
+        file_id=value["file_id"],
+        file_name=_text(value.get("file_name"))[:MAX_FILE_NAME],
+        file_size=size if size is not None and size >= 0 else None,
+        mime_type=mime[:100] if isinstance(mime, str) else None,
+    )
+
+
 def _split_command(text: str):
     if not text.startswith("/"):
         return None, ""
@@ -76,9 +103,11 @@ def _parse(raw: Any) -> Update:
     message = raw.get("message")
     if isinstance(message, dict):
         chat = _dict(message.get("chat"))
-        text = _text(message.get("text"))
+        document = _document(message.get("document"))
+        # An upload's text is its caption, and a caption is never a command.
+        text = _text(message.get("caption")) if document is not None else _text(message.get("text"))
         forwarded = any(key in message for key in _FORWARD_KEYS)
-        command, args = (None, "") if forwarded else _split_command(text)
+        command, args = (None, "") if forwarded or document is not None else _split_command(text)
         return Update(
             update_id=update_id,
             kind="message",
@@ -91,6 +120,7 @@ def _parse(raw: Any) -> Update:
             args=args,
             message_id=_int(message.get("message_id")),
             forwarded=forwarded,
+            document=document,
         )
 
     callback = raw.get("callback_query")
