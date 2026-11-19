@@ -363,6 +363,29 @@ def test_bot_unpair_clears_pairing_and_chat_id(isolate_cli_test_db, tmp_path):
     assert "jobspy-coach init" in result.output and "Restart the daemon" in result.output
 
 
+def test_bot_unpair_clears_llm_tables(isolate_cli_test_db, tmp_path):
+    import time
+
+    from src.bot.conversation_store import ConversationStore, PendingChange
+    from src.bot.state import BotStateStore
+    from src.storage.db import Database
+
+    db = Database(isolate_cli_test_db)
+    db.init_db()
+    BotStateStore(db).set_pairing(5, 5)
+    store = ConversationStore(db)
+    store.put_pending(PendingChange(5, "abcd1234", 1, "chat", "[]", None, time.time()))
+    store.set_state(5, "awaiting_clarification", {"rounds": [["<MARKER>", "?"]]}, time.time())
+    store.record_consent(5, 1)
+
+    result = runner.invoke(app, ["bot", "unpair"])
+
+    assert result.exit_code == 0, result.output
+    assert store.get_pending(5) is None
+    assert store.get_state(5).state == "idle" and store.get_state(5).context is None
+    assert not store.has_consent(5, 1)
+
+
 def test_bot_unpair_without_env_file(isolate_cli_test_db, tmp_path):
     result = runner.invoke(app, ["bot", "unpair"])
 

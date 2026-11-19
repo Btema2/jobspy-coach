@@ -10,6 +10,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from src.bot.bootstrap import InitOptions, TyperPrompter, http_validators, run_init
+from src.bot.conversation_store import ConversationStore
 from src.bot.state import BotStateStore
 from src.config import get_settings
 from src.envfile import merge_env_file
@@ -188,6 +189,7 @@ def bot_unpair() -> None:
     db = Database(settings.db_path)
     db.init_db()
     BotStateStore(db).clear_pairing()
+    ConversationStore(db).clear_all()  # the next account must not see (or inherit) proposals and consent
     env_path = Path(".env")
     if env_path.exists():
         try:

@@ -71,9 +71,10 @@ def telegram(monkeypatch) -> BlockingTelegram:
 
 def _stop(daemon: DaemonService) -> None:
     daemon.request_shutdown()
-    thread = getattr(daemon, "_bot_thread", None)
-    if thread is not None:
-        thread.join(timeout=3)
+    for name in ("_bot_thread", "_conversation_thread"):
+        thread = getattr(daemon, name, None)
+        if thread is not None:
+            thread.join(timeout=3)
 
 
 # --- start order --------------------------------------------------------------------------
@@ -400,3 +401,174 @@ def test_on_paired_updates_notifier_chat_id(tmp_path):
     daemon = _daemon(tmp_path, notifier=notifier)
     daemon._on_paired(12345)
     assert notifier.chat_id == "12345"
+
+
+# --- the language-model layer (conversation worker, ChatLLM) -------------------------------------
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_conversation_worker_started_after_poller_and_stops_on_shutdown(tmp_path, telegram, monkeypatch):
+    from src.bot.conversation import ConversationService
+    from src.bot.poller import BotPoller
+
+    order: List[str] = []
+    real_poller_start, real_worker_start = BotPoller.start, ConversationService.start
+    monkeypatch.setattr(BotPoller, "start", lambda self: order.append("poller") or real_poller_start(self))
+    monkeypatch.setattr(ConversationService, "start", lambda self: order.append("worker") or real_worker_start(self))
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
+    assert daemon._start_bot() is not None
+    thread = daemon._conversation_thread
+    try:
+        assert order == ["poller", "worker"]
+        assert thread.is_alive() and thread.daemon and thread.name == "bot-conversation"
+        daemon._stop_event.set()  # a batch aborting must not touch the worker
+        time.sleep(0.6)
+        daemon._stop_event.clear()
+        assert thread.is_alive()
+        started = time.monotonic()
+        daemon.request_shutdown()
+        thread.join(timeout=1.0)
+        assert not thread.is_alive() and time.monotonic() - started < 1.0
+    finally:
+        _stop(daemon)
+
+
+def test_chat_llm_uses_shutdown_event_and_chain_providers(tmp_path, telegram):
+    from types import SimpleNamespace
+
+    from tests.fake_llm import ScriptedLLM, make_providers
+
+    providers = make_providers(ScriptedLLM().transport)
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
+    daemon.evaluator = SimpleNamespace(providers=providers)
+    poller = daemon._start_bot()
+    try:
+        llm = daemon.chat_llm
+        assert llm is not None and llm._stop_event is daemon._shutdown_requested
+        assert llm.available() and llm._providers() == providers
+        assert poller._router.conversation._ctx.chat_llm is llm
+    finally:
+        _stop(daemon)
+
+
+def test_chat_llm_unconfigured_daemon_still_starts_bot(tmp_path, telegram):
+    import src.bot.conversation as conv
+
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>", TELEGRAM_CHAT_ID="111", NVIDIA_API_KEY="")
+    poller = daemon._start_bot()
+    try:
+        assert poller is not None and daemon.chat_llm is not None and daemon.chat_llm.available() is False
+        reply = poller._router.handle(parse_update(message_update(1, "please add a role")))
+        assert reply[0].text == conv.NOT_CONFIGURED_REPLY
+        assert "step-by-step" in poller._router.handle(parse_update(message_update(2, "/setup")))[0].text
+    finally:
+        _stop(daemon)
+
+
+class PacedTelegram:
+    """FakeTelegram that makes an empty getUpdates take a moment (a real long poll blocks)."""
+
+    def __init__(self):
+        from tests.fake_telegram import FakeTelegram
+
+        self.fake = FakeTelegram()
+        self.transport = httpx.MockTransport(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        response = self.fake._handle(request)
+        if request.url.path.endswith("/getUpdates") and response.json()["result"] == []:
+            time.sleep(0.05)
+        return response
+
+    def texts(self) -> List[str]:
+        return [c["text"] for c in self.fake.calls("sendMessage")]
+
+
+def test_working_and_progress_note_and_poller_stays_responsive(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import src.bot.conversation as conv
+    import src.scheduler.daemon as daemon_module
+    from src.bot.conversation_store import ConversationStore
+    from src.bot.privacy import CONSENT_VERSION
+    from src.profile.ops import create_starter_profile
+    from src.profile.store import ProfileStore
+    from tests.fake_llm import make_providers, nim_reply
+
+    monkeypatch.setattr(conv, "DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(conv, "PROGRESS_NOTE_SECONDS", 0.05)
+    release, entered = threading.Event(), threading.Event()
+    answer = json.dumps({"kind": "proposal", "operations": [{"op": "add_role", "name": "<ROLE>", "synonyms": []}]})
+
+    def slow_nim(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        assert release.wait(15)
+        return nim_reply(answer)
+
+    telegram = PacedTelegram()
+    real = daemon_module.TelegramBotClient
+    monkeypatch.setattr(daemon_module, "TelegramBotClient", lambda token, **kw: real(token, transport=telegram.transport, **kw))
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>", TELEGRAM_CHAT_ID="111")
+    daemon.evaluator = SimpleNamespace(providers=make_providers(httpx.MockTransport(slow_nim)))
+    create_starter_profile(ProfileStore(daemon.db), wow_threshold=8.5, digest_threshold=6.5, output_language="en")
+    ConversationStore(daemon.db).record_consent(111, CONSENT_VERSION)
+    poller = daemon._start_bot()
+    try:
+        assert poller is not None
+        telegram.fake.queue_updates([message_update(1, "add the role <ROLE>")])
+        assert _wait_for(lambda: conv.WORKING_REPLY in telegram.texts())
+        assert entered.wait(5)
+        assert _wait_for(lambda: conv.PROGRESS_REPLY in telegram.texts())
+        assert not any("pc:" in json.dumps(c.get("reply_markup", {})) for c in telegram.fake.calls("sendMessage"))
+
+        telegram.fake.queue_updates([message_update(2, "/help")])  # the poller answers while the model is stuck
+        assert _wait_for(lambda: any(t.startswith("/help -") for t in telegram.texts()))
+        assert not release.is_set()
+
+        release.set()
+        assert _wait_for(
+            lambda: any("pc:" in json.dumps(c.get("reply_markup", {})) for c in telegram.fake.calls("sendMessage"))
+        )
+    finally:
+        release.set()
+        _stop(daemon)
+
+
+def test_on_paired_clears_conversation_tables(tmp_path, telegram):
+    from src.bot.conversation_store import ConversationStore, PendingChange
+
+    notifier = MagicMock()
+    notifier.chat_id = ""
+    daemon = _daemon(tmp_path, notifier=notifier, TELEGRAM_BOT_TOKEN="<TOKEN>")
+    daemon.db.init_db()
+    store = ConversationStore(daemon.db)
+
+    def fill():
+        store.put_pending(PendingChange(5, "abcd1234", 1, "chat", "[]", None, time.time()))
+        store.set_state(5, "awaiting_clarification", {"rounds": [["<MARKER>", "?"]]}, time.time())
+        store.record_consent(5, 1)
+
+    fill()
+    daemon._on_paired(12345)  # no bot running: the tables are still cleared
+    assert notifier.chat_id == "12345"
+    assert store.get_pending(5) is None and store.get_state(5).state == "idle" and not store.has_consent(5, 1)
+
+    daemon._start_bot()
+    try:
+        calls = []
+        daemon._bot_router.conversation.reset_memory = lambda: calls.append(1)
+        fill()
+        daemon._on_paired(777)
+        assert calls == [1]
+        assert store.get_pending(5) is None and not store.has_consent(5, 1)
+    finally:
+        _stop(daemon)

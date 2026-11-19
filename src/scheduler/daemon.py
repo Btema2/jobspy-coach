@@ -23,6 +23,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from src.bot.auth import Authorizer, adopt_chat_id
+from src.bot.chat_llm import ChatLLM
 from src.bot.client import TelegramBotClient
 from src.bot.commands import (
     COMMANDS,
@@ -32,6 +33,7 @@ from src.bot.commands import (
     BotContext,
     CommandRouter,
 )
+from src.bot.conversation_store import ConversationStore
 from src.bot.poller import BotPoller
 from src.bot.state import BotStateStore
 from src.config import get_settings
@@ -139,6 +141,9 @@ class DaemonService:
         self._digest_lock = threading.Lock()
         self._bot_poller: Optional[BotPoller] = None
         self._bot_thread: Optional[threading.Thread] = None
+        self._bot_router: Optional[CommandRouter] = None
+        self._conversation_thread: Optional[threading.Thread] = None
+        self.chat_llm: Optional[ChatLLM] = None
         self._chain_lock = threading.Lock()
         # Futures of the batch in flight (snapshot-cancelled by request_shutdown).
         self._futures: List[Future] = []
@@ -804,8 +809,19 @@ class DaemonService:
     # ----- bot -----
 
     def _on_paired(self, chat_id: int) -> None:
-        """A new pairing: alerts and digests go to the paired chat from now on, without a restart."""
+        """A new pairing: alerts and digests go to the paired chat from now on, without a restart.
+
+        A new account never inherits the previous one's proposals, consent or clarification context: the
+        conversation service forgets its memory state first (a request still in flight loses its result),
+        then the three conversation tables are cleared.
+        """
         self.notifier.chat_id = str(chat_id)
+        try:
+            if self._bot_router is not None:
+                self._bot_router.conversation.reset_memory()
+            ConversationStore(self.db).clear_all()
+        except Exception as exc:  # pairing itself must go through
+            logger.warning("could not clear the conversation state: %s", type(exc).__name__)
 
     def _start_bot(self) -> Optional[BotPoller]:
         """Start the Telegram bot poller thread; any failure is logged and the daemon runs without the bot.
@@ -825,6 +841,9 @@ class DaemonService:
             if not self.notifier.chat_id and pairing is not None:
                 self.notifier.chat_id = str(pairing.chat_id)
             env_path = Path(".env")
+            # Always built: without a key ``available()`` is False and free text answers "not configured".
+            # It drives the chain's own providers (shared limiters and budget), stops only at process shutdown.
+            self.chat_llm = ChatLLM(lambda: self._get_evaluator().providers, stop_event=self._shutdown_requested)
             ctx = BotContext(
                 db_path=self.db.db_path,
                 env_path=env_path,
@@ -834,19 +853,24 @@ class DaemonService:
                 scraper=self.scraper,
                 cycle_guard=self.cycle_guard,
                 stop_event=self._shutdown_requested,
+                chat_llm=self.chat_llm,
             )
+            router = CommandRouter(ctx, client=client)
             poller = BotPoller(
                 client,
                 state,
                 Authorizer(state),
-                CommandRouter(ctx, client=client),
+                router,
                 stop_event=self._shutdown_requested,
                 env_path=env_path,
                 on_paired=self._on_paired,
                 commands=COMMANDS,
             )
+            self._bot_router = router
             self._bot_thread = poller.start()
             self._bot_poller = poller
+            # The free-text worker (daemon thread, stops on the shutdown event; never joined without a timeout).
+            self._conversation_thread = router.conversation.start()
             logger.info("Telegram bot polling started.")
             return poller
         except Exception as exc:  # never the message: it can hold a request URL
