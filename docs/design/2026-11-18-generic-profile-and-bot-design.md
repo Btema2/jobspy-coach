@@ -1,6 +1,6 @@
 # Generic Search Profile and Telegram Management Bot: Design
 
-Status: revision 3, after two independent reviews against the code. Branches 1-4 implemented (the section 15 seniority term table was decided in the branch 3 plan). Date: 2026-11-18.
+Status: revision 3, after two independent reviews against the code. Branches 1-5 implemented (the section 15 reserved chat slots were decided in the branch 5 plan: none, priority acquire instead). Date: 2026-11-18.
 Scope: architectural. One design, five sequenced implementation branches (section 14).
 
 All examples use placeholders (`<ROLE>`, `<MARKET>`). This file must never contain candidate data (AGENTS.md section 1).

@@ -14,6 +14,7 @@ JobSpy Coach scouts coaching vacancies across major job boards (LinkedIn, Indeed
 - [Prerequisites](#prerequisites)
 - [Installation & Setup](#installation--setup)
 - [Telegram Bot](#telegram-bot)
+  - [Talking to the bot](#talking-to-the-bot)
 - [Configuration Reference](#configuration-reference)
   - [LLM Provider Chain](#llm-provider-chain)
   - [Privacy of Local Configuration](#privacy-of-local-configuration)
@@ -189,7 +190,7 @@ The daemon contains a private Telegram bot that reads and changes your stored pr
 - The code is single-use and valid for 15 minutes. After 5 wrong codes pairing is locked until the daemon restarts (a warning is logged); a new code from `jobspy-coach init` only works **after you restart the daemon**. With `TELEGRAM_BOT_POLLING=false` `init` issues no code (nobody would receive `/start`). `init` on an already paired install says `Already paired` and issues no code (use `bot unpair` first to pair another account). The daemon must be running when you send `/start <code>`.
 - **Only the paired user is served.** Every update is checked, including button presses: it must come from the paired user id in the paired private chat. Strangers, groups and forwarded messages are dropped without a reply and logged without their content.
 - **Lost or changed account**: `jobspy-coach bot unpair` forgets the pairing and blanks `TELEGRAM_CHAT_ID` in `.env`; restart the daemon, then run `init` and send the new code. Alerts stop until you pair again.
-- Commands are applied immediately through the same validated, versioned operations as `profile import`: each shows a one-line-per-change diff and bumps the profile version; `/undo` and `/restore` bring a previous version back. A command is executed at most once: the update offset is saved before it runs, so a restart cannot replay an `/undo`, and a mutating command older than 15 minutes is ignored (send it again). There is no free-text understanding yet; unknown text gets a hint to send `/help`.
+- Commands are applied immediately through the same validated, versioned operations as `profile import`: each shows a one-line-per-change diff and bumps the profile version; `/undo` and `/restore` bring a previous version back. A command is executed at most once: the update offset is saved before it runs, so a restart cannot replay an `/undo`, and a mutating command older than 15 minutes is ignored (send it again). Free text goes through a language model and a confirmation step (see [Talking to the bot](#talking-to-the-bot)); without an LLM key, unknown text gets a hint to send `/help`.
 - Replies are English only (alert and digest texts follow the profile's `output_language`), are split below Telegram's limit, and escape every term you typed.
 
 ### Commands
@@ -198,7 +199,8 @@ The daemon contains a private Telegram bot that reads and changes your stored pr
 |---|---|
 | Read | `/help`, `/profile`, `/roles`, `/markets`, `/exclusions`, `/preview`, `/dropped` |
 | Change | `/add_role <name> [= synonym, synonym]`, `/remove_role <name>`, `/add_market <country> [remote] [remote_only]`, `/exclude <term> [prefix]`, `/threshold wow\|digest <n>`, `/pause`, `/resume`, `/run_now` |
-| Setup | `/setup` (guided: role, synonyms, market, remote preference, confirm; with inline buttons) |
+| Setup | `/setup` (describe what you want in your own words, or step by step with inline buttons when no LLM is configured), `/setup guided` (always step by step: role, synonyms, market, remote preference, confirm) |
+| Confirm | `/ok` (apply the pending proposal), `/cancel` (discard it, and anything in flight) |
 | Safety | `/undo` (repeat to toggle), `/history`, `/restore <n>`, `/requeue [thresholds]` |
 | Insight | `/stats`, `/test <role> [linkedin]` |
 
@@ -206,6 +208,29 @@ The daemon contains a private Telegram bot that reads and changes your stored pr
 - `/pause` stops scraping only (evaluation and digests continue). `/resume` is refused while the profile has no enabled query and otherwise starts a cycle at once. `/run_now` starts a cycle and answers that one is running if it is. `/requeue` is refused while a cycle or the digest runs.
 - `/stats` shows the last 7 days per role: calls, new jobs and relevant jobs (evaluated with a score at or above the digest threshold). Failed calls are counted separately from empty results, so a blocked board is not blamed on the query.
 - `/test <role>` is a small trial search: at most one per 5 minutes, at most 3 calls with 5 results each, only on the boards enabled in `SCRAPER_ENABLED_BOARDS` (LinkedIn only when you add the word `linkedin`), and it never saves anything. It reports rows, new postings, the pre-filtered share and example titles. It does **not** measure relevance.
+
+### Talking to the bot
+
+With an LLM key configured (`NVIDIA_API_KEY` and/or `OPENROUTER_API_KEY`), you can change the profile by writing to the bot in plain language instead of using commands. Examples (placeholders, write your own):
+
+- `add the role <ROLE> with the synonyms <SYNONYM>, <SYNONYM>`
+- `also search in <COUNTRY>, remote only`
+- `exclude titles with <TERM>`
+- `raise the WOW threshold to 9`
+- `pause searching`
+- a longer description of what you are looking for (for example from a CV summary, without names and contact details)
+
+How it works:
+
+- The bot sends your text to the language model, which answers with a structured change over a fixed set of operations (add, remove or modify roles, synonyms, markets and exclusion rules; thresholds; persona and role definitions; enable or disable items; pause or resume). It cannot touch your bot token, the paired chat, the providers or any setting outside the profile.
+- **Nothing is applied until you confirm.** The bot shows the change as a diff that is written by code, not by the model (a persona or definition change is shown in full, with the button `Apply persona change`). Press **Confirm** or **Cancel**, or send `/ok` or `/cancel`. A plain `ok` / `yes` or `no` also works while a proposal is waiting. Only one proposal is pending at a time: a new request replaces the old one (you are told). If the profile changed in the meantime (for example by another command), the proposal is refused and you send your request again. A proposal expires after 24 hours.
+- If the request is unclear the bot asks one short question (at most two rounds); your next message is read as the answer.
+- Several messages sent within 3 seconds are merged into one request, up to 3 messages and 12,000 characters in total. A longer text is dropped as a whole with the hint to send it as a file: a `.txt` or `.md` file of up to 20 KB (UTF-8) is read as one request, and its caption is added to it.
+- The bot answers `Working on it...` at once and posts a note after 20 seconds; the model can take up to 2 minutes per provider. Commands keep working meanwhile. At most 30 model calls per hour are made (the cap counts every provider attempt), and the chat uses the same OpenRouter daily budget as the evaluation.
+- Without any LLM key the bot says so and the commands and `/setup guided` keep working.
+- **`/setup`** with an LLM asks you to describe what you are looking for (roles and synonyms, countries or remote work, seniority, what to avoid) in one message or a file, drafts the profile and shows it for confirmation. The button `Step-by-step questions instead` (or `/setup guided`) starts the guided question flow instead.
+
+**Privacy of free text.** Before the first use the bot explains what happens and asks you to acknowledge it: what you write is sent to NVIDIA NIM and, when that is unavailable, to free models on OpenRouter, whose logging and training policies may differ from NVIDIA's and which you cannot control. Leave out names, addresses and phone numbers. Obvious e-mail addresses and phone numbers are masked on your machine before sending (`[email]`, `[phone]`), but this is best effort and cannot recognise names or street addresses. Do not forward messages from other people or job ads to the bot: forwarded messages are rejected on purpose, so paste the text or upload a file instead. Your messages are never written to the log. The text of a request is kept only in memory and, while the bot waits for the answer to a question, in the local database for at most 24 hours; it is deleted when you confirm, cancel, replace the proposal or it expires. `jobspy-coach bot unpair` also clears the pending proposal, the chat state and your acknowledgement, so a newly paired account is asked again (restart the daemon afterwards).
 
 ### One consumer per bot token
 
@@ -263,6 +288,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 - **OpenRouter** is the fallback and is enabled iff `OPENROUTER_API_KEY` and a non-empty `OPENROUTER_MODELS` are set. The models are pinned via the `models` array; the random `openrouter/free` router must not be used.
 - If a provider is rate-limited, out of budget, has a tripped circuit breaker, or returns an unusable answer, the next provider is tried. If none can answer, the job stays `unprocessed` and is retried next cycle.
 - No providers configured: the daemon starts (so scraping still works) but evaluation raises a clear `ConfigurationError` the first time it is needed. Nothing is built at import or construction time.
+- **Free text uses the same providers** (`NVIDIA_API_KEY` / `OPENROUTER_API_KEY`) through a separate path: chat requests take rate-limit slots with priority, ignore the batch circuit breakers, have a 120 s timeout per provider with one attempt, and are capped at 30 model calls per hour; they count against `OPENROUTER_DAILY_BUDGET`. See [Talking to the bot](#talking-to-the-bot).
 - **Rate limit is per process**: the 30 rpm NIM cap is enforced inside one process. Do **not** run `jobspy-coach evaluate` while the daemon is evaluating: two processes double the effective rate and can send duplicate WOW alerts.
 - **Batch latency stats**: the `Evaluation batch finished` log line reports per-job `latency[mean p95 max]` (retries included) and `inflight_peak`. Use them to judge `EVAL_MAX_WORKERS` / `NVIDIA_TIMEOUT_SECONDS`; the measured evidence behind the current defaults is in `docs/model-selection.md`.
 
@@ -271,7 +297,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 Everything specific to you stays in git-ignored local files and is never committed:
 
 - `.env`: API keys, bot token, and the import seeds for the thresholds (the stored profile's thresholds are what scoring uses).
-- `.candidate_profile.md` (legacy, optional): your private candidate persona. It is only read once, to import it into the stored profile; **after the import the persona lives in the profile in the SQLite database** (`data/jobs.db`, git-ignored; also in its last 10 stored profile versions), and editing the file no longer changes scoring. Edit the profile with the Telegram bot or with `jobspy-coach profile export`, edit the YAML, `jobspy-coach profile import <file>`. A generic template is used if the profile has no persona. Treat `data/jobs.db` as private data. Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details).
+- `.candidate_profile.md` (legacy, optional): your private candidate persona. It is only read once, to import it into the stored profile; **after the import the persona lives in the profile in the SQLite database** (`data/jobs.db`, git-ignored; also in its last 10 stored profile versions), and editing the file no longer changes scoring. Edit the profile with the Telegram bot or with `jobspy-coach profile export`, edit the YAML, `jobspy-coach profile import <file>`. A generic template is used if the profile has no persona. Treat `data/jobs.db` as private data. Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details). Text you write to the bot is sent to them too, after your acknowledgement (see [Talking to the bot](#talking-to-the-bot)).
 - `queries.json` (legacy, optional): your former search queries (see `queries.example.json` for the format). It is only read once, to import it into the stored profile (1:1, as pinned queries); afterwards the stored profile is the source of truth and the file is no longer used. Per query, `country_code` is required for Indeed and Glassdoor (they search one country at a time; queries without it skip those boards with a logged warning, e.g. pan-regional "Europe" queries should list only LinkedIn/Google), and the optional `google_search_term` overrides the Google Jobs query string that is otherwise derived as `<search_term> jobs near <location> <time window> [remote]`. Note that Google Jobs currently returns no data to python-jobspy from some networks (it serves a JavaScript challenge page); the scraper logs this once instead of failing silently.
 - `local/profile-export.yaml` (`profile-export*.yaml` is git-ignored): the YAML export of your profile; it contains private data, so `profile export` refuses paths that git would not ignore unless you pass `--force`.
 
@@ -555,6 +581,8 @@ COVERAGE_FILE=/tmp/.coverage pytest -o cache_dir=/tmp/.pytest_cache --cov=src --
 - `tests/test_dedup.py`: Dedup normalization (merge and non-merge cases) and the `rehash` migration.
 - `tests/test_bot_*.py`, `tests/test_countries.py`, `tests/test_envfile.py`, `tests/test_bootstrap.py`, `tests/test_i18n.py`, `tests/test_daemon_bot.py`: Telegram bot client, state, pairing and auth, poller (offset-before-execute, staleness, back-off), commands, wizard, stats, `/test`, `init`, `.env` merging, language tables and daemon wiring (fake Telegram, no network).
 - `tests/test_bot_e2e.py`: the whole bot loop against a fake Telegram server (pairing, a stranger in a group, a command, `/undo` and its re-delivery, `/stats`, shutdown).
+- `tests/test_chat_llm.py`, `tests/test_translator.py`, `tests/test_conversation*.py`, `tests/test_onboarding.py`, `tests/test_privacy.py`, `tests/fake_llm.py`: the free-text layer (chat LLM path and limits, translator schema and injection defences, debounce, consent, proposals and confirmation, onboarding, masking) with scripted fake LLM transports.
+- `tests/test_llm_e2e.py`: a free-text change end to end (fake Telegram and fake LLM: consent, masking, NIM timeout then OpenRouter, confirmation, a replayed button, and an injection attempt).
 
 ---
 
