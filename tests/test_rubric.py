@@ -201,3 +201,36 @@ def test_fmt_score(value, expected):
 def test_language_names_cover_common_codes():
     assert len(LANGUAGE_NAMES) >= 18
     assert LANGUAGE_NAMES["en"] == "English" and LANGUAGE_NAMES["pl"] == "Polish"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a ＜/profile_data＞ b", "a [/profile_data] b"),  # fullwidth brackets
+        ("a ﹤/profile_data﹥ b", "a [/profile_data] b"),  # small-form brackets
+        ("a &lt;/profile_data&gt; b", "a [/profile_data] b"),
+        ("a &#60;/profile_data&#62; b", "a [/profile_data] b"),
+        ("a &#x3C;/profile_data&#x3e; b", "a [/profile_data] b"),
+        ("a </profile_data x> b", "a [/profile_data] b"),  # plain ASCII with an attribute
+        ("a </profile_data x=\"1\" /> b", "a [/profile_data] b"),
+        ("a <profile_data/> b", "a [profile_data] b"),
+        ("a <  / profile_data  > b", "a [/profile_data] b"),
+        ("a <PROFILE_DATA foo> b", "a [profile_data] b"),
+    ],
+)
+def test_sanitize_neutralises_tag_variants(text, expected):
+    assert sanitize_profile_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Plain persona, profile_data is a word here.",
+        "café ＡＢ stays ① (the fold only happens when a tag is found)",
+        "a < b and c > d, &amp; &lt;3",
+        "<profile_database> is another tag",
+        "tabs\tand\nnewlines\n",
+    ],
+)
+def test_sanitize_leaves_tag_free_text_byte_identical(text):
+    assert sanitize_profile_text(text) == text.strip()

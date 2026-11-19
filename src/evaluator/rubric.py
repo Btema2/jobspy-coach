@@ -7,6 +7,7 @@ and to ignore any text in the block that tries to change the output format or th
 thresholds; the non-core cap is ``wow - 0.1`` and exists only when a core-role definition exists.
 """
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -16,7 +17,12 @@ PROFILE_TEXT_LIMIT = 8000
 _CONTROL_RE = re.compile(
     "[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069]"
 )
-_DATA_TAG_RE = re.compile(r"<\s*(/?)\s*profile_data\s*>", re.IGNORECASE)
+# Any opener (ASCII, entity forms), optional slash, the name, anything up to a closer (attributes, a trailing
+# slash). Matched on NFKC-folded text, so fullwidth and small-form angle brackets are caught too.
+_DATA_TAG_RE = re.compile(
+    r"(?:<|&lt;|&#0*60;|&#x0*3c;)\s*(/?)\s*profile_data(?![A-Za-z0-9_])[^<>&]{0,100}(?:>|&gt;|&#0*62;|&#x0*3e;)",
+    re.IGNORECASE,
+)
 
 # ISO 639-1 code -> English name, used for the ``output_language`` slot.
 LANGUAGE_NAMES: Dict[str, str] = {
@@ -45,10 +51,13 @@ class RubricInputs:
 
 def sanitize_profile_text(text: str, limit: int = PROFILE_TEXT_LIMIT) -> str:
     """Candidate-written text made safe to embed: tabs and newlines stay, other control characters go,
-    a ``<profile_data>`` tag can no longer open or close the data block, and the length is capped."""
+    a ``<profile_data>`` tag (any form: attributes, spaces, entities, fullwidth or small-form brackets) can no
+    longer open or close the data block, and the length is capped."""
     text = (text or "").replace("\r\n", "\n")
     text = _CONTROL_RE.sub("", text)
-    text = _DATA_TAG_RE.sub(lambda m: f"[{m.group(1)}profile_data]", text)
+    folded = unicodedata.normalize("NFKC", text)
+    if _DATA_TAG_RE.search(folded):  # fold only when a tag form is present: other text stays byte-identical
+        text = _DATA_TAG_RE.sub(lambda m: f"[{m.group(1)}profile_data]", folded)
     return text.strip()[:limit]
 
 
