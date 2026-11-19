@@ -15,6 +15,7 @@ from src.bot.interview import (
     FOLLOWUP_MAX_CHARS,
     QUESTIONS,
     SLOTS,
+    TURN_SYSTEM_PROMPT,
     ExtractReply,
     InterviewLLM,
     InterviewState,
@@ -545,3 +546,18 @@ def test_turn_catches_any_exception_and_logs_only_the_type(caplog):
 
     with pytest.raises(StopRequested):
         InterviewLLM(Stop(), Translator(Stop())).turn(state(), "roles", "a long answer here", request_id="r2")
+
+
+def test_turn_prompt_counts_a_topic_only_when_the_answer_explicitly_addresses_it():
+    """A live probe saw the model claim ``bonus`` for an answer that never mentioned it: the prompt must say a
+    topic is covered only when the answer explicitly addresses it, leave it out when unsure, and show an example."""
+    llm, nim = engine({"covers": [], "followup": None})
+    llm.turn(state(), "roles", "I want data analyst or BI analyst jobs in Berlin", request_id="r1")
+    system = nim.bodies[0]["messages"][0]["content"]
+    assert system == TURN_SYSTEM_PROMPT
+    lowered = system.lower()
+    assert "only when the answer explicitly" in lowered
+    assert "when unsure, leave it out" in lowered
+    assert "example:" in lowered and '"covers": ["markets"]' in system  # the tiny example names one topic
+    assert "not bonus" in lowered  # the example says what is NOT covered
+    assert "<current_profile>" not in system and "<current_profile>" not in user_of(nim)
