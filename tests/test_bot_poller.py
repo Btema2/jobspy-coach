@@ -94,6 +94,20 @@ def test_offset_persisted_before_mutating_command(telegram, state, tmp_path):
     assert router2.handled == []
 
 
+def test_an_update_below_the_saved_offset_is_not_handled_again(telegram, state, tmp_path):
+    """Telegram never re-delivers an acknowledged update, but a duplicate must not run a command twice."""
+    _paired(state)
+    poller, router = _make(telegram, state, tmp_path)
+
+    poller.process(message_update(10, "/undo", date=int(NOW)))
+    poller.process(message_update(10, "/undo", date=int(NOW)))  # same id again
+    poller.process(message_update(9, "/undo", date=int(NOW)))  # older id
+
+    assert len(router.handled) == 1
+    assert len(_texts(telegram)) == 1
+    assert state.get_offset() == 11
+
+
 def test_offset_is_persisted_even_if_the_handler_would_kill_the_process(telegram, state, tmp_path):
     _paired(state)
     poller, router = _make(telegram, state, tmp_path)

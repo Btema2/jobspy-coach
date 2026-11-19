@@ -132,6 +132,9 @@ class BotPoller:
     def process(self, update_raw: dict) -> None:
         update = parse_update(update_raw)
         if update.update_id >= 0:
+            if update.update_id < self._state.get_offset():
+                logger.debug("skipped already acknowledged update %d", update.update_id)
+                return  # a duplicate delivery must never run a command twice
             self._state.set_offset(update.update_id + 1)  # before anything executes: at-most-once
         decision = self._authorizer.decide(update)
         if decision is AuthDecision.REJECT:
