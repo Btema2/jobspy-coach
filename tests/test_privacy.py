@@ -72,7 +72,14 @@ def test_readme_and_dedup_fixtures_carry_no_real_org_or_home_city_examples():
 
 import pytest  # noqa: E402
 
-from src.bot.privacy import CONSENT_NOTICE, CONSENT_VERSION, mask_personal_data  # noqa: E402
+from src.bot.privacy import (  # noqa: E402
+    CONSENT_NOTICE,
+    CONSENT_VERSION,
+    mask_all,
+    mask_links,
+    mask_personal_data,
+    strip_contact_header,
+)
 
 
 def test_masks_email_and_phones():
@@ -140,8 +147,11 @@ def test_empty_and_plain_text_unchanged():
     assert mask_personal_data("I want <ROLE> work in <MARKET>.") == ("I want <ROLE> work in <MARKET>.", 0)
 
 
+def test_consent_version_is_2():
+    assert CONSENT_VERSION == 2
+
+
 def test_consent_notice_names_providers():
-    assert CONSENT_VERSION == 1
     notice = CONSENT_NOTICE
     assert "NVIDIA NIM" in notice and "OpenRouter" in notice
     assert "free" in notice.lower() and "logging" in notice.lower() and "training" in notice.lower()
@@ -163,3 +173,107 @@ def test_masking_is_linear_on_hostile_input():
         started = time.monotonic()
         mask_personal_data(text)
         assert time.monotonic() - started < 0.5, text[:12]
+
+
+def test_notice_mentions_cv_and_local_storage():
+    notice = CONSENT_NOTICE
+    assert "CV" in notice
+    assert "24 hours" in notice and "stored" in notice
+    assert "locally" in notice or "local" in notice
+    assert "NVIDIA NIM" in notice and "OpenRouter" in notice  # existing sentences kept
+
+
+def test_mask_links_urls_handles_paths():
+    text = (
+        "see https://x.y/z?q=1 and www.site.com or @name plus linkedin.com/in/john-doe, "
+        "github.com/someone/repo and http://example.com."
+    )
+    masked = mask_links(text)
+    assert masked == "see [link] and [link] or [handle] plus [link], [link] and [link]."
+
+
+def test_mask_links_leaves_plain_text_and_non_latin_alone():
+    for text in (
+        "", "I want <ROLE> work in <MARKET>.", "node.js and C++ at 9.5", "name@", "a @ b",
+        "Привіт, шукаю роботу в Києві", "我想找一份工作", "Szukam pracy w Łodzi, über mich", "日本語のテキスト。",
+    ):
+        assert mask_links(text) == text
+        assert mask_all(text) == text
+
+
+def test_mask_links_handles_with_unicode_and_dots():
+    assert mask_links("ping @імя_1 now") == "ping [handle] now"
+    assert mask_links("ping @first.last now") == "ping [handle] now"
+    assert mask_links("end @first.") == "end [handle]."
+
+
+def test_mask_links_is_linear():
+    import time
+
+    hostile = [
+        "www." * 25000, "http://" * 14000, "@" * 100000, "@a" * 50000, "a." * 50000, "https://" + "." * 99990,
+        "linkedin.com/" * 7000, "a.b." * 25000 + "@", "x@" * 50000, "(" * 100000, "https://a/" + "(" * 99000,
+        "github.com" * 10000, "-" * 100000,
+    ]
+    for text in hostile:
+        started = time.monotonic()
+        mask_links(text)
+        mask_all(text)
+        assert time.monotonic() - started < 1.0, text[:12]
+
+
+def test_mask_all_masks_email_phone_and_links():
+    text = "Mail jane@example.com, call +48 123 456 789, see https://example.com/me and @jane_doe."
+    assert mask_all(text) == "Mail [email], call [phone], see [link] and [handle]."
+
+
+def test_mask_all_does_not_turn_email_into_handle():
+    assert mask_all("write to jane@example.com") == "write to [email]"
+
+
+def test_strip_contact_header_with_heading():
+    text = "JANE DOE\nContact: jane@example.com\n+48 123\n\nSummary\nCareer coach.\nExperience\nWork."
+    assert strip_contact_header(text) == "Summary\nCareer coach.\nExperience\nWork."
+
+
+def test_strip_contact_header_heading_variants():
+    for heading in ("EXPERIENCE", "Work Experience:", "Освіта", "Doświadczenie zawodowe", "Berufserfahrung", "Formación", "Compétences"):
+        text = f"JANE DOE\n123 Example Street\n{heading}\nbody"
+        assert strip_contact_header(text) == f"{heading}\nbody"
+
+
+def test_strip_contact_header_long_line_is_not_a_heading():
+    text = "A\nB\nSummary of everything I did in my long career over many years\nSkills\nx"
+    assert strip_contact_header(text) == "Skills\nx"
+
+
+def test_strip_contact_header_without_heading_drops_six_lines():
+    lines = [f"line {i}" for i in range(1, 10)]
+    assert strip_contact_header("\n".join(lines)) == "line 7\nline 8\nline 9"
+
+
+def test_strip_contact_header_without_heading_counts_non_empty_lines():
+    text = "\n".join(["a", "", "b", "c", "", "d", "e", "f", "", "g"])
+    assert strip_contact_header(text) == "g"
+
+
+def test_strip_contact_header_only_header_returns_empty():
+    assert strip_contact_header("JANE DOE\nexample street\n+48 123") == ""
+    assert strip_contact_header("") == ""
+
+
+def test_uppercase_name_is_header():
+    assert strip_contact_header("JANE DOE\nSummary\nHello") == "Summary\nHello"
+
+
+def test_contact_colon_is_header():
+    assert strip_contact_header("Name\nContact:\nx@y.z\nSkills\nPython") == "Skills\nPython"
+
+
+def test_line_one_is_never_a_heading():
+    assert strip_contact_header("Summary\na\nb\nc\nd\ne\nf\ng") == "f\ng"
+    assert strip_contact_header("Summary\nname\nEducation\nx") == "Education\nx"
+
+
+def test_strip_contact_header_keeps_non_latin_body():
+    assert strip_contact_header("Імʼя\nКонтакти\nДосвід\nПрацював у Києві") == "Досвід\nПрацював у Києві"

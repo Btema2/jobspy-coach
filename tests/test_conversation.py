@@ -1200,7 +1200,10 @@ def test_reset_memory_drops_buffers_held_text_and_running_result(svc, clock, tra
     translator.gate = threading.Event()
     translator.add(prop(add_role("<ROLE2>")))
     with sqlite3.connect(db.db_path) as conn:
-        conn.execute("INSERT INTO llm_consent (chat_id, notice_version, acknowledged_at) VALUES (111, 1, 'x')")
+        conn.execute(
+            "INSERT INTO llm_consent (chat_id, notice_version, acknowledged_at) VALUES (111, ?, 'x')",
+            (CONSENT_VERSION,),
+        )
     say(svc, "request")
     clock.value += 3
     worker = threading.Thread(target=svc.process_next, args=(clock.value,), daemon=True)

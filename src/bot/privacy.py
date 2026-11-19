@@ -7,7 +7,7 @@ reliably, which is why the notice asks the user to leave them out.
 import re
 from typing import Tuple
 
-CONSENT_VERSION = 1
+CONSENT_VERSION = 2
 
 CONSENT_NOTICE = (
     "Before I use a language model for free text: what you write is sent to NVIDIA NIM and, when that "
@@ -15,6 +15,10 @@ CONSENT_NOTICE = (
     "which are not masked) so that I can propose changes to it. Their logging and training policies may differ, and I "
     "cannot control what they keep. Please leave out names, addresses and phone numbers. Obvious e-mail addresses "
     "and phone numbers are masked here before sending when I recognise them, but that is best effort. "
+    "If you send a CV, the text is read on this machine, e-mail addresses, phone numbers, links and handles are "
+    "masked and the contact header is dropped before anything is sent; the CV text itself is never stored. "
+    "The facts I note from your answers and your CV are masked and stored locally in the bot's database for up to "
+    "24 hours. Names and addresses cannot be recognised reliably, so please leave them out. "
     "Choose below to continue; the commands (/help) work without any language model."
 )
 
@@ -78,3 +82,85 @@ def mask_personal_data(text: str) -> Tuple[str, int]:
     text = _EMAIL_RE.sub(email, text)
     text = _PHONE_RE.sub(phone, text)
     return text, count
+
+
+# --- links and handles ---------------------------------------------------------------------------------
+# Every repetition is bounded or a single character class, so hostile input stays linear.
+_URL_RE = re.compile(r"(?<![\w@])(?:https?://|ftp://|www\.)[^\s<>\"']*[^\s<>\"'.,;:!?)\]}]|(?<![\w@])(?:https?://|ftp://|www\.)")
+_SOCIAL_HOSTS = (
+    "linkedin.com", "github.com", "gitlab.com", "twitter.com", "x.com", "facebook.com", "instagram.com",
+    "t.me", "telegram.me", "medium.com", "behance.net", "dribbble.com", "xing.com", "youtube.com", "youtu.be",
+    "stackoverflow.com", "bit.ly", "tiktok.com", "threads.net",
+)
+_SOCIAL_RE = re.compile(
+    r"(?<![\w@./-])(?:[A-Za-z0-9-]{1,30}\.){0,2}(?:"
+    + "|".join(re.escape(h) for h in _SOCIAL_HOSTS)
+    + r")(?![\w-])(?:/[^\s<>\"']*[^\s<>\"'.,;:!?)\]}])?",
+    re.IGNORECASE,
+)
+_HANDLE_RE = re.compile(r"(?<![\w@.])@\w{2,30}(?:\.\w{1,30}){0,3}")
+
+
+def mask_links(text: str) -> str:
+    """``text`` with URLs and social-media paths as ``[link]`` and ``@handles`` as ``[handle]``."""
+    text = _URL_RE.sub("[link]", text)
+    text = _SOCIAL_RE.sub("[link]", text)
+    return _HANDLE_RE.sub("[handle]", text)
+
+
+def mask_all(text: str) -> str:
+    """E-mail addresses, phone numbers, links and handles masked."""
+    return mask_links(mask_personal_data(text)[0])
+
+
+# --- contact header of a CV ----------------------------------------------------------------------------
+_HEADINGS = frozenset(
+    {
+        # English
+        "summary", "profile", "about me", "objective", "experience", "work experience", "employment",
+        "education", "skills", "languages", "certifications", "projects",
+        # Ukrainian
+        "резюме", "про себе", "мета", "цілі", "досвід", "досвід роботи", "освіта", "навички", "мови",
+        "сертифікати", "проєкти", "проекти",
+        # Polish
+        "podsumowanie", "profil", "o mnie", "cel zawodowy", "doświadczenie", "doświadczenie zawodowe",
+        "wykształcenie", "edukacja", "umiejętności", "języki", "certyfikaty", "projekty",
+        # German
+        "zusammenfassung", "über mich", "berufsziel", "berufserfahrung", "erfahrung", "ausbildung", "bildung",
+        "kenntnisse", "fähigkeiten", "sprachen", "zertifikate", "projekte",
+        # Spanish
+        "resumen", "perfil", "sobre mí", "objetivo", "experiencia", "experiencia laboral", "educación",
+        "formación", "habilidades", "competencias", "idiomas", "certificaciones", "proyectos",
+        # French
+        "résumé", "à propos", "objectif", "expérience", "expérience professionnelle", "formation", "éducation",
+        "compétences", "langues",
+    }
+)
+MAX_HEADING_CHARS = 40
+HEADER_FALLBACK_LINES = 6
+
+
+def _is_heading(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > MAX_HEADING_CHARS:
+        return False
+    return stripped.casefold().rstrip(":").strip() in _HEADINGS
+
+
+def strip_contact_header(text: str) -> str:
+    """``text`` without its contact header: everything before the first heading line (never the first line);
+    with no heading, the first 6 non-empty lines. ``""`` when everything was header."""
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None:
+        return ""
+    for i in range(first + 1, len(lines)):
+        if _is_heading(lines[i]):
+            return "\n".join(lines[i:])
+    seen = 0
+    for i in range(first, len(lines)):
+        if lines[i].strip():
+            seen += 1
+            if seen == HEADER_FALLBACK_LINES:
+                return "\n".join(lines[i + 1 :]).lstrip("\n")
+    return ""
