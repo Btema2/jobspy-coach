@@ -12,6 +12,9 @@ import sys
 
 MAX_CV_PAGES = 10
 MAX_CV_CHARS = 20000
+# The child sends a little more than the cap so the parent can mask before cutting (no half e-mail at the cut).
+TEXT_SLACK_CHARS = 256
+MAX_CHILD_CHARS = MAX_CV_CHARS + TEXT_SLACK_CHARS
 ADDRESS_SPACE_BYTES = 512 * 1024 * 1024
 CPU_SECONDS = 10
 
@@ -46,9 +49,9 @@ def _extract(data: bytes) -> dict:
         piece = page.extract_text() or ""
         chunks.append(piece)
         total += len(piece) + 1
-        if total >= MAX_CV_CHARS:
+        if total >= MAX_CHILD_CHARS:
             break
-    text = "\n".join(chunks)[:MAX_CV_CHARS]
+    text = "\n".join(chunks)[:MAX_CHILD_CHARS]
     return {"ok": True, "pages": pages, "text": text}
 
 

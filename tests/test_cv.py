@@ -316,14 +316,14 @@ def test_read_text_file_masks_like_a_pdf():
 
 
 def test_read_text_file_caps_length():
-    cv = read_text_file("Experience\n" + "word " * 10000)
+    cv = read_text_file("Sample Person\nExperience\n" + "word " * 10000)
     assert len(cv.text) <= MAX_CV_CHARS
 
 
 def test_preview_has_counts_and_only_masked_text():
     cv = read_cv(build_pdf())
     preview = build_preview(cv)
-    assert preview.startswith("Read 1 pages, %d characters. First lines: " % len(cv.text))
+    assert preview.startswith("Read 1 page, %d characters. First lines: " % len(cv.text))
     for forbidden in ("@", "555", "example.com", "http", "Sample Person"):
         assert forbidden not in preview
     assert "\n" not in preview
@@ -334,3 +334,64 @@ def test_preview_for_text_file_omits_pages():
     preview = build_preview(read_text_file("\n".join(CV_LINES)))
     assert preview.startswith("Read ") and "pages" not in preview
     assert "characters. First lines: " in preview
+
+
+def test_preview_pluralises_pages():
+    assert build_preview(CvText(pages=3, text="abc")).startswith("Read 3 pages, 3 characters.")
+    assert build_preview(CvText(pages=1, text="abc")).startswith("Read 1 page, 3 characters.")
+
+
+# --- empty after header removal, mask before cut, limits applied first ---------------------------------
+
+LONG_LINES = ["A long line of plain words without any heading in it, " * 2] * 3  # > 200 chars, all "header"
+
+
+def test_pdf_that_is_all_header_gives_the_no_text_reply():
+    with pytest.raises(CvError) as exc:
+        read_cv(build_pdf(lines=LONG_LINES))
+    assert reply_of(exc) == NO_TEXT_REPLY
+
+
+def test_text_file_that_is_all_header_is_refused():
+    with pytest.raises(CvError) as exc:
+        read_text_file("\n".join(LONG_LINES))
+    assert reply_of(exc) == NO_TEXT_REPLY
+    with pytest.raises(CvError):
+        read_text_file("")
+
+
+def test_email_straddling_the_cut_is_fully_masked():
+    prefix = "Sample Person\nExperience\n"
+    email = "john.doe@example.com"
+    filler = "x" * (MAX_CV_CHARS - 11 - len(prefix)) + " "
+    text = prefix + filler + email + " tail words"
+    assert text.index(email) == MAX_CV_CHARS - 10
+    cv = read_text_file(text)
+    assert "john" not in cv.text and "@" not in cv.text and "example" not in cv.text
+    assert len(cv.text) <= MAX_CV_CHARS
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is applied on Linux only")
+def test_child_applies_memory_limit_before_importing_pypdf():
+    script = (
+        "import io, json, resource, sys\n"
+        "from src.bot import pdf_text\n"
+        "def probe(data):\n"
+        "    soft = resource.getrlimit(resource.RLIMIT_AS)[0]\n"
+        "    cpu = resource.getrlimit(resource.RLIMIT_CPU)[0]\n"
+        "    try:\n"
+        "        bytearray(600 * 1024 * 1024)\n"
+        "        oom = False\n"
+        "    except MemoryError:\n"
+        "        oom = True\n"
+        "    sys.stderr.write(json.dumps({'as': soft, 'cpu': cpu, 'oom': oom, 'pypdf': 'pypdf' in sys.modules}))\n"
+        "    return {'ok': False, 'error': 'unreadable'}\n"
+        "pdf_text._extract = probe\n"
+        "raise SystemExit(pdf_text.main())\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script], input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30
+    )
+    assert proc.returncode == 0
+    seen = json.loads(proc.stderr.decode())
+    assert seen == {"as": 512 * 1024 * 1024, "cpu": 10, "oom": True, "pypdf": False}

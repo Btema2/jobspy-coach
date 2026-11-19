@@ -11,7 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-from src.bot.pdf_text import MAX_CV_CHARS, MAX_CV_PAGES  # noqa: F401 - re-exported constants
+from src.bot.pdf_text import MAX_CHILD_CHARS, MAX_CV_CHARS, MAX_CV_PAGES  # noqa: F401 - re-exported constants
 from src.bot.privacy import mask_all, strip_contact_header
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,8 @@ def _run_child(data: bytes, timeout: float) -> dict:
     if proc.returncode != 0:
         logger.warning("CV extraction child exited abnormally")
         raise CvError(UNREADABLE_REPLY)
+    # stdout is read whole: accepted risk, the child's output is at most ~240 KB by construction
+    # (MAX_CHILD_CHARS characters, JSON-escaped at up to 12 bytes each).
     try:
         result = json.loads(proc.stdout.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -90,7 +92,10 @@ def _run_child(data: bytes, timeout: float) -> dict:
 
 
 def _finish(text: str, pages: int) -> CvText:
+    """Header removed and everything masked on the full text; only then cut (no half e-mail at the cut)."""
     cleaned = mask_all(strip_contact_header(text))[:MAX_CV_CHARS].strip()
+    if not cleaned:
+        raise CvError(NO_TEXT_REPLY)  # everything was header
     return CvText(pages=pages, text=cleaned)
 
 
@@ -109,19 +114,19 @@ def read_cv(data: bytes, *, timeout: float = PDF_TIMEOUT_SECONDS) -> CvText:
         raise CvError(UNREADABLE_REPLY)
     if pages > MAX_CV_PAGES:
         raise CvError(TOO_MANY_PAGES_REPLY)
-    text = text[:MAX_CV_CHARS]
+    text = text[:MAX_CHILD_CHARS]
     if sum(1 for ch in text if not ch.isspace()) < MIN_TEXT_CHARS:
         raise CvError(NO_TEXT_REPLY)
     return _finish(text, pages)
 
 
 def read_text_file(text: str) -> CvText:
-    """A ``.txt`` / ``.md`` CV: the same masking and header removal, ``pages == 0``."""
-    return _finish(text[:MAX_CV_CHARS], 0)
+    """A ``.txt`` / ``.md`` CV: the same masking and header removal, ``pages == 0``; ``CvError`` when empty."""
+    return _finish(text[:MAX_CHILD_CHARS], 0)
 
 
 def build_preview(cv: CvText) -> str:
     """``Read <N> pages, <M> characters. First lines: <first ~300 masked characters>`` (no page count for text)."""
     snippet = " ".join(cv.text.split())[:PREVIEW_CHARS]
-    count = f"{cv.pages} pages, " if cv.pages else ""
+    count = "" if not cv.pages else ("1 page, " if cv.pages == 1 else f"{cv.pages} pages, ")
     return f"Read {count}{len(cv.text)} characters. First lines: {snippet}"
