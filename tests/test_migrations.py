@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 
 from src.profile import legacy_seed
+from src.storage import migrations
 from src.storage.db import Database
 from src.storage.migrations import apply_migrations
 from tests.test_storage import _OLD_SCHEMA
@@ -37,7 +38,7 @@ def test_fresh_db_has_foundations_schema(tmp_path: Path):
     assert _JOBS_NEW <= _cols(db_file, "jobs")
     assert _RUNS_NEW <= _cols(db_file, "scrape_runs")
     assert {"job_id", "query_key", "first_seen", "last_seen"} <= _cols(db_file, "job_hits")
-    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 4
+    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 5
     assert _scalar(
         db_file,
         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='job_hits' "
@@ -64,7 +65,7 @@ def test_old_schema_db_keeps_rows_and_gains_schema(tmp_path: Path):
     assert job is not None and job.title == "t"
     assert _JOBS_NEW <= _cols(db_file, "jobs")
     assert _RUNS_NEW <= _cols(db_file, "scrape_runs")
-    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 4
+    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 5
     assert _scalar(db_file, "SELECT remote_status FROM jobs WHERE dedup_hash='h1'") == "unverified"
 
 
@@ -87,7 +88,7 @@ def test_init_db_is_safe_when_run_concurrently(tmp_path: Path):
         t.join(timeout=30)
 
     assert errors == []
-    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 4
+    assert _scalar(db_file, "SELECT COUNT(*) FROM schema_version") == 5
 
 
 def test_existing_ensure_column_import_still_works():
@@ -108,20 +109,50 @@ def test_profile_tables_created(tmp_path: Path):
     assert {
         "profile", "roles", "role_terms", "markets", "pinned_queries", "rules", "profile_versions",
     } <= tables
+    assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 5
+
+
+def _tables(db_file: Path) -> set:
+    conn = sqlite3.connect(db_file)
+    try:
+        return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def test_applying_only_migrations_1_to_4_leaves_the_llm_tables_absent(tmp_path: Path, monkeypatch):
+    db_file = tmp_path / "nobot.db"
+    monkeypatch.setattr(migrations, "MIGRATIONS", [m for m in migrations.MIGRATIONS if m[0] <= 4])
+    Database(db_file).init_db()
+
+    tables = _tables(db_file)
+    assert "bot_state" in tables
+    assert not ({"pending_change", "conversation", "llm_consent"} & tables)
     assert _scalar(db_file, "SELECT MAX(version) FROM schema_version") == 4
 
 
-def test_migration_4_creates_no_branch5_tables(tmp_path: Path):
-    db_file = tmp_path / "nobot.db"
+def test_migration_5_creates_llm_tables_idempotent(tmp_path: Path):
+    db_file = tmp_path / "m5.db"
     Database(db_file).init_db()
 
+    assert _scalar(db_file, "SELECT name FROM schema_version WHERE version = 5") == "llm_layer"
+    assert {"pending_change", "conversation", "llm_consent"} <= _tables(db_file)
+    assert _cols(db_file, "pending_change") == {
+        "chat_id", "change_id", "base_version", "mode", "operations", "message_id", "created_at",
+    }
+    assert _cols(db_file, "conversation") == {"chat_id", "state", "context", "updated_at"}
+    assert _cols(db_file, "llm_consent") == {"chat_id", "notice_version", "acknowledged_at"}
     conn = sqlite3.connect(db_file)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.execute("INSERT INTO conversation (chat_id, updated_at) VALUES (1, 0)")
+        assert apply_migrations(conn) == 5
+        conn.execute("DELETE FROM schema_version WHERE version = 5")
+        assert apply_migrations(conn) == 5
+        conn.commit()
+        # the second run neither drops nor duplicates
+        assert conn.execute("SELECT state FROM conversation WHERE chat_id = 1").fetchone()[0] == "idle"
     finally:
         conn.close()
-    assert "bot_state" in tables
-    assert not ({"pending_change", "conversation", "llm_consent"} & tables)
 
 
 def test_migration_4_creates_bot_state_single_row(tmp_path: Path):
@@ -137,9 +168,9 @@ def test_migration_4_creates_bot_state_single_row(tmp_path: Path):
         assert row["paired_user_id"] is None and row["paired_chat_id"] is None
         assert row["pairing_code_hash"] is None and row["pairing_expires_at"] is None
         assert row["wizard_state"] is None
-        assert apply_migrations(conn) == 4
+        assert apply_migrations(conn) == 5
         conn.execute("DELETE FROM schema_version WHERE version = 4")
-        assert apply_migrations(conn) == 4
+        assert apply_migrations(conn) == 5
         conn.commit()
     finally:
         conn.close()
@@ -175,7 +206,7 @@ def test_migration_3_rewrites_only_unedited_seed_text(tmp_path: Path):
     conn.execute("DELETE FROM schema_version WHERE version = 3")
     conn.commit()
 
-    assert apply_migrations(conn) == 4
+    assert apply_migrations(conn) == 5
     conn.commit()
     row = conn.execute(
         "SELECT version, core_role_definition, adjacent_role_definition, dealbreakers FROM profile"

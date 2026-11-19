@@ -167,11 +167,45 @@ def _migration_4_bot_core(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_5_llm_layer(conn: sqlite3.Connection) -> None:
+    # No CHECK constraint on ``conversation.state``: add-only migrations must stay extensible.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_change (
+            chat_id INTEGER PRIMARY KEY,
+            change_id TEXT NOT NULL,
+            base_version INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            operations TEXT NOT NULL,
+            message_id INTEGER,
+            created_at REAL NOT NULL)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation (
+            chat_id INTEGER PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'idle',
+            context TEXT,
+            updated_at REAL NOT NULL)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS llm_consent (
+            chat_id INTEGER PRIMARY KEY,
+            notice_version INTEGER NOT NULL,
+            acknowledged_at TEXT NOT NULL)
+        """
+    )
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "foundations", _migration_1_foundations),
     (2, "profile_core", _migration_2_profile_core),
     (3, "rules_and_rubric", _migration_3_rules_and_rubric),
     (4, "bot_core", _migration_4_bot_core),
+    (5, "llm_layer", _migration_5_llm_layer),
 ]
 
 
