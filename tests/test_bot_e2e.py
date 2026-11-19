@@ -54,12 +54,18 @@ class Harness:
             is_cycle_running=lambda: False,
             scraper=None,
         )
+        self.ctx = ctx
+        self.poller = self.new_poller()
+
+    def new_poller(self, router_wrapper=None) -> BotPoller:
+        """A poller over the same DB, state and fake Telegram (a daemon restart builds exactly this)."""
         client = TelegramBotClient(TOKEN, transport=self.telegram.transport, stop_event=self.stop)
-        self.poller = BotPoller(
+        router = CommandRouter(self.ctx, client=client)
+        return BotPoller(
             client,
-            self.state,
-            Authorizer(self.state),
-            CommandRouter(ctx, client=client),
+            BotStateStore(self.db),
+            Authorizer(BotStateStore(self.db)),
+            router_wrapper(router) if router_wrapper else router,
             stop_event=self.stop,
             env_path=self.env_path,
             commands=COMMANDS,
@@ -80,7 +86,6 @@ def _run_scenario(tmp_path: Path) -> Harness:
     h.telegram.queue_updates([message_update(2, f"/start {code}")])
     h.telegram.queue_updates([message_update(3, f"/add_role <ROLE-E2E> = {SYNONYM}")])
     h.telegram.queue_updates([message_update(4, "/undo")])
-    h.telegram.queue_updates([message_update(4, "/undo")])  # Telegram re-delivers an already seen update
     h.telegram.queue_updates([message_update(5, "/stats")])
 
     thread = h.poller.start()
@@ -118,7 +123,7 @@ def test_bot_loop_against_fake_telegram(tmp_path, monkeypatch):
     texts = h.send_texts()
     assert any("+ role" in text for text in texts)  # the /add_role diff
 
-    # add (+1) and undo (+1); the re-delivered /undo (same update id) did not run a second time.
+    # add (+1) and undo (+1).
     assert h.store.read_snapshot().version == h.base_version + 2
 
     # The offset stays one past the last update id.
@@ -139,3 +144,53 @@ def test_e2e_logs_carry_no_token_or_text(tmp_path, monkeypatch, caplog):
     assert "E2E-FAKE-TOKEN" not in logged
     assert SYNONYM not in logged
     assert "<ROLE-E2E>" not in logged
+
+
+class _CrashAfterExecuting:
+    """A router whose process dies right after a command ran, before the reply was sent."""
+
+    def __init__(self, router: CommandRouter):
+        self._router = router
+
+    def is_mutating(self, update):
+        return self._router.is_mutating(update)
+
+    def handle(self, update):
+        self._router.handle(update)
+        raise SystemExit
+
+
+def test_a_crash_after_a_command_does_not_replay_it_on_restart(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    h = Harness(tmp_path)
+    h.state.set_pairing(111, 111)
+    h.telegram.queue_updates([message_update(3, f"/add_role <ROLE-E2E> = {SYNONYM}")])
+    h.poller.poll_once()
+    assert h.store.read_snapshot().version == h.base_version + 1
+
+    h.telegram.queue_updates([message_update(4, "/undo")])
+    crashing = h.new_poller(_CrashAfterExecuting)
+    with pytest.raises(SystemExit):
+        crashing.poll_once()
+    assert h.store.read_snapshot().version == h.base_version + 2  # the undo ran once
+    assert h.state.get_offset() == 5  # and its offset was saved before it ran
+
+    # Telegram still holds update 4 (never confirmed); the restarted poller confirms it with offset 5.
+    restarted = h.new_poller()
+    assert restarted.poll_once() == 0
+
+    assert h.telegram.calls("getUpdates")[-1]["offset"] == 5
+    assert h.store.read_snapshot().version == h.base_version + 2
+
+
+def test_update_ids_that_restart_below_the_saved_offset_are_still_served(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    h = Harness(tmp_path)
+    h.state.set_pairing(111, 111)
+    h.state.set_offset(1_000_000)
+    h.telegram.queue_updates([message_update(5, "/help")], ignore_offset=True)
+
+    assert h.poller.poll_once() == 1
+
+    assert len(h.send_texts()) == 1  # the bot answered
+    assert h.state.get_offset() == 6

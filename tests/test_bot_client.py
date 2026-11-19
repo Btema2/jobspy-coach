@@ -45,11 +45,11 @@ def test_send_message_posts_html_and_returns_message_id():
 
 def test_get_updates_sends_offset_and_long_poll_timeout():
     fake = FakeTelegram()
-    fake.queue_updates([{"update_id": 3}])
+    fake.queue_updates([{"update_id": 4}])
 
     result = _client(fake).get_updates(4)
 
-    assert result == [{"update_id": 3}]
+    assert result == [{"update_id": 4}]
     body = fake.requests[0][1]
     assert body["offset"] == 4 and body["timeout"] == 25
     assert body["allowed_updates"] == ["message", "callback_query"]

@@ -6,17 +6,44 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 
+def _confirmed(update: dict, offset: int) -> bool:
+    uid = update.get("update_id")
+    return isinstance(uid, int) and not isinstance(uid, bool) and uid < offset
+
+
 class FakeTelegram:
     def __init__(self) -> None:
         self.requests: List[Tuple[str, dict]] = []
         self._queue: List[List[dict]] = []
+        self._unfiltered: set = set()
         self._overrides: Dict[str, List[Tuple[int, Any]]] = {}
         self._next_message_id = 100
         self.transport = httpx.MockTransport(self._handle)
 
-    def queue_updates(self, batch: List[dict]) -> None:
-        """The next ``getUpdates`` call returns ``batch``."""
-        self._queue.append(batch)
+    def queue_updates(self, batch: List[dict], *, ignore_offset: bool = False) -> None:
+        """The next ``getUpdates`` call returns ``batch``.
+
+        Like the real API, a batch stays pending until a later call confirms it with a higher ``offset``
+        (updates with an id below ``offset`` are dropped); a poller that restarts with the saved offset
+        therefore sees only what it never acknowledged. ``ignore_offset=True`` hands the batch out once
+        whatever the offset is (the server picked ids lower than the saved offset, for example after a long idle).
+        """
+        self._queue.append(list(batch))
+        if ignore_offset:
+            self._unfiltered.add(id(self._queue[-1]))
+
+    def _updates_for(self, offset: Optional[int]) -> List[dict]:
+        if offset is not None:
+            for group in self._queue:
+                if id(group) in self._unfiltered:
+                    continue
+                group[:] = [u for u in group if not _confirmed(u, offset)]
+            self._queue[:] = [g for g in self._queue if g]
+        if not self._queue:
+            return []
+        group = self._queue[0]
+        self._unfiltered.discard(id(group))  # an unfiltered batch is handed out once, then confirmed normally
+        return list(group)
 
     def respond(self, method: str, status: int, body: Any) -> None:
         """The next call of ``method`` answers with this status and JSON body (FIFO per method)."""
@@ -34,8 +61,7 @@ class FakeTelegram:
             status, payload = pending.pop(0)
             return httpx.Response(status, json=payload)
         if method == "getUpdates":
-            batch = self._queue.pop(0) if self._queue else []
-            return httpx.Response(200, json={"ok": True, "result": batch})
+            return httpx.Response(200, json={"ok": True, "result": self._updates_for(body.get("offset"))})
         if method == "sendMessage":
             self._next_message_id += 1
             return httpx.Response(200, json={"ok": True, "result": {"message_id": self._next_message_id}})

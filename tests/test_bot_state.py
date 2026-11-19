@@ -18,11 +18,12 @@ def test_initial_state_is_empty(tmp_path):
     assert store.get_wizard() is None
 
 
-def test_offset_never_decreases(tmp_path):
+def test_offset_is_stored_as_given_and_may_go_down(tmp_path):
+    """Telegram can restart its update ids at a lower number; the offset must follow it."""
     store = _store(tmp_path)
-    store.set_offset(10)
-    store.set_offset(5)
-    assert store.get_offset() == 10
+    store.set_offset(1_000_000)
+    store.set_offset(6)
+    assert store.get_offset() == 6
     store.set_offset(11)
     assert store.get_offset() == 11
 

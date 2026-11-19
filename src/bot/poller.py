@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Protocol, Sequence, Tuple
+from typing import Callable, List, Protocol, Sequence, Set, Tuple
 
 from src.bot.auth import AuthDecision, Authorizer
 from src.bot.client import (
@@ -116,10 +116,15 @@ class BotPoller:
         updates = self._client.get_updates(self._state.get_offset(), LONG_POLL_SECONDS)
         handled = 0
         unreadable_last = False
+        seen: Set[int] = set()
         for raw in updates:
             if self._stop.is_set():
                 break  # not acknowledged: Telegram re-delivers it after the restart
-            unreadable_last = parse_update(raw).update_id < 0
+            update_id = parse_update(raw).update_id
+            if update_id >= 0 and update_id in seen:
+                continue  # an exact repeat inside one batch never runs a command twice
+            seen.add(update_id)
+            unreadable_last = update_id < 0
             self.process(raw)
             handled += 1
         if unreadable_last:
@@ -132,9 +137,7 @@ class BotPoller:
     def process(self, update_raw: dict) -> None:
         update = parse_update(update_raw)
         if update.update_id >= 0:
-            if update.update_id < self._state.get_offset():
-                logger.debug("skipped already acknowledged update %d", update.update_id)
-                return  # a duplicate delivery must never run a command twice
+            # Stored as given, even below the saved offset: Telegram can continue with lower ids after a long idle.
             self._state.set_offset(update.update_id + 1)  # before anything executes: at-most-once
         decision = self._authorizer.decide(update)
         if decision is AuthDecision.REJECT:

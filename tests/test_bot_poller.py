@@ -94,14 +94,29 @@ def test_offset_persisted_before_mutating_command(telegram, state, tmp_path):
     assert router2.handled == []
 
 
-def test_an_update_below_the_saved_offset_is_not_handled_again(telegram, state, tmp_path):
-    """Telegram never re-delivers an acknowledged update, but a duplicate must not run a command twice."""
+def test_an_update_id_below_the_saved_offset_is_processed_and_lowers_the_offset(telegram, state, tmp_path):
+    """After a long idle Telegram may continue with a much lower update id; the bot must not go deaf."""
+    _paired(state)
+    state.set_offset(1_000_000)
+    poller, router = _make(telegram, state, tmp_path)
+    telegram.queue_updates([message_update(5, "/help", date=int(NOW))], ignore_offset=True)
+
+    assert poller.poll_once() == 1
+
+    assert [u.command for u in router.handled] == ["/help"]
+    assert state.get_offset() == 6
+    # The next poll asks for the new offset, so later ids are served normally.
+    telegram.queue_updates([message_update(6, "/help", date=int(NOW))])
+    assert poller.poll_once() == 1
+    assert state.get_offset() == 7
+
+
+def test_the_same_update_id_twice_in_one_batch_runs_once(telegram, state, tmp_path):
     _paired(state)
     poller, router = _make(telegram, state, tmp_path)
+    telegram.queue_updates([message_update(10, "/undo", date=int(NOW)), message_update(10, "/undo", date=int(NOW))])
 
-    poller.process(message_update(10, "/undo", date=int(NOW)))
-    poller.process(message_update(10, "/undo", date=int(NOW)))  # same id again
-    poller.process(message_update(9, "/undo", date=int(NOW)))  # older id
+    poller.poll_once()
 
     assert len(router.handled) == 1
     assert len(_texts(telegram)) == 1

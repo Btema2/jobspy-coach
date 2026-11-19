@@ -45,7 +45,7 @@ class BotStateStore:
         return int(row["update_offset"]) if row else 0
 
     def set_offset(self, offset: int) -> None:
-        self._update("update_offset = MAX(update_offset, ?)", (int(offset),))
+        self._update("update_offset = ?", (int(offset),))  # may go down: Telegram can restart its ids
 
     # --- pairing ---------------------------------------------------------------------------
 
