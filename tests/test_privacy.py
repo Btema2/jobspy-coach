@@ -70,6 +70,8 @@ def test_readme_and_dedup_fixtures_carry_no_real_org_or_home_city_examples():
 
 # --- masking of personal data before text goes to an LLM (src/bot/privacy.py) -------------------------
 
+import pytest  # noqa: E402
+
 from src.bot.privacy import CONSENT_NOTICE, CONSENT_VERSION, mask_personal_data  # noqa: E402
 
 
@@ -104,10 +106,33 @@ def test_never_masks_a_run_inside_a_longer_token():
     assert mask_personal_data("1234567890123456") == ("1234567890123456", 0)  # 16 digits: too long
 
 
-def test_phone_groups_are_at_most_four_digits_unless_one_bare_run():
-    assert mask_personal_data("12345 67890") == ("12345 67890", 0)
-    assert mask_personal_data("123456789") == ("[phone]", 1)
-    assert mask_personal_data("123456789012345") == ("[phone]", 1)
+@pytest.mark.parametrize("number", [
+    "+49 15112345678", "+48 600123456", "030 12345678", "+44 7700 900123", "030/1234567", "0612345678",
+    "+48 123 456 789", "(030) 1234-5678", "+1 (555) 123-4567", "555.123.4567", "123456789", "123456789012345",
+    "+49 (0) 30 1234567",
+])
+def test_masks_common_phone_formats(number):
+    assert mask_personal_data(f"call {number} now") == ("call [phone] now", 1)
+
+
+@pytest.mark.parametrize("text", [
+    "2024-11-18", "2024-11-18 10:30", "2024-11-18 10:30:00", "10:30", "2019-2024", "120000-150000", "EUR 4,500",
+    "18.11.2024 10.30", "18/11/2024", "2019 2020 2021", "12:30-14:00", "ISO 9001", "v1.2.3", "12345678",
+    "1234567890123456", "12 34 56",
+])
+def test_phone_rule_keeps_dates_years_and_salary_ranges(text):
+    assert mask_personal_data(f"see {text} ok") == (f"see {text} ok", 0)
+
+
+def test_phone_over_masking_is_documented_best_effort():
+    # Recall over precision: bare reference numbers and IP addresses look like phone numbers.
+    assert mask_personal_data("ref 123456789") == ("ref [phone]", 1)
+    assert mask_personal_data("host 192.168.100.200") == ("host [phone]", 1)
+
+
+def test_phone_separators_are_single_characters():
+    assert mask_personal_data("+48  600 123 456") == ("+48  [phone]", 1)  # a double space ends the number
+    assert mask_personal_data("600,123,456") == ("600,123,456", 0)
 
 
 def test_empty_and_plain_text_unchanged():
@@ -127,7 +152,13 @@ def test_consent_notice_names_providers():
 def test_masking_is_linear_on_hostile_input():
     import time
 
-    for text in ("1-" * 10000 + "a", "a." * 10000, "a@" + "b." * 5000, "(1) " * 5000 + "z"):
+    hostile = [
+        "1-" * 10000 + "a", "a." * 10000, "a@" + "b." * 5000, "(1) " * 5000 + "z", "1/" * 10000 + "a",
+        "12 " * 7000 + "x", "1" * 20480, "+" * 20480, "2024-11-18 " * 1800, "(" * 20480, "1 (" * 6000,
+        "12.34." * 3400 + "z", "a@b." * 5000,
+    ]
+    for text in hostile:
+        assert len(text) <= 21100
         started = time.monotonic()
         mask_personal_data(text)
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < 0.5, text[:12]

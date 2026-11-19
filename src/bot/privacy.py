@@ -21,15 +21,19 @@ CONSENT_NOTICE = (
 _EMAIL_RE = re.compile(
     r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){0,8}\.[A-Za-z]{2,24}"
 )
-# Candidate: groups of digits (optionally in parentheses) joined by one space, dot or dash, not part of a
-# longer alphanumeric token; the digit rules are checked in ``_is_phone``.
+# Candidate: groups of digits (optionally in parentheses) joined by one space, dot, dash or slash, not part of
+# a longer alphanumeric token; ``_is_phone`` applies the digit-count and look-alike rules. Bounded repetitions.
 _PHONE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])\+?\(?\d{1,15}\)?(?:[ .\-]\(?\d{1,15}\)?){0,15}(?![A-Za-z0-9_])"
+    r"(?<![A-Za-z0-9_])\+?\(?\d{1,15}\)?(?:[ .\-/]\(?\d{1,15}\)?){0,15}(?![A-Za-z0-9_])"
 )
 _DIGITS_RE = re.compile(r"\d+")
+# Things that look like phone numbers by digit count but are dates, date-times or years.
+_DATE_RE = re.compile(r"(?<!\d)(?:(?:19|20)\d{2}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-](?:19|20)\d{2})(?!\d)")
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 MIN_PHONE_DIGITS = 9
 MAX_PHONE_DIGITS = 15
-MAX_GROUP_DIGITS = 4
+MAX_GROUP_DIGITS = 12
+MIN_RANGE_DIGITS = 5
 
 
 def _is_phone(candidate: str) -> bool:
@@ -37,7 +41,20 @@ def _is_phone(candidate: str) -> bool:
     total = sum(len(g) for g in groups)
     if not MIN_PHONE_DIGITS <= total <= MAX_PHONE_DIGITS:
         return False
-    return len(groups) == 1 or all(len(g) <= MAX_GROUP_DIGITS for g in groups)
+    if len(groups) == 1:  # a bare run of 9-15 digits
+        return True
+    if any(len(g) > MAX_GROUP_DIGITS for g in groups):
+        return False
+    if _DATE_RE.search(candidate) or all(_YEAR_RE.fullmatch(g) for g in groups):
+        return False  # a date, a date with a time, or a list of years
+    plain = candidate.strip()
+    if (
+        len(groups) == 2
+        and re.fullmatch(r"\d+-\d+", plain)
+        and all(len(g) >= MIN_RANGE_DIGITS and not g.startswith("0") for g in groups)
+    ):
+        return False  # a range such as a salary: 120000-150000
+    return True
 
 
 def mask_personal_data(text: str) -> Tuple[str, int]:
