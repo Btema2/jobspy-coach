@@ -13,6 +13,7 @@ JobSpy Coach scouts coaching vacancies across major job boards (LinkedIn, Indeed
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Installation & Setup](#installation--setup)
+- [Telegram Bot](#telegram-bot)
 - [Configuration Reference](#configuration-reference)
   - [LLM Provider Chain](#llm-provider-chain)
   - [Privacy of Local Configuration](#privacy-of-local-configuration)
@@ -122,7 +123,7 @@ flowchart TD
 
 - **Python 3.10+** (tested on Python 3.10, 3.11, 3.12, 3.13, 3.14)
 - **At least one LLM provider key**: an **NVIDIA NIM API key** (primary; from [build.nvidia.com](https://build.nvidia.com/)) and/or an **OpenRouter API key** plus `OPENROUTER_MODELS` (fallback; from [openrouter.ai](https://openrouter.ai/)). The app starts without keys, but evaluation raises a clear configuration error on first use until one provider is configured.
-- **Telegram Bot Token & Chat ID** (create a bot with [@BotFather](https://t.me/BotFather) and get your user/group ID with [@userinfobot](https://t.me/userinfobot))
+- **Telegram bot token** (create a bot with [@BotFather](https://t.me/BotFather)). `jobspy-coach init` pairs your Telegram account with the bot, so you do not need to look up a chat ID (an existing `TELEGRAM_CHAT_ID` in `.env` is adopted as the paired chat).
 
 ---
 
@@ -152,28 +153,63 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-### 4. Create Environment File
-
-Copy the template and configure your secrets:
+### 4. Run the Setup (`init`)
 
 ```bash
-cp .env.example .env
+jobspy-coach init
 ```
 
-Edit `.env` with your preferred editor:
+`init` is interactive and replaces hand-editing `.env`:
 
-```bash
-nano .env
-```
+1. It asks for the Telegram bot token and the LLM key(s) (NVIDIA NIM and/or OpenRouter) with **hidden input**; secrets are never accepted as command-line arguments. Each credential is checked with one call (a rejected one is asked again, at most 3 tries; if the network is down it is saved with a warning). The values are merged into your existing `.env` without touching other lines, and the file is set to mode 600. A value already in `.env` is offered for keeping (and is checked too).
+2. It creates an empty, **paused** starter profile unless a profile already exists (an imported one is left alone).
+3. It pairs your Telegram account (see [Telegram Bot](#telegram-bot)): it prints a one-time code, or adopts an existing `TELEGRAM_CHAT_ID`.
+4. It offers to start the daemon.
+
+Options: `--skip-credentials` (do not prompt for or write credentials), `--no-start` / `--start` (do not ask about starting the daemon), `--language CODE` (output language of the starter profile, default `en`). Other settings (schedule, boards, limits) keep their defaults; `.env.example` lists them if you want to change one.
 
 ### 5. Create Your Search Profile
 
 The search queries and the candidate persona live in a stored, versioned profile (in the SQLite database), not in `.env`.
 
 - **Existing install** (you already have `queries.json` and/or `.candidate_profile.md` in the project directory): nothing to do. The first `jobspy-coach` command you run imports them automatically (the files are left untouched; the import happens once). A broken `queries.json` stops every command with a message naming the file and the entry to fix; there is no fallback to built-in queries.
-- **New install**: run `jobspy-coach init` to create an empty, paused profile, then `jobspy-coach profile export`, edit the YAML file (it is written under the git-ignored `local/`), and `jobspy-coach profile import <file>`. Check the result with `jobspy-coach profile preview`.
+- **New install**: `init` created an empty, paused profile. Build it from Telegram (`/setup`, `/add_role`, `/add_market`, then `/resume`; see [Telegram Bot](#telegram-bot)) or with `jobspy-coach profile export`, edit the YAML file (it is written under the git-ignored `local/`), and `jobspy-coach profile import <file>`. Check the result with `jobspy-coach profile preview` or `/preview`.
 
 `jobspy-coach run` refuses to start without a profile (`no profile, run \`jobspy-coach init\``, with the backticks). There are no built-in default queries.
+
+---
+
+## Telegram Bot
+
+The daemon contains a private Telegram bot that reads and changes your stored profile. It runs as a background thread inside `jobspy-coach run` (it starts before the first scrape cycle, so it answers during a cycle) and needs only the bot token.
+
+### Pairing and security
+
+- **Setup**: `jobspy-coach init` asks for the token, then pairs. If `TELEGRAM_CHAT_ID` is already set in `.env` (an existing install), that chat is adopted as the paired one, because the local `.env` is the trust anchor; the poller also adopts it on its first start, so an existing install gets the bot without re-running `init`. Otherwise `init` prints a one-time 8-character code. Open your bot in a **private chat** and send `/start <code>`; the bot stores your user id and chat id, writes `TELEGRAM_CHAT_ID` into `.env` (the alerts use the same value) and replies `Paired`.
+- The code is single-use and valid for 15 minutes. After 5 wrong codes pairing is locked until the daemon restarts (a warning is logged); run `jobspy-coach init` again for a new code. `init` on an already paired install says `Already paired` and issues no code (use `bot unpair` first to pair another account). The daemon must be running when you send `/start <code>`.
+- **Only the paired user is served.** Every update is checked, including button presses: it must come from the paired user id in the paired private chat. Strangers, groups and forwarded messages are dropped without a reply and logged without their content.
+- **Lost or changed account**: `jobspy-coach bot unpair` forgets the pairing and blanks `TELEGRAM_CHAT_ID` in `.env`; restart the daemon, then run `init` and send the new code. Alerts stop until you pair again.
+- Commands are applied immediately through the same validated, versioned operations as `profile import`: each shows a one-line-per-change diff and bumps the profile version; `/undo` and `/restore` bring a previous version back. A command is executed at most once: the update offset is saved before it runs, so a restart cannot replay an `/undo`, and a mutating command older than 15 minutes is ignored (send it again). There is no free-text understanding yet; unknown text gets a hint to send `/help`.
+- Replies are English only (alert and digest texts follow the profile's `output_language`), are split below Telegram's limit, and escape every term you typed.
+
+### Commands
+
+| Group | Commands |
+|---|---|
+| Read | `/help`, `/profile`, `/roles`, `/markets`, `/exclusions`, `/preview`, `/dropped` |
+| Change | `/add_role <name> [= synonym, synonym]`, `/remove_role <name>`, `/add_market <country> [remote] [remote_only]`, `/exclude <term> [prefix]`, `/threshold wow\|digest <n>`, `/pause`, `/resume`, `/run_now` |
+| Setup | `/setup` (guided: role, synonyms, market, remote preference, confirm; with inline buttons) |
+| Safety | `/undo` (repeat to toggle), `/history`, `/restore <n>`, `/requeue [thresholds]` |
+| Insight | `/stats`, `/test <role> [linkedin]` |
+
+- Country names are resolved from a built-in table; an ambiguous name gets a reply asking which one. `/add_market` also accepts the regions `europe` and `worldwide` (LinkedIn and Google only; they have no country for Indeed or Glassdoor).
+- `/pause` stops scraping only (evaluation and digests continue). `/resume` is refused while the profile has no enabled query and otherwise starts a cycle at once. `/run_now` starts a cycle and answers that one is running if it is. `/requeue` is refused while a cycle or the digest runs.
+- `/stats` shows the last 7 days per role: calls, new jobs and relevant jobs (evaluated with a score at or above the digest threshold). Failed calls are counted separately from empty results, so a blocked board is not blamed on the query.
+- `/test <role>` is a small trial search: at most one per 5 minutes, at most 3 calls with 5 results each, only on the boards enabled in `SCRAPER_ENABLED_BOARDS` (LinkedIn only when you add the word `linkedin`), and it never saves anything. It reports rows, new postings, the pre-filtered share and example titles. It does **not** measure relevance.
+
+### One consumer per bot token
+
+Telegram lets only one program call `getUpdates` for a bot token at a time. If a second poller starts (another instance of this daemon, or another bot program using the same token) or a webhook is set, Telegram answers HTTP 409 and the daemon logs one warning and backs off (it keeps sending alerts). Give this daemon its own bot token, or set `TELEGRAM_BOT_POLLING=false` to run only the alert sender and leave the polling to the other program (then there is no bot and no pairing).
 
 ---
 
@@ -206,8 +242,9 @@ All settings are managed via environment variables (or defined in `.env`) and va
 | `EVAL_BATCH_LIMIT` | `300` | Max unprocessed jobs evaluated per batch (also the default for `evaluate --limit`). |
 | `LLM_BREAKER_FAILURES` | `3` | Consecutive failures that open a provider's circuit breaker. |
 | `LLM_BREAKER_COOLDOWN_SECONDS` | `600.0` | Breaker cooldown before a single half-open probe. |
-| `TELEGRAM_BOT_TOKEN` | *(required)* | Telegram Bot API token from `@BotFather`. |
-| `TELEGRAM_CHAT_ID` | *(required)* | Telegram Chat ID or Channel ID receiving notifications. |
+| `TELEGRAM_BOT_TOKEN` | *(required)* | Telegram Bot API token from `@BotFather` (written by `init`). |
+| `TELEGRAM_CHAT_ID` | *(set by pairing)* | Chat receiving notifications. Written by `init` / `/start <code>`; an existing value is adopted as the paired chat; `bot unpair` blanks it. |
+| `TELEGRAM_BOT_POLLING` | `true` | Run the Telegram bot (long polling) inside the daemon. Set `false` when another program polls the same token. |
 | `SCRAPE_INTERVAL_HOURS` | `6` | Hours between automatic background scrape pipeline cycles. With many LinkedIn queries a pass can take 15-30 minutes (12 s cooldown), so `12` is a reasonable choice for large query sets. |
 | `DIGEST_TIME_CET` | `09:00` | Daily 24-hour time (`HH:MM`) when the morning digest is dispatched. |
 | `HOURS_OLD_WINDOW` | `48` | Maximum posting age (in hours) to fetch from job boards. Indeed always uses at least 168 h, because narrower windows starve niche queries. |
@@ -234,7 +271,7 @@ All settings are managed via environment variables (or defined in `.env`) and va
 Everything specific to you stays in git-ignored local files and is never committed:
 
 - `.env`: API keys, bot token, and the import seeds for the thresholds (the stored profile's thresholds are what scoring uses).
-- `.candidate_profile.md` (legacy, optional): your private candidate persona. It is only read once, to import it into the stored profile; **after the import the persona lives in the profile in the SQLite database** (`data/jobs.db`, git-ignored; also in its last 10 stored profile versions), and editing the file no longer changes scoring. Edit the profile with `jobspy-coach profile export`, edit the YAML, `jobspy-coach profile import <file>` (a Telegram bot for this is planned). A generic template is used if the profile has no persona. Treat `data/jobs.db` as private data. Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details).
+- `.candidate_profile.md` (legacy, optional): your private candidate persona. It is only read once, to import it into the stored profile; **after the import the persona lives in the profile in the SQLite database** (`data/jobs.db`, git-ignored; also in its last 10 stored profile versions), and editing the file no longer changes scoring. Edit the profile with the Telegram bot or with `jobspy-coach profile export`, edit the YAML, `jobspy-coach profile import <file>`. A generic template is used if the profile has no persona. Treat `data/jobs.db` as private data. Note that the profile text is sent to the configured LLM providers with each vacancy, so keep it minimal (no name or contact details).
 - `queries.json` (legacy, optional): your former search queries (see `queries.example.json` for the format). It is only read once, to import it into the stored profile (1:1, as pinned queries); afterwards the stored profile is the source of truth and the file is no longer used. Per query, `country_code` is required for Indeed and Glassdoor (they search one country at a time; queries without it skip those boards with a logged warning, e.g. pan-regional "Europe" queries should list only LinkedIn/Google), and the optional `google_search_term` overrides the Google Jobs query string that is otherwise derived as `<search_term> jobs near <location> <time window> [remote]`. Note that Google Jobs currently returns no data to python-jobspy from some networks (it serves a JavaScript challenge page); the scraper logs this once instead of failing silently.
 - `local/profile-export.yaml` (`profile-export*.yaml` is git-ignored): the YAML export of your profile; it contains private data, so `profile export` refuses paths that git would not ignore unless you pass `--force`.
 
@@ -274,8 +311,10 @@ EVAL_MAX_WORKERS=8
 EVAL_MAX_ATTEMPTS=5
 EVAL_BATCH_LIMIT=300
 
+# `jobspy-coach init` writes the token, the LLM keys and (when pairing) TELEGRAM_CHAT_ID
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRstuVWXyz
 TELEGRAM_CHAT_ID=987654321
+TELEGRAM_BOT_POLLING=true
 
 SCRAPE_INTERVAL_HOURS=6
 DIGEST_TIME_CET=09:00
@@ -302,7 +341,9 @@ jobspy-coach --help
 ### 0. `init` and `profile`
 Every command first imports a legacy `queries.json` / `.candidate_profile.md` if no stored profile exists yet (see Create Your Search Profile).
 ```bash
-jobspy-coach init                       # empty, paused starter profile (does nothing if a profile exists)
+jobspy-coach init                       # interactive: credentials (hidden), Telegram pairing, paused starter profile, optional daemon start
+jobspy-coach init --skip-credentials --no-start --language en   # no credential prompts, do not start the daemon
+jobspy-coach bot unpair                 # forget the paired Telegram account and blank TELEGRAM_CHAT_ID (restart the daemon after)
 jobspy-coach profile preview            # compiled queries, calls per cycle, estimated duration, warnings
 jobspy-coach profile export             # writes local/profile-export.yaml (--path PATH, --force)
 jobspy-coach profile import FILE.yaml   # validated, versioned (the last 10 versions are kept); prints the diff
@@ -467,7 +508,7 @@ sudo journalctl -u jobspy-coach.service -n 100 --no-pager
 
 ## Testing
 
-The project is covered by **~600 unit and end-to-end integration tests** (no network access needed). One additional `live` smoke test makes two real provider calls and is skipped by default.
+The project is covered by **~1,660 unit and end-to-end integration tests** (no network access needed). One additional `live` smoke test makes two real provider calls and is skipped by default.
 
 ### Run All Tests
 
@@ -512,6 +553,8 @@ COVERAGE_FILE=/tmp/.coverage pytest -o cache_dir=/tmp/.pytest_cache --cov=src --
 - `tests/test_scraper.py`: JobSpy board scraping, URL sanitization, and retry backoff.
 - `tests/test_storage.py`: SQLite WAL database operations, schema constraints, dedup hashing, and stats.
 - `tests/test_dedup.py`: Dedup normalization (merge and non-merge cases) and the `rehash` migration.
+- `tests/test_bot_*.py`, `tests/test_countries.py`, `tests/test_envfile.py`, `tests/test_bootstrap.py`, `tests/test_i18n.py`, `tests/test_daemon_bot.py`: Telegram bot client, state, pairing and auth, poller (offset-before-execute, staleness, back-off), commands, wizard, stats, `/test`, `init`, `.env` merging, language tables and daemon wiring (fake Telegram, no network).
+- `tests/test_bot_e2e.py`: the whole bot loop against a fake Telegram server (pairing, a stranger in a group, a command, `/undo` and its re-delivery, `/stats`, shutdown).
 
 ---
 
