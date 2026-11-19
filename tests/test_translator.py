@@ -672,3 +672,67 @@ def test_render_proposal_uses_code_diff_not_llm_prose():
     header, footer = lines[0], lines[-1]
     assert lines[1:-1] == [tr.esc(d) for d in proposal.diff]
     assert header.startswith("<b>Proposed change</b>") and footer.startswith("Confirm with the button")
+
+
+# --- interview drafts and update mode -------------------------------------------------------------
+
+
+def test_to_operations_reports_the_failing_op_kinds():
+    with pytest.raises(TranslationProblem) as exc:
+        ops_of(
+            {"op": "add_role", "name": "<ROLE2>", "synonyms": []},
+            {"op": "add_market", "country": "Narnia", "remote": False, "remote_only": False},
+        )
+    assert exc.value.op_kinds == ("add_market",)
+    seed = Rule("block", "legacy term", "pattern", "SEED_REASON", "seed")
+    with pytest.raises(TranslationProblem) as exc:
+        ops_of({"op": "remove_rule", "kind": "block", "term": "legacy term"}, snap=snapshot(rules=(seed,)))
+    assert exc.value.op_kinds == ("remove_rule",)
+    assert TranslationProblem("x").op_kinds == ()
+
+
+def test_update_mode_prompt_and_label():
+    system, _ = system_and_user(mode="update")
+    assert system == tr.TRANSLATOR_SYSTEM_PROMPT + tr.UPDATE_ADDENDUM
+    lowered = tr.UPDATE_ADDENDUM.lower()
+    for needle in ("extend", "keep", "merg", "never", "roles", "markets"):
+        assert needle in lowered, needle
+    assert tr.ONBOARDING_ADDENDUM not in system
+    assert "update" in tr.MODES
+    parsed = TranslatorReply.model_validate(reply({"op": "set_paused", "paused": False})).operations
+    assert prepare_proposal(parsed, snapshot(), mode="update").label == "llm update"
+
+
+@pytest.mark.parametrize("mode", ["chat", "onboarding", "update"])
+def test_no_clarify_prompt(mode):
+    messages = build_messages(snapshot(), "<TEXT>", mode=mode, allow_clarify=False)
+    system = messages[0]["content"]
+    assert tr.NO_CLARIFY_SENTENCE in system
+    assert 'Ask one question (kind "clarify")' not in system
+    default = build_messages(snapshot(), "<TEXT>", mode=mode)[0]["content"]
+    assert tr.NO_CLARIFY_SENTENCE not in default
+
+
+@pytest.mark.parametrize("kind", ["clarify", "none"])
+def test_translate_without_clarify_rejects_clarify_and_none(kind):
+    translator, _ = make_translator(reply(kind=kind, question="Which?" if kind == "clarify" else None))
+    with pytest.raises(TranslationProblem) as exc:
+        translator.translate(["x"], snapshot(), mode="onboarding", allow_clarify=False, kind="draft", request_id="r1")
+    assert exc.value.messages == ["nothing to propose"]
+
+
+def test_translate_passes_kind_to_the_llm():
+    seen = []
+
+    class Spy:
+        def complete(self, messages, *, validate, request_id, kind="chat"):
+            seen.append(kind)
+
+            class A:
+                value = validate({"kind": "none", "question": None, "operations": []})
+
+            return A()
+
+    Translator(Spy()).translate(["x"], snapshot(), mode="chat", request_id="r1")
+    Translator(Spy()).translate(["x"], snapshot(), mode="chat", kind="draft", request_id="r2")
+    assert seen == ["chat", "draft"]

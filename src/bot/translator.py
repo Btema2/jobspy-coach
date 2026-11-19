@@ -62,7 +62,7 @@ MAX_SYNONYMS = 20
 MAX_NAME_CHARS = 80
 MAX_TERM_CHARS = 60
 
-MODES = ("chat", "onboarding")
+MODES = ("chat", "onboarding", "update")
 TEXT_FIELDS = ("persona", "core_role_definition", "adjacent_role_definition", "dealbreakers", "bonus_criteria")
 _SHORT_LIMIT = 200  # profile names and terms shown in the prompt
 _LISTED_LIMIT = 60  # roles, markets, pinned queries per prompt section
@@ -275,8 +275,10 @@ def operations_from_json(text: str) -> List[Any]:
 class TranslationProblem(Exception):
     """The request cannot be turned into a valid change; ``messages`` are plain-text lines for the user."""
 
-    def __init__(self, messages: Union[str, Sequence[str]]):
+    def __init__(self, messages: Union[str, Sequence[str]], op_kinds: Sequence[str] = ()):
         self.messages: List[str] = [messages] if isinstance(messages, str) else list(messages)
+        # The ``op`` of each operation that could not be converted (an interview names the slot to ask again).
+        self.op_kinds: Tuple[str, ...] = tuple(op_kinds)
         super().__init__("; ".join(self.messages))
 
 
@@ -399,9 +401,13 @@ def to_operations(ops: Sequence[Op], snapshot: Optional[ProfileSnapshot]) -> Lis
     """
     work = snapshot if snapshot is not None else ProfileSnapshot(ProfileFields())
     problems: List[str] = []
+    op_kinds: List[str] = []
     result: List[Operation] = []
     for op in ops:
+        before = len(problems)
         converted = _convert(op, work, problems)
+        if len(problems) > before:
+            op_kinds.append(op.op)
         result.extend(converted)
         for item in converted:
             try:
@@ -409,7 +415,7 @@ def to_operations(ops: Sequence[Op], snapshot: Optional[ProfileSnapshot]) -> Lis
             except ProfileValidationError:
                 break  # ``prepare_proposal`` reports it with the same text the commands use
     if problems:
-        raise TranslationProblem(problems)
+        raise TranslationProblem(problems, op_kinds)
     return result
 
 
@@ -474,7 +480,12 @@ def prepare_proposal(reply_ops: Sequence[Op], snapshot: Optional[ProfileSnapshot
         if getattr(proposed.fields, name) != getattr(old_fields, name)
     )
     resumes = snapshot is not None and snapshot.fields.paused and not proposed.fields.paused
-    label = "llm onboarding" if mode == "onboarding" else f"chat change ({len(reply_ops)} operations)"
+    if mode == "onboarding":
+        label = "llm onboarding"
+    elif mode == "update":
+        label = "llm update"
+    else:
+        label = f"chat change ({len(reply_ops)} operations)"
     return Proposal(
         operations_json=json.dumps([op.model_dump(mode="json") for op in reply_ops]),
         ops=tuple(ops),
@@ -520,6 +531,28 @@ The user message holds two blocks. <current_profile> is the stored profile and <
 ONBOARDING_ADDENDUM = """
 
 This is the first setup: the profile is nearly empty and the user describes the search in their own words. Draft a starter profile with kind "proposal": the roles with synonyms in the languages of the chosen markets (tag each synonym with its language), the markets (countries and remote preference), a persona (a short factual description of the candidate and what they look for), a core_role_definition (what a role must mainly consist of to be a perfect match), dealbreakers (what to avoid), a target level when the user gives one, and a few starter "block" rules for obvious unwanted topics the user names. Use only what the user wrote; do not invent facts about them. Ask one question (kind "clarify") only when no role or no market can be derived at all."""
+
+UPDATE_ADDENDUM = """
+
+This is an update of an existing profile: the user describes what to add or change in their own words, and <current_profile> shows what is stored. Extend the profile with kind "proposal": add the roles (with synonyms in the languages of the markets, each tagged with its language), markets, rules and target level the user names. Keep existing text: change a persona or definition only by merging, i.e. a set_text value starts from the current text and adds or adjusts only what the user said. Never remove or disable existing roles or markets unless the user says so. Use only what the user wrote; do not invent facts about them. Ask one question (kind "clarify") only when the request cannot be carried out without guessing."""
+
+_ADDENDA = {"chat": "", "onboarding": ONBOARDING_ADDENDUM, "update": UPDATE_ADDENDUM}
+_CLARIFY_SENTENCE_RE = re.compile(r'Ask one question \(kind "clarify"\)[^.]*\.')
+NO_CLARIFY_SENTENCE = 'Never ask a question; if nothing can be drafted answer kind "none".'
+NOTHING_TO_PROPOSE = "nothing to propose"
+
+
+def system_prompt(mode: str, allow_clarify: bool = True) -> str:
+    """The system prompt of ``mode``; without ``allow_clarify`` the addendum's question sentence becomes
+    ``NO_CLARIFY_SENTENCE`` (appended for ``chat``, which has no addendum)."""
+    if mode not in MODES:
+        raise ValueError(f"unknown translator mode '{mode[:20]}'")
+    addendum = _ADDENDA[mode]
+    if allow_clarify:
+        return TRANSLATOR_SYSTEM_PROMPT + addendum
+    if _CLARIFY_SENTENCE_RE.search(addendum):
+        return TRANSLATOR_SYSTEM_PROMPT + _CLARIFY_SENTENCE_RE.sub(NO_CLARIFY_SENTENCE, addendum)
+    return TRANSLATOR_SYSTEM_PROMPT + "\n\n" + NO_CLARIFY_SENTENCE
 
 _NAMES = "current_profile|user_message"
 _OPEN = r"(?:<|&lt;|&#0*60;|&#x0*3c;)"
@@ -593,12 +626,11 @@ def build_messages(
     *,
     mode: str,
     history: Sequence[Tuple[str, str]] = (),
+    allow_clarify: bool = True,
 ) -> List[Dict[str, str]]:
     """System and user message for one translation. All user text is masked here (e-mail addresses and phone
     numbers), so no caller can send it unmasked; no job data is ever an input."""
-    if mode not in MODES:
-        raise ValueError(f"unknown translator mode '{mode[:20]}'")
-    system = TRANSLATOR_SYSTEM_PROMPT + (ONBOARDING_ADDENDUM if mode == "onboarding" else "")
+    system = system_prompt(mode, allow_clarify)
     parts: List[str] = []
     for earlier, question in history:
         parts.append("Earlier message: " + _clean(mask_personal_data(earlier)[0], MAX_INPUT_CHARS))
@@ -627,12 +659,18 @@ class Translator:
         mode: str,
         history: Sequence[Tuple[str, str]] = (),
         request_id: str,
+        kind: str = "chat",
+        allow_clarify: bool = True,
     ) -> Union[Proposal, Clarification, NoChange]:
-        """One model call. ``ChatLLM`` errors, ``TranslationProblem`` and ``ProfileValidationError`` propagate."""
+        """One model call (``kind`` selects the ``ChatLLM`` timeout profile). ``ChatLLM`` errors,
+        ``TranslationProblem`` and ``ProfileValidationError`` propagate. Without ``allow_clarify`` (an interview
+        draft) a ``clarify`` or ``none`` reply is ``TranslationProblem("nothing to propose")``."""
         text = "\n\n".join(parts)[:MAX_INPUT_CHARS]
-        messages = build_messages(snapshot, text, mode=mode, history=history)
-        answer = self._llm.complete(messages, validate=TranslatorReply.model_validate, request_id=request_id)
+        messages = build_messages(snapshot, text, mode=mode, history=history, allow_clarify=allow_clarify)
+        answer = self._llm.complete(messages, validate=TranslatorReply.model_validate, request_id=request_id, kind=kind)
         reply: TranslatorReply = answer.value
+        if not allow_clarify and reply.kind != "proposal":
+            raise TranslationProblem([NOTHING_TO_PROPOSE])
         if reply.kind == "clarify":
             return Clarification(_clean(reply.question, MAX_QUESTION_CHARS))
         if reply.kind == "none":
