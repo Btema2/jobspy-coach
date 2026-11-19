@@ -239,7 +239,7 @@ Any AI agent working on this codebase must adhere strictly to these principles:
 ## 5. Quick CLI & Testing Reference
 
 ```bash
-# Run full automated test suite (~1,940 tests, no network; the `live` smoke test is skipped)
+# Run full automated test suite (~1,960 tests, no network; the `live` smoke test is skipped)
 .venv/bin/pytest -v
 
 # Optional: 2 real calls through the provider chain (needs keys in .env)

@@ -582,7 +582,7 @@ COVERAGE_FILE=/tmp/.coverage pytest -o cache_dir=/tmp/.pytest_cache --cov=src --
 - `tests/test_bot_*.py`, `tests/test_countries.py`, `tests/test_envfile.py`, `tests/test_bootstrap.py`, `tests/test_i18n.py`, `tests/test_daemon_bot.py`: Telegram bot client, state, pairing and auth, poller (offset-before-execute, staleness, back-off), commands, wizard, stats, `/test`, `init`, `.env` merging, language tables and daemon wiring (fake Telegram, no network).
 - `tests/test_bot_e2e.py`: the whole bot loop against a fake Telegram server (pairing, a stranger in a group, a command, `/undo` and its re-delivery, `/stats`, shutdown).
 - `tests/test_chat_llm.py`, `tests/test_translator.py`, `tests/test_conversation*.py`, `tests/test_onboarding.py`, `tests/test_privacy.py`, `tests/fake_llm.py`: the free-text layer (chat LLM path and limits, translator schema and injection defences, debounce, consent, proposals and confirmation, onboarding, masking) with scripted fake LLM transports.
-- `tests/test_llm_e2e.py`: a free-text change end to end (fake Telegram and fake LLM: consent, masking, NIM timeout then OpenRouter, confirmation, a replayed button, and an injection attempt).
+- `tests/test_llm_e2e.py`: a free-text change end to end (fake Telegram and fake LLM: consent, masking, NIM timeout then OpenRouter, confirmation, a replayed button, a clarification round, and an injection attempt).
 
 ---
 
