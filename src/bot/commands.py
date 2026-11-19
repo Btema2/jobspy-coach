@@ -7,11 +7,12 @@ and probe modules (see ``_register_features``) through ``register`` / ``register
 ``set_text_handler``.
 """
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence, Tuple
 
 from src.bot.client import TelegramBotClient
 from src.bot.countries import resolve_country
@@ -105,6 +106,9 @@ class BotContext:
     is_cycle_running: Callable[[], bool]
     scraper: Any  # has scrape_board_outcome
     clock: Callable[[], float] = time.time
+    # Atomically takes the cycle (and digest) locks for a data-changing command; yields False when one is held.
+    cycle_guard: Optional[Callable[[], ContextManager[bool]]] = None
+    stop_event: Optional[threading.Event] = None  # set at shutdown; makes waits of worker threads abortable
 
 
 def _reply(text: str) -> List[OutgoingMessage]:
@@ -197,6 +201,10 @@ class CommandRouter:
     # --- dispatch -----------------------------------------------------------------------
 
     def is_mutating(self, update: Update) -> bool:
+        # Staleness (15 minutes) applies to commands only. Wizard callbacks and free text are protected
+        # otherwise: every button carries the wizard nonce, the wizard expires after 30 idle minutes and an
+        # apply is bound to the profile version it started from (and clears the wizard first, so a replayed
+        # button finds nothing). A callback's date is that of the button message, so the check would misfire.
         return update.kind == "message" and update.command in MUTATING_COMMANDS
 
     def handle(self, update: Update) -> List[OutgoingMessage]:
@@ -540,8 +548,16 @@ class CommandRouter:
         argument = update.args.strip().lower()
         if argument not in ("", "thresholds"):
             return _reply("Usage: /requeue [thresholds]")
-        if self._ctx.is_cycle_running():
-            return _reply("A cycle is running; send /requeue when it has finished.")
+        busy = _reply("A cycle is running; send /requeue when it has finished.")
+        guard = self._ctx.cycle_guard
+        if guard is None:  # no daemon behind the router (tests): the best available check
+            if self._ctx.is_cycle_running():
+                return busy
+            return self._requeue_now(argument)
+        with guard() as acquired:  # the lock is held while the writes run, so no cycle can start meanwhile
+            return self._requeue_now(argument) if acquired else busy
+
+    def _requeue_now(self, argument: str) -> List[OutgoingMessage]:
         snapshot = self._snapshot()
         if snapshot is None:
             return _reply(_NO_PROFILE)

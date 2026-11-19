@@ -359,3 +359,12 @@ def test_setup_wizard_class_direct(db, store, clock):
     assert wizard.on_text(parse_update(message_update(1, "hi"))) is None
     messages = wizard.start(parse_update(message_update(2, "/setup")))
     assert isinstance(messages[0], OutgoingMessage)
+
+
+def test_replayed_apply_after_apply_is_rejected(chat, store):
+    _to_confirm(chat)
+    apply_data = _choice(chat, "apply")
+    assert "Profile v" in chat.press(apply_data)
+    version = store.read_snapshot().version
+    assert chat.press(apply_data) == STALE  # a re-delivered or double-tapped button finds no wizard
+    assert store.read_snapshot().version == version

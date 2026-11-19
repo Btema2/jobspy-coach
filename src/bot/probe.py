@@ -15,8 +15,8 @@ from src.bot.render import chunk_html, esc
 from src.bot.updates import OutgoingMessage, Update
 from src.filters.rules import CompiledRule
 from src.profile.compiler import compile_profile, parse_expanded_query_id
-from src.profile.ops import AddRole, apply_operation
-from src.profile.snapshot import ProfileSnapshot
+from src.profile.ops import AddRole, apply_operation, normalise_snapshot, validate_snapshot
+from src.profile.snapshot import ProfileFields, ProfileSnapshot
 from src.profile.store import ProfileStore
 from src.scraper.jobspy_scraper import COUNTRY_BOUND_BOARDS
 from src.scraper.query_catalog import SearchQuery
@@ -32,7 +32,8 @@ _USAGE = "Usage: /test role [linkedin]"
 _NO_MARKET = "Add a market first (/add_market)."
 _NOTHING = "Nothing to search for that role; is the role enabled?"
 _DISCLAIMER = "This does not measure relevance."
-_ID_SEPARATORS = (";", "=")
+_SKIP_REASONS = {"disabled": "disabled in SCRAPER_ENABLED_BOARDS", "no_country": "no country"}
+MAX_REASON_PROBLEMS = 2
 
 
 @dataclass(frozen=True)
@@ -46,8 +47,17 @@ class ProbeResult:
     postings: int = 0  # distinct postings seen (the denominator of the pre-filtered share)
 
 
-def plan_probe(snapshot: ProfileSnapshot, role: str, include_linkedin: bool) -> List[Tuple[SearchQuery, str]]:
-    """The (query, board) calls of a trial search for ``role``; an unknown role is added in memory only."""
+def plan_probe(
+    snapshot: ProfileSnapshot,
+    role: str,
+    include_linkedin: bool,
+    board_skip_reason: Optional[Callable[[str, SearchQuery], Optional[str]]] = None,
+) -> List[Tuple[SearchQuery, str]]:
+    """The (query, board) calls of a trial search for ``role``; an unknown role is added in memory only.
+
+    Pairs the scraper would refuse (``board_skip_reason`` returns a reason) are dropped before the call budget
+    is applied, so the budget is spent on calls that really happen.
+    """
     wanted = role.strip().casefold()
     names = {r.name.strip().casefold() for r in snapshot.roles}
     if wanted not in names:
@@ -63,6 +73,8 @@ def plan_probe(snapshot: ProfileSnapshot, role: str, include_linkedin: bool) -> 
             if board == "linkedin" and not include_linkedin:
                 continue
             if board in COUNTRY_BOUND_BOARDS and not query.country_code:
+                continue
+            if board_skip_reason is not None and board_skip_reason(site, query) is not None:
                 continue
             plan.append((query, site))
     return plan[:TEST_MAX_CALLS]
@@ -111,7 +123,15 @@ def render_probe(result: ProbeResult) -> str:
     return "\n".join(lines)
 
 
+def role_name_problems(role: str) -> List[str]:
+    """Why ``role`` is not a valid role name, by the same validation ``ops`` applies (empty list: valid)."""
+    empty = ProfileSnapshot(ProfileFields(paused=True))
+    return validate_snapshot(normalise_snapshot(apply_operation(empty, AddRole(role))), None)
+
+
 class ProbeRunner:
+    RETRY_WAIT_SECONDS = 3.0  # one retry of an undelivered result
+
     def __init__(self, ctx: BotContext, client: Any, *, clock: Callable[[], float] = time.time):
         self._ctx = ctx
         self._client = client
@@ -130,13 +150,27 @@ class ProbeRunner:
         role = " ".join(words)
         if not role:
             return [OutgoingMessage(_USAGE)]
-        if any(sep in role for sep in _ID_SEPARATORS):
-            return [OutgoingMessage("A role name cannot contain ';' or '='.")]
+        problems = role_name_problems(role)
+        if problems:
+            shown = "; ".join(esc(" ".join(p.split())[:120]) for p in problems[:MAX_REASON_PROBLEMS])
+            return [OutgoingMessage(f"That role name is not valid: {shown}")]
         snapshot = self._store.read_snapshot()
         if snapshot is None or not any(m.enabled for m in snapshot.markets):
             return [OutgoingMessage(_NO_MARKET)]
-        plan = plan_probe(snapshot, role, include_linkedin)
+        skipped: Dict[str, str] = {}
+        skip_reason = getattr(self._ctx.scraper, "board_skip_reason", None)
+
+        def scraper_skips(site: str, query: SearchQuery) -> Optional[str]:
+            reason = skip_reason(site, query) if callable(skip_reason) else None
+            if reason:
+                skipped.setdefault(site.lower(), _SKIP_REASONS.get(reason, reason))
+            return reason
+
+        plan = plan_probe(snapshot, role, include_linkedin, scraper_skips)
+        skipped_text = ", ".join(f"{esc(board)} ({esc(why)})" for board, why in skipped.items())
         if not plan:
+            if skipped_text:
+                return [OutgoingMessage(f"Nothing to search: every board is skipped: {skipped_text}.")]
             return [OutgoingMessage(_NOTHING)]
         rules = compile_profile(snapshot).rules
         with self._lock:
@@ -147,20 +181,35 @@ class ProbeRunner:
                 return [OutgoingMessage(f"One /test per 5 minutes; try again in {wait} s.")]
             self._last_started = now
             self._thread = threading.Thread(
-                target=self._work, args=(update.chat_id, plan, rules), name="bot-test", daemon=True
+                target=self._work, args=(update.chat_id, plan, rules, skipped_text), name="bot-test", daemon=True
             )
             self._thread.start()
         return [OutgoingMessage("Searching...")]
 
-    def _work(self, chat_id: Optional[int], plan, rules) -> None:
+    def _work(self, chat_id: Optional[int], plan, rules, skipped_text: str = "") -> None:
         try:
             text = render_probe(run_probe(self._ctx.scraper, self._db, plan, rules))
         except Exception as exc:  # never the message: it can hold a request URL
             logger.warning("test search failed: %s", type(exc).__name__)
             text = f"The test search failed ({type(exc).__name__})."
+        if skipped_text:
+            text += f"\nSkipped boards: {skipped_text}"
+        if chat_id is None:
+            return
         try:
-            if chat_id is not None:
-                for piece in chunk_html(text):
-                    self._client.send_message(chat_id, piece)
+            for piece in chunk_html(text):
+                if self._client.send_message(chat_id, piece) is None and not self._retry(chat_id, piece):
+                    logger.warning("could not send the test result")
+                    return
         except Exception as exc:
             logger.warning("could not send the test result: %s", type(exc).__name__)
+
+    def _retry(self, chat_id: int, piece: str) -> bool:
+        """One more attempt after a short wait that ends early on shutdown."""
+        stop = self._ctx.stop_event
+        if stop is not None:
+            if stop.wait(self.RETRY_WAIT_SECONDS):
+                return False
+        else:
+            time.sleep(self.RETRY_WAIT_SECONDS)
+        return self._client.send_message(chat_id, piece) is not None

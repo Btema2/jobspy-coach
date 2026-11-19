@@ -245,6 +245,98 @@ def test_daemon_shutdown_stops_poller(tmp_path, telegram):
     assert "getUpdates" in telegram.methods and "setMyCommands" in telegram.methods
 
 
+def test_shutdown_returns_at_once_while_a_long_poll_is_in_flight(monkeypatch, tmp_path):
+    """A getUpdates blocking for 2.5 s: the signal handler must not wait for it (the poller is a daemon thread)."""
+    import signal
+
+    import src.scheduler.daemon as daemon_module
+
+    fake = BlockingTelegram(delay=2.5)
+    real = daemon_module.TelegramBotClient
+    monkeypatch.setattr(daemon_module, "TelegramBotClient", lambda token, **kw: real(token, transport=fake.transport, **kw))
+    mock_scheduler = MagicMock()
+    mock_scheduler.running = True
+    monkeypatch.setattr("src.scheduler.daemon.BlockingScheduler", MagicMock(return_value=mock_scheduler))
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
+    handlers = {}
+    monkeypatch.setattr("signal.signal", lambda sig, handler: handlers.update({sig: handler}))
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
+    monkeypatch.setattr(daemon, "run_pipeline_cycle", MagicMock(return_value=(0, 0)))
+    daemon.start()
+    thread = daemon._bot_thread
+    deadline = time.monotonic() + 2
+    while "getUpdates" not in fake.methods and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "getUpdates" in fake.methods and thread.is_alive()
+
+    monkeypatch.setattr("sys.exit", MagicMock())
+    started = time.monotonic()
+    handlers[signal.SIGTERM](signal.SIGTERM, None)
+    assert time.monotonic() - started < 1.0
+    assert thread.is_alive() and thread.daemon  # still inside the poll: nothing waited for it
+    thread.join(timeout=5)
+    assert not thread.is_alive()  # and it ends by itself once the poll returns
+
+
+def test_cycle_guard_is_atomic_and_covers_cycle_and_digest(tmp_path):
+    daemon = _daemon(tmp_path)
+    with daemon.cycle_guard() as acquired:
+        assert acquired is True
+        assert daemon.is_cycle_running()
+        assert daemon.run_pipeline_cycle(queries=[]) == (0, 0)  # skipped: the guard holds the cycle lock
+        with daemon.cycle_guard() as nested:
+            assert nested is False
+    assert not daemon.is_cycle_running()
+
+    assert daemon._digest_lock.acquire(blocking=False)
+    try:
+        with daemon.cycle_guard() as acquired:
+            assert acquired is False
+        assert not daemon._cycle_lock.locked()  # a refused guard leaves nothing held
+    finally:
+        daemon._digest_lock.release()
+
+    assert daemon._cycle_lock.acquire(blocking=False)
+    try:
+        with daemon.cycle_guard() as acquired:
+            assert acquired is False
+    finally:
+        daemon._cycle_lock.release()
+    assert not daemon._digest_lock.locked()
+
+
+def test_requeue_holds_the_cycle_lock_and_is_refused_while_a_cycle_runs(tmp_path, telegram, monkeypatch):
+    import src.bot.commands as commands
+    from src.profile.ops import create_starter_profile
+    from src.profile.store import ProfileStore
+
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
+    create_starter_profile(ProfileStore(daemon.db), wow_threshold=8.5, digest_threshold=6.5, output_language="en")
+    poller = daemon._start_bot()
+    seen = {}
+
+    def fake_requeue(db, rules):
+        seen["locked"] = daemon._cycle_lock.locked()
+        seen["cycle"] = daemon.run_pipeline_cycle(queries=[])  # a scheduled cycle meanwhile is skipped
+        from src.profile.requeue import RequeueResult
+
+        return RequeueResult(0, 0, 0, 0, [])
+
+    try:
+        monkeypatch.setattr(commands, "requeue_prefiltered", fake_requeue)
+        reply = poller._router.handle(parse_update(message_update(1, "/requeue")))
+        assert seen == {"locked": True, "cycle": (0, 0)} and "checked: 0" in reply[0].text
+        assert not daemon.is_cycle_running()
+
+        assert daemon._cycle_lock.acquire(blocking=False)
+        seen.clear()
+        reply = poller._router.handle(parse_update(message_update(2, "/requeue")))
+        assert "A cycle is running" in reply[0].text and seen == {}
+        daemon._cycle_lock.release()
+    finally:
+        _stop(daemon)
+
+
 def test_start_bot_registers_features_and_commands(tmp_path, telegram):
     daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>", TELEGRAM_CHAT_ID="111")
     poller = daemon._start_bot()

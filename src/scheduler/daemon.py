@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -567,8 +568,34 @@ class DaemonService:
         """A scrape/evaluate cycle or a digest is running (the bot refuses /requeue meanwhile)."""
         return self._cycle_lock.locked() or self._digest_lock.locked()
 
+    @contextmanager
+    def cycle_guard(self) -> Iterator[bool]:
+        """Hold the cycle and digest locks (non-blocking, atomic) while the body runs; yields False if one is held.
+
+        Used by ``/requeue``: its writes must not interleave with a cycle or a digest, and a scheduled cycle that
+        wants to start meanwhile is skipped (like any cycle that finds the lock held).
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            yield False
+            return
+        try:
+            if not self._digest_lock.acquire(blocking=False):
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                self._digest_lock.release()
+        finally:
+            self._cycle_lock.release()
+
     def trigger_cycle(self) -> str:
-        """Schedule an immediate cycle (``/run_now``, ``/resume``); the scheduler thread runs it."""
+        """Schedule an immediate cycle (``/run_now``, ``/resume``); the scheduler thread runs it.
+
+        The answer is "started" when the job was queued while no cycle ran. If the interval job takes the lock
+        first, the queued ``run_now`` cycle is skipped with a WARNING; a cycle is running either way, which is
+        what the caller wanted.
+        """
         if self._shutdown_requested.is_set() or self.scheduler is None:
             return TRIGGER_NOT_READY
         if self._cycle_lock.locked():
@@ -805,6 +832,8 @@ class DaemonService:
                 trigger_cycle=self.trigger_cycle,
                 is_cycle_running=self.is_cycle_running,
                 scraper=self.scraper,
+                cycle_guard=self.cycle_guard,
+                stop_event=self._shutdown_requested,
             )
             poller = BotPoller(
                 client,

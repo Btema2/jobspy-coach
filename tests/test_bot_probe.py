@@ -195,24 +195,30 @@ def test_probe_counts_failed_calls_and_continues(store, db):
 
 
 class Sink:
-    """Records what the worker sends; ``done`` is set after the first message."""
+    """Records what the worker sends; the first ``fail_first`` sends are reported as undelivered (None)."""
 
-    def __init__(self):
+    def __init__(self, fail_first=0):
         self.sent: List[str] = []
+        self.attempts = 0
+        self.fail_first = fail_first
         self.done = threading.Event()
 
     def send_message(self, chat_id, text, reply_markup=None):
+        self.attempts += 1
+        if self.attempts <= self.fail_first:
+            return None
         self.sent.append(text)
         self.done.set()
         return 1
 
 
-def _runner(tmp_path, db, scraper, clock=time.time):
+def _runner(tmp_path, db, scraper, clock=time.time, sink=None, stop_event=None):
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
         trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=scraper, clock=clock,
+        stop_event=stop_event,
     )
-    sink = Sink()
+    sink = sink or Sink()
     return ProbeRunner(ctx, sink, clock=clock), sink
 
 
@@ -391,3 +397,90 @@ def test_probe_interleaves_with_cycle_calls(monkeypatch, tmp_path, db, store):
     names = [e[1] for e in ends]
     assert "probe" in names
     assert names.index("probe") < names.index("cycle 3")
+
+
+# --- review fixes -------------------------------------------------------------------------
+
+
+def _skip_google(site, query):
+    return "disabled" if site.lower() == "google" else None
+
+
+def test_plan_drops_scraper_skipped_boards_before_the_call_budget(store):
+    snap = _snapshot(store)
+    plain = plan_probe(snap, "<ROLE>", include_linkedin=False)
+    assert len(plain) == TEST_MAX_CALLS and "google" in {site for _, site in plain}
+    plan = plan_probe(snap, "<ROLE>", include_linkedin=False, board_skip_reason=_skip_google)
+    assert plan and all(site == "indeed" for _, site in plan)
+    assert len(plan) == 2  # indeed for the name and the synonym: nothing is padded with skipped calls
+
+
+def test_probe_reply_names_skipped_boards(tmp_path, db, store):
+    scraper = DoubleScraper(per_call=1)
+    scraper.board_skip_reason = _skip_google
+    runner, sink = _runner(tmp_path, db, scraper)
+    runner.request(_update("/test <ROLE>"))
+    _wait(runner)
+    assert all(c["site"] != "google" for c in scraper.calls)
+    assert "Skipped boards: google (disabled in SCRAPER_ENABLED_BOARDS)" in "\n".join(sink.sent)
+
+
+def test_probe_with_everything_skipped_says_so_and_keeps_cooldown(tmp_path, db, store):
+    scraper = DoubleScraper()
+    scraper.board_skip_reason = lambda site, query: "disabled"
+    runner, sink = _runner(tmp_path, db, scraper)
+    reply = runner.request(_update("/test <ROLE>"))[0].text
+    assert "SCRAPER_ENABLED_BOARDS" in reply and "google" in reply
+    assert runner._thread is None and scraper.calls == []
+
+
+def test_probe_with_real_scraper_enabled_boards(tmp_path, db, store, monkeypatch):
+    monkeypatch.setattr("src.scraper.jobspy_scraper.scrape_jobs", lambda **kw: _df(1))
+    scraper = JobSpyScraper(jitter_min=0, jitter_max=0, enabled_boards=["indeed"])
+    runner, sink = _runner(tmp_path, db, scraper)
+    runner.request(_update("/test <ROLE>"))
+    _wait(runner)
+    text = "\n".join(sink.sent)
+    assert "rows 2" in text and "Skipped boards: google" in text
+
+
+def test_probe_retries_an_undelivered_result_once(tmp_path, db, store, caplog):
+    sink = Sink(fail_first=1)
+    runner, _ = _runner(tmp_path, db, DoubleScraper(per_call=1), sink=sink, stop_event=threading.Event())
+    runner.RETRY_WAIT_SECONDS = 0.01
+    runner.request(_update("/test <ROLE>"))
+    _wait(runner)
+    assert sink.attempts == 2 and "This does not measure relevance." in "\n".join(sink.sent)
+
+
+def test_probe_gives_up_after_one_retry_without_logging_content(tmp_path, db, store, caplog):
+    sink = Sink(fail_first=99)
+    runner, _ = _runner(tmp_path, db, DoubleScraper(per_call=1), sink=sink, stop_event=threading.Event())
+    runner.RETRY_WAIT_SECONDS = 0.01
+    with caplog.at_level("WARNING"):
+        runner.request(_update("/test <ROLE>"))
+        _wait(runner)
+    assert sink.attempts == 2 and sink.sent == []
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings and not any("Title" in w or "<ROLE>" in w for w in warnings)
+
+
+def test_probe_retry_wait_stops_on_shutdown(tmp_path, db, store):
+    stop = threading.Event()
+    stop.set()
+    sink = Sink(fail_first=99)
+    runner, _ = _runner(tmp_path, db, DoubleScraper(per_call=1), sink=sink, stop_event=stop)
+    runner.RETRY_WAIT_SECONDS = 30
+    started = time.monotonic()
+    runner.request(_update("/test <ROLE>"))
+    _wait(runner)
+    assert time.monotonic() - started < 5 and sink.attempts == 1
+
+
+def test_probe_validates_the_role_name_before_searching(tmp_path, db, store):
+    scraper = DoubleScraper()
+    runner, _ = _runner(tmp_path, db, scraper)
+    reply = runner.request(_update("/test " + "x" * 200))[0].text
+    assert reply.startswith("That role name is not valid")
+    assert runner._thread is None and scraper.calls == []
+    assert runner.request(_update("/test a=b"))[0].text.startswith("That role name is not valid")
