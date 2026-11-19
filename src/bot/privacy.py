@@ -14,14 +14,17 @@ CONSENT_NOTICE = (
     "is unavailable, to free models on OpenRouter. Their logging and training policies may differ, and I "
     "cannot control what they keep. Please leave out names, addresses and phone numbers. Obvious e-mail addresses "
     "and phone numbers are masked here before sending when I recognise them, but that is best effort. "
-    "Tap Agree to continue; the commands (/help) work without any language model."
+    "Choose below to continue; the commands (/help) work without any language model."
 )
 
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+# Every repetition is bounded, so hostile input cannot make the matching quadratic.
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){0,8}\.[A-Za-z]{2,24}"
+)
 # Candidate: groups of digits (optionally in parentheses) joined by one space, dot or dash, not part of a
-# longer alphanumeric token; the digit rules are checked in ``_phone``.
+# longer alphanumeric token; the digit rules are checked in ``_is_phone``.
 _PHONE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])\+?\(?\d+\)?(?:[ .\-]\(?\d+\)?)*(?![A-Za-z0-9_])"
+    r"(?<![A-Za-z0-9_])\+?\(?\d{1,15}\)?(?:[ .\-]\(?\d{1,15}\)?){0,15}(?![A-Za-z0-9_])"
 )
 _DIGITS_RE = re.compile(r"\d+")
 MIN_PHONE_DIGITS = 9

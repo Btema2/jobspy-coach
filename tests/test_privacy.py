@@ -122,3 +122,12 @@ def test_consent_notice_names_providers():
     assert "free" in notice.lower() and "logging" in notice.lower() and "training" in notice.lower()
     assert "names" in notice and "addresses" in notice and "phone numbers" in notice
     assert "e-mail addresses" in notice and "masked" in notice
+
+
+def test_masking_is_linear_on_hostile_input():
+    import time
+
+    for text in ("1-" * 10000 + "a", "a." * 10000, "a@" + "b." * 5000, "(1) " * 5000 + "z"):
+        started = time.monotonic()
+        mask_personal_data(text)
+        assert time.monotonic() - started < 0.5
