@@ -540,22 +540,6 @@ def test_resume_via_chat_triggers_cycle(svc, clock, translator, telegram, contro
     assert store.read_snapshot().fields.paused is False
 
 
-def test_awaiting_description_uses_onboarding_mode_and_paused_note(
-    svc, clock, translator, telegram, conv_store, store
-):
-    apply_changes(store, [SetField("paused", True)], label="pause")
-    conv_store.set_state(111, "awaiting_description", None, clock.value)
-    translator.add(prop(add_role("<ROLE2>")))
-    run_request(svc, clock, "describe")
-    assert translator.calls[0]["mode"] == "onboarding"
-    assert conv_store.get_pending(111).mode == "onboarding"
-    data = [d for d in button_data(last_markup(telegram)) if d.endswith(":a")][0]
-    reply = texts(svc.on_callback(callback(data)))
-    assert conv.PAUSED_NOTE in reply
-    assert store.list_versions()[0].label == "llm onboarding"
-    assert conv_store.get_state(111).state == "idle"
-
-
 # --- bare words, /ok, /cancel --------------------------------------------------------------------
 
 
@@ -1246,3 +1230,125 @@ def test_proposal_with_a_lost_middle_chunk_is_discarded(svc, clock, translator, 
     assert telegram.calls("editMessageReplyMarkup")  # the buttons of the last chunk were removed
     assert texts(say(svc, "yes")) == conv.NO_PENDING_REPLY
     assert version(store) == before
+
+
+# --- the interview entry (update mode, routing, restart, purge) ----------------------------------------
+
+
+def iv_nonce(telegram: FakeTelegram) -> str:
+    for call in reversed(telegram.calls("sendMessage")):
+        for row in (call.get("reply_markup") or {}).get("inline_keyboard", []):
+            for button in row:
+                if button["callback_data"].startswith("iv:"):
+                    return button["callback_data"].split(":")[1]
+    raise AssertionError("no interview buttons sent")
+
+
+def start_interview(svc, clock, telegram) -> str:
+    assert svc.start_setup(text_update("/setup")) == []
+    assert svc.process_next(clock.value) is True
+    return iv_nonce(telegram)
+
+
+def test_interview_in_update_mode_when_profile_has_roles(svc, clock, telegram, conv_store):
+    start_interview(svc, clock, telegram)
+    state = conv_store.get_state(111)
+    assert state.state == conv.STATE_INTERVIEW and state.context["mode"] == "update"
+
+
+def test_interview_mode_follows_starter_rule(svc, clock, telegram, conv_store, store):
+    # no enabled role and no market: onboarding; a disabled role alone still counts as starter
+    snapshot = store.read_snapshot()
+    from src.profile.ops import RemoveMarket, SetEnabled
+    apply_changes(
+        store,
+        [SetEnabled("role", snapshot.roles[0].name, False), RemoveMarket(snapshot.markets[0].name)],
+        label="empty",
+    )
+    start_interview(svc, clock, telegram)
+    assert conv_store.get_state(111).context["mode"] == "onboarding"
+
+
+def test_interview_text_is_tagged_and_never_reaches_translator(svc, clock, telegram, translator, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    assert say(svc, "<ANSWER>") == []
+    buffer = svc._buffers[-1]
+    assert (buffer.interview, buffer.nonce, buffer.slot, buffer.closed, buffer.immediate) == (
+        True, nonce, "roles", True, True
+    )
+    assert svc.process_next(clock.value) is True
+    assert translator.calls == []
+
+
+def test_bare_words_in_interview_do_not_touch_a_proposal(svc, clock, telegram, translator, conv_store, store):
+    start_interview(svc, clock, telegram)
+    conv_store.put_pending(
+        conv.PendingChange(111, "abcd0001", version(store), "chat", '[{"op": "set_paused", "paused": true}]', None,
+                           clock.value)
+    )
+    before = version(store)
+    for word in ("yes", "no", "OK!", "cancel"):
+        assert say(svc, word, date=int(clock.value)) == []
+    while svc.process_next(clock.value):
+        pass
+    assert version(store) == before and conv_store.get_pending(111) is not None
+    assert translator.calls == []
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+
+
+def test_after_cancel_free_text_reaches_translator_again(svc, clock, telegram, translator, conv_store):
+    start_interview(svc, clock, telegram)
+    assert texts(svc.on_cancel(text_update("/cancel"))) == conv.CANCELLED_REPLY
+    assert conv_store.get_state(111).state == "idle" and 111 not in svc._interview
+    run_request(svc, clock, "add a role")
+    assert translator.calls and translator.calls[0]["mode"] == "chat"
+
+
+def test_restart_keeps_row_and_rebuilds_mirror(svc, db, store, clock, telegram, translator, conv_store, tmp_path):
+    nonce = start_interview(svc, clock, telegram)
+    ctx = BotContext(
+        db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
+        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+    )
+    client = TelegramBotClient(TOKEN, transport=telegram.transport)
+    fresh = ConversationService(ctx, client, SetupWizard(BotStateStore(db), store, clock=clock),
+                                translator=translator, clock=clock)
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+    assert fresh._interview == {}
+    assert fresh.on_text(text_update("<ANSWER>")) == []
+    buffer = fresh._buffers[-1]
+    assert (buffer.interview, buffer.nonce, buffer.slot) == (True, nonce, None)
+    assert fresh.process_next(clock.value) is True
+    assert fresh._interview[111] == (nonce, "roles")
+    assert translator.calls == []
+    assert texts(fresh.on_callback(callback("iv:deadbeef:draft"))) == conv.INTERVIEW_STALE_REPLY
+
+
+def _interview_row(conv_store, clock, *, created_at, updated_at):
+    state = conv_store.get_state(111)
+    context = dict(state.context)
+    context["created_at"] = created_at
+    conv_store.set_state(111, conv.STATE_INTERVIEW, context, updated_at)
+
+
+def test_purge_counts_interview_from_created_at(svc, db, clock, telegram, conv_store):
+    start_interview(svc, clock, telegram)
+    t0 = clock.value
+    # the first answer was stored at t0; the row was rewritten an hour before the sweep
+    _interview_row(conv_store, clock, created_at=t0, updated_at=t0 + conv.CONTEXT_TTL_SECONDS - 3600)
+    svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS - 60)
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+    svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS + 1)
+    state = conv_store.get_state(111)
+    assert state.state == "idle" and state.context is None
+    assert 111 not in svc._interview
+
+
+def test_purge_counts_from_updated_at_while_created_at_is_null(svc, db, clock, telegram, conv_store):
+    start_interview(svc, clock, telegram)
+    t0 = clock.value
+    _interview_row(conv_store, clock, created_at=None, updated_at=t0)
+    svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS - 60)
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+    svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS + 1)
+    assert conv_store.get_state(111).state == "idle"

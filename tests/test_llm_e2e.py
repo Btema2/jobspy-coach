@@ -332,3 +332,44 @@ def test_e2e_failed_request_is_retried_with_the_button(tmp_path, quiet_httpx):
         assert wait_for(lambda: conv.CONSENT_STALE_REPLY in h.telegram.texts())
     finally:
         h.finish()
+
+
+def test_e2e_setup_interview_consent_first(tmp_path, quiet_httpx):
+    """/setup without consent: the notice, no conversation row; yes: intro, buttons, first question, row."""
+    from src.bot.interview import QUESTIONS
+
+    nim, openrouter = ScriptedLLM(), ScriptedLLM()
+    h = Harness(tmp_path, nim, openrouter, consent=False)
+    h.start()
+    try:
+        h.telegram.fake.queue_updates([message_update(1, "/setup")])
+        assert wait_for(lambda: any(b.startswith("cs:") for c in h.telegram.sent() for b in buttons(c)))
+        time.sleep(0.2)
+        assert h.table("SELECT COUNT(*) FROM conversation") == [(0,)]
+        yes = next(b for c in h.telegram.sent() for b in buttons(c) if b.startswith("cs:") and b.endswith(":yes"))
+
+        h.telegram.fake.queue_updates([callback_update(2, yes)])
+        assert wait_for(lambda: QUESTIONS["roles"] in h.telegram.texts())
+        texts = h.telegram.texts()
+        assert texts.index(conv.INTERVIEW_INTRO) < texts.index(QUESTIONS["roles"])
+        intro = next(c for c in h.telegram.sent() if c["text"] == conv.INTERVIEW_INTRO)
+        assert [b.rsplit(":", 1)[1] for b in buttons(intro)] == ["draft", "guided", "cancel"]
+        rows = h.table("SELECT state, context FROM conversation")
+        assert rows[0][0] == "awaiting_interview"
+        context = json.loads(rows[0][1])
+        assert context["created_at"] is None and context["mode"] == "onboarding"
+        assert buttons(intro)[0] == f"iv:{context['nonce']}:draft"
+
+        # an answer is routed to the interview, never to the free-text translator
+        h.telegram.fake.queue_updates([message_update(3, "yes")])
+        time.sleep(0.4)
+        assert nim.requests == [] and openrouter.requests == []
+        assert conv.NO_PENDING_REPLY not in h.telegram.texts()
+
+        # Cancel ends the interview; free text then reaches the translator again
+        h.telegram.fake.queue_updates([callback_update(4, buttons(intro)[2])])
+        assert wait_for(lambda: h.table("SELECT state FROM conversation") == [("idle",)])
+        assert h.table("SELECT COUNT(*) FROM conversation WHERE context IS NOT NULL") == [(0,)]
+    finally:
+        h.finish()
+    assert h.table("SELECT COUNT(*) FROM llm_consent") == [(1,)]

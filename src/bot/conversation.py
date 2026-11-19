@@ -9,7 +9,11 @@ and writes only ``pending_change`` / ``conversation`` rows; it has its own ``Dat
 
 Retention: raw text lives in memory and, while a clarifying question is open, in ``conversation.context``
 (masked, at most 24 hours); it is purged on apply, cancel, supersede and expiry. ``pending_change`` holds the
-validated operation list only. Nothing here logs user text, masked text, questions or replies: only lengths,
+validated operation list only. An interview (``/setup``, state ``awaiting_interview``) exists only after
+consent; its row is created by the worker (``begin``) and cleared on the poller only together with
+``_drop_memory()`` and a nonce check; the poller learns "in an interview" from the ``_interview`` mirror.
+Its 24 hours count from the first stored answer (``context.created_at``; ``updated_at`` while that is null).
+Nothing here logs user text, masked text, questions or replies: only lengths,
 request ids and exception type names.
 """
 import logging
@@ -23,6 +27,7 @@ from src.bot.chat_llm import ChatLLMError, ChatLLMLimited, ChatLLMNotConfigured,
 from src.bot.client import TelegramApiError, TelegramBotClient
 from src.bot.commands import BotContext, not_applied, trigger_note
 from src.bot.conversation_store import ConversationState, ConversationStore, PendingChange
+from src.bot.interview import InterviewLLM, InterviewState, new_state, next_step
 from src.bot.privacy import CONSENT_NOTICE, CONSENT_VERSION, mask_personal_data
 from src.bot.render import chunk_html, esc, render_apply
 from src.bot.translator import (
@@ -104,24 +109,39 @@ COMPILE_ERROR_REPLY = "The stored profile cannot be compiled; nothing was change
 PAUSED_NOTE = "The profile is paused; send /resume to start searching."
 SETUP_NO_LLM_REPLY = "No LLM is configured; using step-by-step questions."
 PROPOSAL_DISCARDED_REPLY = "Your pending proposal was discarded."
+CLARIFICATION_DISCARDED_REPLY = "Your open question was dropped."
+DRAFT_BUTTON = "Draft now"
 GUIDED_BUTTON = "Step-by-step questions instead"
-GUIDED_CALLBACK = "ob:guided"
+CANCEL_BUTTON = "Cancel"
+INTERVIEW_STALE_REPLY = "This choice is no longer active; send your answer again."
 CONSENT_DECLINED_SETUP_REPLY = "Nothing was sent. Continuing with step-by-step questions."
-ONBOARDING_PROMPT = (
-    "Describe what you are looking for in your own words, in one message or a .txt / .md file: the roles and "
-    "their synonyms, the countries or remote work, your seniority level, and what to avoid. "
-    "I will draft the profile and show it for your confirmation before anything changes. "
-    "Prefer questions? Press the button."
+INTERVIEW_INTRO = (
+    "Let's set up your search. I will ask 6 to 8 short questions; it takes a few minutes. "
+    "You can send a CV (PDF), a .txt / .md file or pasted text at any point: one answer can cover several "
+    "questions. Your answers are kept at most 24 hours. Nothing changes until you confirm the draft I show you.\n"
+    "Draft now: draft the profile from what you have said so far. "
+    "Step-by-step questions instead: switch to fixed questions without the language model. "
+    "Cancel: stop the interview."
 )
 
 STATE_IDLE = "idle"
 STATE_CLARIFICATION = "awaiting_clarification"
 STATE_CONFIRM = "awaiting_confirm"
-STATE_DESCRIPTION = "awaiting_description"
+STATE_INTERVIEW = "awaiting_interview"
+_INTERVIEW_ACTIONS = ("draft", "cancel", "retry", "guided")
 
 
 def _reply(text: str) -> List[OutgoingMessage]:
     return [OutgoingMessage(text)]
+
+
+def _consent_markup(nonce: str) -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [[
+            {"text": "Yes, continue", "callback_data": f"cs:{nonce}:yes"},
+            {"text": "No", "callback_data": f"cs:{nonce}:no"},
+        ]]
+    }
 
 
 def _bare_word(text: str) -> Optional[str]:
@@ -146,6 +166,16 @@ class _Buffer:
     immediate: bool = False  # due at once (uploads, text released by the consent button)
     doc: Optional[DocumentRef] = None
     caption: str = ""
+    # Interview inputs: ``interview`` marks them (a free-text request has False); ``action`` is a worker action
+    # (``begin``, ``draft``, ``retry``; None for an answer), ``mode`` the interview mode for ``begin``, ``nonce``
+    # the interview the input belongs to and ``slot`` the question current when it arrived (None: unknown,
+    # e.g. after a restart).
+    interview: bool = False
+    action: Optional[str] = None
+    mode: Optional[str] = None
+    nonce: Optional[str] = None
+    slot: Optional[str] = None
+    ask_first: bool = True  # ``begin``: post the first question (False when started from a CV)
 
     def due(self, now: float) -> bool:
         return self.immediate or now - self.last >= DEBOUNCE_SECONDS
@@ -163,6 +193,7 @@ class _Held:
     parts: List[str]
     created: float
     message_id: Optional[int] = None  # the consent notice, so its buttons can be removed when it is replaced
+    setup: bool = False  # ``/setup`` waits for consent: ``yes`` starts the interview, ``no`` the wizard
 
 
 @dataclass
@@ -191,6 +222,7 @@ class ConversationService:
         wizard: SetupWizard,
         *,
         translator: Optional[Translator] = None,
+        interview_llm: Optional[InterviewLLM] = None,
         clock: Callable[[], float] = time.time,
     ):
         self._ctx = ctx
@@ -209,6 +241,9 @@ class ConversationService:
         if translator is None and ctx.chat_llm is not None:
             translator = Translator(ctx.chat_llm)
         self._translator = translator
+        if interview_llm is None and ctx.chat_llm is not None and translator is not None:
+            interview_llm = InterviewLLM(ctx.chat_llm, translator)
+        self._interview_llm = interview_llm
         self._stop = ctx.stop_event if ctx.stop_event is not None else threading.Event()
         self._note_lock = threading.Lock()  # a progress note is sent (or skipped) as a whole; see _progress_note
         self._cond = threading.Condition()  # memory state only: nothing slow (database, network) runs under it
@@ -219,6 +254,9 @@ class ConversationService:
         self._swallow: Optional[List[Any]] = None
         self._held: Optional[_Held] = None
         self._retry: Optional[_Retry] = None
+        # chat id -> (interview nonce, current slot): set by the worker before it posts each question, removed
+        # when the interview ends; the poller reads only this to know "in an interview" (guarded by ``_cond``).
+        self._interview: Dict[int, Tuple[str, Optional[str]]] = {}
         self._generation = 0
         self._inflight = False
         self._next_sweep = 0.0
@@ -238,6 +276,9 @@ class ConversationService:
                 return wizard_reply
         if update.chat_id is None or (update.document is None and not update.text.strip()):
             return None
+        tag = self._interview_tag(update.chat_id)
+        if tag is not None:  # an interview input: never the bare-word router, never the free-text translator
+            return self._add_interview_input(update, tag)
         if update.document is None:
             kind = _bare_word(update.text)
             if kind is not None:
@@ -254,24 +295,61 @@ class ConversationService:
         return self._add_part(update.chat_id, update.text, self._clock())
 
     def start_setup(self, update: Update) -> List[OutgoingMessage]:
-        """``/setup``: a free-text description when a language model is configured, else the wizard.
+        """``/setup``: the interview when a language model is configured, else the wizard.
 
-        ``/setup guided`` always runs the wizard. Either way a pending proposal is discarded (with a notice),
-        a request still in flight loses its result and any earlier wizard or description prompt is replaced.
+        ``/setup guided`` always runs the wizard. Either way a pending proposal and an open question are
+        discarded (with notices), a request still in flight loses its result and any earlier wizard or interview
+        is replaced. Consent comes first: without it only the notice is shown and nothing is stored (the hold
+        lives in memory); with it the worker starts the interview (``begin``).
         """
         chat_id = update.chat_id
         guided = update.args.strip().lower() == "guided"
         llm = self._ctx.chat_llm
         ready = self._translator is not None and (llm is None or llm.available())
         notes = self._reset_for_setup(chat_id) if chat_id is not None else []
-        if guided or not ready:
-            extra = [] if guided else _reply(SETUP_NO_LLM_REPLY)
+        if guided or not ready or chat_id is None:
+            extra = [] if guided or chat_id is None else _reply(SETUP_NO_LLM_REPLY)
             return notes + extra + self._wizard.start(update)
         self._bot_state.set_wizard(None)
-        with self._state_lock:
-            self._conv.set_state(chat_id, STATE_DESCRIPTION, None, self._clock())
-        markup = {"inline_keyboard": [[{"text": GUIDED_BUTTON, "callback_data": GUIDED_CALLBACK}]]}
-        return notes + [OutgoingMessage(ONBOARDING_PROMPT, markup)]
+        if not self._conv.has_consent(chat_id, CONSENT_VERSION):
+            self._hold_setup(chat_id, notes)
+            return []
+        self._queue_begin(chat_id)
+        return notes
+
+    def _starter_mode(self) -> str:
+        """``onboarding`` when the profile has no enabled role and no market, else ``update``."""
+        snapshot = self._profiles.read_snapshot()
+        if snapshot is None or (not any(role.enabled for role in snapshot.roles) and not snapshot.markets):
+            return "onboarding"
+        return "update"
+
+    def _queue_begin(self, chat_id: int, *, ask_first: bool = True) -> None:
+        mode = self._starter_mode()
+        with self._cond:
+            self._buffers.insert(
+                0,
+                _Buffer(chat_id, [], 0, self._clock(), closed=True, immediate=True, interview=True,
+                        action="begin", mode=mode, ask_first=ask_first),
+            )
+            self._cond.notify_all()
+
+    def _hold_setup(self, chat_id: int, notes: List[OutgoingMessage]) -> None:
+        """``/setup`` without consent: the notice (after the discard notes); nothing is stored before the answer."""
+        held = _Held(secrets.token_hex(4), chat_id, [], self._clock(), setup=True)
+        with self._cond:
+            replaced, self._held = self._held, held
+        if replaced is not None and replaced.message_id is not None:
+            self._clear_buttons(replaced.chat_id, replaced.message_id)
+        if notes:
+            self._send(chat_id, notes)
+        message_id = self._send(chat_id, [OutgoingMessage(CONSENT_NOTICE, _consent_markup(held.nonce))])
+        with self._cond:
+            current = self._held is held
+            if current:
+                held.message_id = message_id
+        if not current:  # answered or cancelled while the notice was being sent
+            self._clear_buttons(chat_id, message_id)
 
     def _reset_for_setup(self, chat_id: int) -> List[OutgoingMessage]:
         self._drop_memory()
@@ -280,22 +358,83 @@ class ConversationService:
             state = self._conv.get_state(chat_id)
             if state.state != STATE_IDLE or state.context is not None:
                 self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
-        if pending is None:
-            return []
-        self._clear_buttons(chat_id, pending.message_id)
-        return _reply(PROPOSAL_DISCARDED_REPLY)
+        notes: List[OutgoingMessage] = []
+        if pending is not None:
+            self._clear_buttons(chat_id, pending.message_id)
+            notes += _reply(PROPOSAL_DISCARDED_REPLY)
+        if state.state == STATE_CLARIFICATION:
+            notes += _reply(CLARIFICATION_DISCARDED_REPLY)
+        return notes
 
-    def _on_onboarding_button(self, update: Update) -> List[OutgoingMessage]:
-        """``ob:guided``: leave the description prompt for the step-by-step wizard."""
+    def _row_interview_nonce(self, chat_id: int) -> Optional[str]:
+        """The nonce of the stored interview (None: the chat is not in one)."""
+        state = self._conv.get_state(chat_id)
+        if state.state != STATE_INTERVIEW:
+            return None
+        nonce = state.context.get("nonce") if isinstance(state.context, dict) else None
+        return nonce if isinstance(nonce, str) else ""
+
+    def _interview_tag(self, chat_id: int) -> Optional[Tuple[Optional[str], Optional[str]]]:
+        """``(nonce, slot)`` when the chat is in an interview: the mirror, else one read of the row (after a
+        restart the slot is unknown); None otherwise."""
+        with self._cond:
+            entry = self._interview.get(chat_id)
+        if entry is not None:
+            return entry
+        nonce = self._row_interview_nonce(chat_id)
+        return None if nonce is None else (nonce or None, None)
+
+    def _add_interview_input(
+        self, update: Update, tag: Tuple[Optional[str], Optional[str]]
+    ) -> List[OutgoingMessage]:
+        """Queue an interview answer (or upload) for the worker, in arrival order and without debounce."""
+        nonce, slot = tag
+        document = update.document
+        if document is not None:
+            if not document.file_name.lower().endswith(_UPLOAD_SUFFIXES):
+                return _reply(ONLY_TEXT_FILES_REPLY)
+            if document.file_size is not None and document.file_size > MAX_UPLOAD_BYTES:
+                return _reply(FILE_TOO_LARGE_REPLY)
+        text = update.text if document is None else ""
+        with self._cond:
+            if len(self._buffers) >= MAX_QUEUED_REQUESTS:
+                return _reply(BUSY_REPLY)
+            self._buffers.append(
+                _Buffer(update.chat_id, [text] if text else [], len(text), self._clock(), closed=True,
+                        immediate=True, doc=document, caption=update.text.strip() if document else "",
+                        interview=True, nonce=nonce, slot=slot)
+            )
+            self._cond.notify_all()
+        return []
+
+    def _on_interview_button(self, update: Update) -> List[OutgoingMessage]:
+        """``iv:<nonce>:draft|cancel|retry|guided`` (poller thread)."""
         chat_id = update.chat_id
-        if update.text != GUIDED_CALLBACK or chat_id is None \
-                or self._conv.get_state(chat_id).state != STATE_DESCRIPTION:
-            return _reply(NO_LONGER_ACTIVE_REPLY)
-        self._clear_buttons(chat_id, update.message_id)
-        self._drop_memory()
-        with self._state_lock:
-            self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
-        return self._wizard.start(update)
+        parts = update.text.split(":")
+        if chat_id is None or len(parts) != 3 or parts[2] not in _INTERVIEW_ACTIONS:
+            return _reply(INTERVIEW_STALE_REPLY)
+        nonce, action = parts[1], parts[2]
+        tag = self._interview_tag(chat_id)
+        if tag is None or tag[0] != nonce:
+            return _reply(INTERVIEW_STALE_REPLY)
+        if action in ("cancel", "guided"):
+            self._clear_buttons(chat_id, update.message_id)
+            self._drop_memory()  # bumps the generation: a worker step of this interview loses its result
+            with self._state_lock:
+                if self._row_interview_nonce(chat_id) == nonce:
+                    self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+            if action == "guided":
+                return self._wizard.start(update)
+            return _reply(CANCELLED_REPLY)
+        with self._cond:
+            if len(self._buffers) >= MAX_QUEUED_REQUESTS:
+                return _reply(BUSY_REPLY)
+            self._buffers.append(
+                _Buffer(chat_id, [], 0, self._clock(), closed=True, immediate=True, interview=True,
+                        action=action, nonce=nonce, slot=tag[1])
+            )
+            self._cond.notify_all()
+        return []
 
     def on_ok(self, update: Update) -> List[OutgoingMessage]:
         return self._confirm(update.chat_id, None, None)
@@ -329,6 +468,7 @@ class ConversationService:
             self._held = None
             self._retry = None
             self._swallow = None
+            self._interview.clear()  # the single paired chat: its interview mirror goes with the generation
         if held is not None and held.message_id is not None:
             self._clear_buttons(held.chat_id, held.message_id)
         if retry is not None and retry.message_id is not None:
@@ -342,8 +482,8 @@ class ConversationService:
             return self._on_consent_button(update)
         if update.text.startswith("rt:"):
             return self._on_retry_button(update)
-        if update.text.startswith("ob:"):
-            return self._on_onboarding_button(update)
+        if update.text.startswith("iv:"):
+            return self._on_interview_button(update)
         return _reply(NO_LONGER_ACTIVE_REPLY)
 
     # --- poller thread: buffering ------------------------------------------------------------
@@ -427,13 +567,13 @@ class ConversationService:
             return _reply(CONSENT_STALE_REPLY)
         self._clear_buttons(update.chat_id, update.message_id)
         if parts[2] == "no":
-            if self._in_description(self._conv.get_state(update.chat_id), self._clock()):
-                # Onboarding without the language model: the step-by-step wizard takes over.
-                with self._state_lock:
-                    self._conv.set_state(update.chat_id, STATE_IDLE, None, self._clock())
+            if held.setup:  # /setup without the language model: the step-by-step wizard takes over
                 return _reply(CONSENT_DECLINED_SETUP_REPLY) + self._wizard.start(update)
             return _reply(CONSENT_DECLINED_REPLY)
         self._conv.record_consent(update.chat_id, CONSENT_VERSION)  # the poller thread writes llm_consent
+        if held.setup:
+            self._queue_begin(held.chat_id)
+            return []
         with self._cond:
             self._buffers.insert(
                 0,
@@ -643,9 +783,16 @@ class ConversationService:
             chats.add(pairing.chat_id)
         for chat_id in chats:
             state = self._wconv.get_state(chat_id)
-            if state.state == STATE_CLARIFICATION and self._context_expired(state, now):
-                with self._state_lock:
-                    self._wconv.set_state(chat_id, self._rest_state(chat_id), None, now)
+            if state.state not in (STATE_CLARIFICATION, STATE_INTERVIEW) or not self._context_expired(state, now):
+                continue
+            with self._state_lock:
+                current = self._wconv.get_state(chat_id)
+                if current.state != state.state or current.context != state.context:
+                    continue  # rewritten meanwhile: the next sweep looks again
+                self._wconv.set_state(chat_id, self._rest_state(chat_id), None, now)
+            if state.state == STATE_INTERVIEW:
+                with self._cond:
+                    self._interview.pop(chat_id, None)
 
     # --- worker thread: one request --------------------------------------------------------------
 
@@ -667,6 +814,12 @@ class ConversationService:
     def _run(self, work: _Work, request_id: str) -> None:
         buffer = work.buffer
         chat_id = buffer.chat_id
+        if buffer.action == "begin":
+            self._begin(work)
+            return
+        if buffer.interview:
+            self._run_interview(work, request_id)
+            return
         parts = self._collect_parts(work)
         if parts is None:
             return
@@ -710,11 +863,6 @@ class ConversationService:
         return parts
 
     @staticmethod
-    def _in_description(state: ConversationState, now: float) -> bool:
-        """Waiting for an onboarding description, counted from ``/setup`` (24 hours at most)."""
-        return state.state == STATE_DESCRIPTION and now - state.updated_at <= CONTEXT_TTL_SECONDS
-
-    @staticmethod
     def _mode_and_history(state: ConversationState, now: float) -> Tuple[str, List[Tuple[str, str]]]:
         context = state.context
         if state.state == STATE_CLARIFICATION and isinstance(context, dict) \
@@ -726,8 +874,6 @@ class ConversationService:
                 if isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item):
                     history.append((item[0], item[1]))
             return mode, history[:MAX_CLARIFICATIONS]
-        if ConversationService._in_description(state, now):
-            return "onboarding", []
         return "chat", []
 
     def _hold_for_consent(self, work: _Work, parts: List[str], now: float) -> None:
@@ -739,13 +885,7 @@ class ConversationService:
             replaced, self._held = self._held, held
         if replaced is not None and replaced.message_id is not None:
             self._clear_buttons(replaced.chat_id, replaced.message_id)
-        markup = {
-            "inline_keyboard": [[
-                {"text": "Yes, continue", "callback_data": f"cs:{nonce}:yes"},
-                {"text": "No", "callback_data": f"cs:{nonce}:no"},
-            ]]
-        }
-        message_id = self._send(work.buffer.chat_id, [OutgoingMessage(CONSENT_NOTICE, markup)])
+        message_id = self._send(work.buffer.chat_id, [OutgoingMessage(CONSENT_NOTICE, _consent_markup(nonce))])
         with self._cond:
             current = self._held is held
             if current:
@@ -856,8 +996,8 @@ class ConversationService:
 
     def _reset_state(self, chat_id: int) -> None:
         with self._state_lock:
-            if self._in_description(self._wconv.get_state(chat_id), self._clock()):
-                return  # a failed onboarding request: the user can send the description again (no text is held)
+            if self._wconv.get_state(chat_id).state == STATE_INTERVIEW:
+                return  # never over an interview: only its own steps end it
             self._wconv.set_state(chat_id, self._rest_state(chat_id), None, self._clock())
 
     def _ask(
@@ -890,6 +1030,70 @@ class ConversationService:
             return
         self._send(chat_id, _reply(QUESTION_PREFIX + esc(clarification.question)))
 
+    # --- worker thread: the interview ----------------------------------------------------------------
+
+    def _begin(self, work: _Work) -> None:
+        """Start an interview: write the row (``created_at`` null), set the mirror, post the intro with its
+        buttons and the first question. Sends happen after the lock is released; a ``/cancel`` or ``/setup``
+        that lands meanwhile (a new generation) wins and the row is reset."""
+        buffer = work.buffer
+        chat_id = buffer.chat_id
+        nonce = secrets.token_hex(4)
+        state = new_state(nonce, buffer.mode if buffer.mode in ("onboarding", "update") else "update")
+        step = next_step(state) if buffer.ask_first else None
+        now = self._clock()
+        with self._state_lock:
+            if self._stale(work):
+                return
+            self._wconv.set_state(chat_id, STATE_INTERVIEW, state.to_json(), now)
+            if self._stale(work):  # dropped during the write: undo it unless something newer replaced it
+                current = self._wconv.get_state(chat_id)
+                if current.state == STATE_INTERVIEW and isinstance(current.context, dict) \
+                        and current.context.get("nonce") == nonce:
+                    self._wconv.set_state(chat_id, STATE_IDLE, None, now)
+                return
+        self._context_chats.add(chat_id)
+        if not self._set_mirror(work, nonce, step.slot if step is not None else None):
+            return
+        markup = {
+            "inline_keyboard": [
+                [{"text": DRAFT_BUTTON, "callback_data": f"iv:{nonce}:draft"}],
+                [{"text": GUIDED_BUTTON, "callback_data": f"iv:{nonce}:guided"}],
+                [{"text": CANCEL_BUTTON, "callback_data": f"iv:{nonce}:cancel"}],
+            ]
+        }
+        self._send(chat_id, [OutgoingMessage(INTERVIEW_INTRO, markup)])
+        if step is not None and step.kind != "draft":
+            self._send(chat_id, _reply(esc(step.text)))
+
+    def _set_mirror(self, work: _Work, nonce: str, slot: Optional[str]) -> bool:
+        """Record the current question in the mirror (before it is posted); False when the work is stale."""
+        with self._cond:
+            if work.generation != self._generation:
+                return False
+            self._interview[work.buffer.chat_id] = (nonce, slot)
+            return True
+
+    def _rebuild_mirror(self, work: _Work) -> Optional[InterviewState]:
+        """After a restart the mirror is empty while the row says ``awaiting_interview``: rebuild it from the row."""
+        chat_id = work.buffer.chat_id
+        state = self._wconv.get_state(chat_id)
+        interview = InterviewState.from_json(state.context) if state.state == STATE_INTERVIEW else None
+        if interview is None:
+            return None
+        with self._cond:
+            if work.generation == self._generation and chat_id not in self._interview:
+                self._interview[chat_id] = (interview.nonce, interview.current)
+        return interview
+
+    def _run_interview(self, work: _Work, request_id: str) -> None:
+        """PLACEHOLDER (Task 6b replaces it): answers, ``Draft now`` and ``Retry`` of an interview.
+
+        For now an interview input only rebuilds the mirror after a restart; it is never sent to the free-text
+        translator, and nothing is stored or replied."""
+        self._rebuild_mirror(work)
+        logger.debug("interview input %s not handled yet", request_id)
+
     def _proposal_extras(self, proposal: Proposal) -> Tuple[List[str], List[str]]:
         """Compile warnings and a rule backtest for the proposal (best effort: never blocks the proposal)."""
         try:
@@ -921,6 +1125,9 @@ class ConversationService:
             self._wconv.set_state(chat_id, STATE_CONFIRM, None, self._clock())
         if superseded is not None:
             self._clear_buttons(chat_id, superseded.message_id)
+        if work.buffer.interview:  # an interview draft: the interview ends with its proposal
+            with self._cond:
+                self._interview.pop(chat_id, None)
         if self._stale(work):  # /cancel landed after the row was stored: no proposal may follow "Cancelled"
             with self._state_lock:
                 self._wconv.take_pending(chat_id, change_id)

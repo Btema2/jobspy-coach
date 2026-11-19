@@ -23,7 +23,17 @@ def pending(change_id: str = "aaaa1111", *, chat_id: int = CHAT, created_at: flo
 
 
 def test_states_constant():
-    assert STATES == ("idle", "awaiting_description", "awaiting_clarification", "awaiting_confirm")
+    # ``awaiting_description`` stays readable (a leftover row from before the interview is treated as idle).
+    assert STATES == (
+        "idle", "awaiting_description", "awaiting_clarification", "awaiting_confirm", "awaiting_interview"
+    )
+
+
+def test_store_accepts_interview_state_with_null_created_at(store):
+    context = {"nonce": "abcd1234", "created_at": None, "mode": "update"}
+    store.set_state(CHAT, "awaiting_interview", context, 500.0)
+    state = store.get_state(CHAT)
+    assert (state.state, state.context, state.updated_at) == ("awaiting_interview", context, 500.0)
 
 
 def test_put_pending_returns_superseded(store):
@@ -92,7 +102,7 @@ def test_state_roundtrip_and_unknown_state_rejected(store):
 
     with pytest.raises(ValueError):
         store.set_state(CHAT, "typing", None, now=1.0)
-    assert store.get_state(CHAT).state == "awaiting_confirm"  # the rejected write changed nothing
+    assert store.get_state(CHAT).state == STATES[-1]  # the rejected write changed nothing
 
 
 def test_consent_versioned(store):

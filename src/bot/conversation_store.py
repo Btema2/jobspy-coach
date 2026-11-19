@@ -2,8 +2,8 @@
 ``llm_consent`` (all keyed by chat id, one row each).
 
 Retention: ``pending_change`` holds the validated operation list only (never raw pasted text);
-``conversation.context`` may hold raw earlier messages while a clarifying question is open and is purged
-on apply, cancel, supersede and expiry (expiry is enforced by the running daemon's sweep; rows left behind
+``conversation.context`` may hold raw earlier messages while a clarifying question is open, or the masked
+interview facts while an interview runs, and is purged on apply, cancel, supersede and expiry (expiry is enforced by the running daemon's sweep; rows left behind
 while it is stopped go on its next start). Every connection sets ``PRAGMA secure_delete = ON`` before it
 writes, so deleted text is overwritten in the database file; in WAL mode the old page images also sit in
 the ``-wal`` file until the WAL is reused, so every removal (including dropping a context) is followed by a
@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # ``DELETE ... RETURNING`` needs SQLite 3.35; older libraries use SELECT + DELETE in one immediate transaction.
 _HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
 
-STATES = ("idle", "awaiting_description", "awaiting_clarification", "awaiting_confirm")
+# ``awaiting_description`` is retired (the interview replaced it); a leftover row is read and treated as idle.
+STATES = ("idle", "awaiting_description", "awaiting_clarification", "awaiting_confirm", "awaiting_interview")
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ class PendingChange:
     chat_id: int
     change_id: str
     base_version: int
-    mode: str  # "chat" or "onboarding"
+    mode: str  # "chat", "onboarding" or "update"
     operations: str  # JSON of the validated operation list
     message_id: Optional[int]  # the proposal's last message (the one carrying the buttons)
     created_at: float
