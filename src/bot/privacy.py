@@ -15,8 +15,9 @@ CONSENT_NOTICE = (
     "which are not masked) so that I can propose changes to it. Their logging and training policies may differ, and I "
     "cannot control what they keep. Please leave out names, addresses and phone numbers. Obvious e-mail addresses "
     "and phone numbers are masked here before sending when I recognise them, but that is best effort. "
-    "If you send a CV, the text is read on this machine, e-mail addresses, phone numbers, links and handles are "
-    "masked and the contact header is dropped before anything is sent; the CV text itself is never stored. "
+    "If you send a CV, the text is read on this machine; e-mail addresses, phone numbers, web addresses starting "
+    "with http or www, links with a path, links to well-known profile sites and @handles are masked and the "
+    "contact header is dropped before anything is sent; the CV text itself is never stored. "
     "The facts I note from your answers and your CV are masked and stored locally in the bot's database for up to "
     "24 hours. Names and addresses cannot be recognised reliably, so please leave them out. "
     "Choose below to continue; the commands (/help) work without any language model."
@@ -28,6 +29,7 @@ _EMAIL_RE = re.compile(
 )
 # Candidate: groups of digits (optionally in parentheses) joined by one space, dot, dash or slash, not part of
 # a longer alphanumeric token; ``_is_phone`` applies the digit-count and look-alike rules. Bounded repetitions.
+_SCHEME_TAIL_RE = re.compile(r"(?:https?|ftp)$", re.IGNORECASE)
 _PHONE_RE = re.compile(
     r"(?<![A-Za-z0-9_])\+?\(?\d{1,15}\)?(?:[ .\-/]\(?\d{1,15}\)?){0,15}(?![A-Za-z0-9_])"
 )
@@ -70,6 +72,12 @@ def mask_personal_data(text: str) -> Tuple[str, int]:
     def email(match: "re.Match[str]") -> str:
         nonlocal count
         count += 1
+        found = match.group(0)
+        if match.string[match.end() : match.end() + 3] == "://":
+            # the TLD class swallowed the scheme of a link that follows directly: give it back
+            scheme = _SCHEME_TAIL_RE.search(found)
+            if scheme and re.search(r"\.[A-Za-z]{2,24}$", found[: scheme.start()]):
+                return "[email]" + scheme.group(0)
         return "[email]"
 
     def phone(match: "re.Match[str]") -> str:
@@ -86,17 +94,25 @@ def mask_personal_data(text: str) -> Tuple[str, int]:
 
 # --- links and handles ---------------------------------------------------------------------------------
 # Every repetition is bounded or a single character class, so hostile input stays linear.
-_URL_RE = re.compile(r"(?<![\w@])(?:https?://|ftp://|www\.)[^\s<>\"']*[^\s<>\"'.,;:!?)\]}]|(?<![\w@])(?:https?://|ftp://|www\.)")
+_URL_RE = re.compile(
+    r"(?<![\w@])(?:https?://|ftp://|www\.)[^\s<>\"']*[^\s<>\"'.,;:!?)\]}]|(?<![\w@])(?:https?://|ftp://|www\.)",
+    re.IGNORECASE,
+)
 _SOCIAL_HOSTS = (
     "linkedin.com", "github.com", "gitlab.com", "twitter.com", "x.com", "facebook.com", "instagram.com",
     "t.me", "telegram.me", "medium.com", "behance.net", "dribbble.com", "xing.com", "youtube.com", "youtu.be",
-    "stackoverflow.com", "bit.ly", "tiktok.com", "threads.net",
+    "stackoverflow.com", "bit.ly", "tiktok.com", "threads.net", "goo.gl", "tinyurl.com", "lnkd.in", "ow.ly",
 )
 _SOCIAL_RE = re.compile(
     r"(?<![\w@./-])(?:[A-Za-z0-9-]{1,30}\.){0,2}(?:"
     + "|".join(re.escape(h) for h in _SOCIAL_HOSTS)
     + r")(?![\w-])(?:/[^\s<>\"']*[^\s<>\"'.,;:!?)\]}])?",
     re.IGNORECASE,
+)
+# A dotted host with a letters-only TLD followed by a path (``janedoe.io/work``). A bare ``name.tld`` stays
+# readable on purpose (``Vue.js``, ``ASP.NET``, ``node.js`` are not links).
+_PATH_LINK_RE = re.compile(
+    r"(?<![\w@./-])(?:[A-Za-z0-9-]{1,63}\.){1,5}[A-Za-z]{2,24}/[^\s<>\"']*[^\s<>\"'.,;:!?)\]}]"
 )
 _HANDLE_RE = re.compile(r"(?<![\w@.])@\w{2,30}(?:\.\w{1,30}){0,3}")
 
@@ -105,6 +121,7 @@ def mask_links(text: str) -> str:
     """``text`` with URLs and social-media paths as ``[link]`` and ``@handles`` as ``[handle]``."""
     text = _URL_RE.sub("[link]", text)
     text = _SOCIAL_RE.sub("[link]", text)
+    text = _PATH_LINK_RE.sub("[link]", text)
     return _HANDLE_RE.sub("[handle]", text)
 
 

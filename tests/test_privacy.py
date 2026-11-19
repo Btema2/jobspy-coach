@@ -213,7 +213,7 @@ def test_mask_links_is_linear():
     hostile = [
         "www." * 25000, "http://" * 14000, "@" * 100000, "@a" * 50000, "a." * 50000, "https://" + "." * 99990,
         "linkedin.com/" * 7000, "a.b." * 25000 + "@", "x@" * 50000, "(" * 100000, "https://a/" + "(" * 99000,
-        "github.com" * 10000, "-" * 100000,
+        "github.com" * 10000, "-" * 100000, "a.b/" * 25000, "a." * 50000 + "b/", "a.a." * 25000, "a-" * 50000, "x.yz/" + "(" * 99000,
     ]
     for text in hostile:
         started = time.monotonic()
@@ -277,3 +277,29 @@ def test_line_one_is_never_a_heading():
 
 def test_strip_contact_header_keeps_non_latin_body():
     assert strip_contact_header("Імʼя\nКонтакти\nДосвід\nПрацював у Києві") == "Досвід\nПрацював у Києві"
+
+
+def test_mask_links_is_case_insensitive():
+    assert mask_links("HTTP://EXAMPLE.COM and WWW.Site.COM/path and HTTPS://X.Y/Z") == "[link] and [link] and [link]"
+
+
+def test_mask_links_path_links_without_scheme():
+    for link in ("janedoe.io/work", "jane.doe.dev/portfolio", "goo.gl/abc", "tinyurl.com/abc", "lnkd.in/x1", "ow.ly/q", "bit.ly/z"):
+        assert mask_links(f"see {link} now") == "see [link] now"
+        assert mask_links(f"see {link}.") == "see [link]."
+
+
+def test_mask_links_keeps_bare_names_and_numbers():
+    for text in ("Vue.js", "ASP.NET", "node.js", "I use Vue.js and ASP.NET and node.js daily", "v1.2/3", "9.5/10", "1.2.3/4", "and/or", "CI/CD"):
+        assert mask_links(text) == text
+
+
+def test_mask_all_email_does_not_swallow_a_following_scheme():
+    assert mask_all("jane@example.comhttps://x.y/z") == "[email][link]"
+    assert mask_all("jane@example.com https://x.y/z") == "[email] [link]"
+    assert mask_all("jane@example.com") == "[email]"
+    assert mask_all("jane@example.org/path") == "[email]/path"
+
+
+def test_notice_does_not_overpromise_links():
+    assert "http or www" in CONSENT_NOTICE and "with a path" in CONSENT_NOTICE and "profile sites" in CONSENT_NOTICE
