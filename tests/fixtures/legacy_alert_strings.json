@@ -51,6 +51,19 @@
      ]
     ]
    }
+  },
+  {
+   "text": "🚨 <b>WOW JOB ALERT | Топ-Вакансія Коучингу</b>\n⭐️ <b>Оцінка: 7.6 / 10</b>\n\n💼 <b>Посада:</b> &lt;ROLE&gt; 4 &amp; Partner\n🏢 <b>Компанія:</b> Company 4 &lt;PL&gt;\n📍 <b>Локація:</b> &lt;MARKET&gt;\n💰 <b>Вилка:</b> від 1200 PLN\n🌐 <b>Мови:</b> English, Polish\n\n💡 <b>Про вакансію:</b>\nОпис ролі та ключові обов&#x27;язки. Опис ролі та ключові обов&#x27;язки. Опис ролі та ключові обов&#x27;язки. \n\n🎯 <b>Чому це WOW:</b>\nReasoning &amp; detail",
+   "markup": {
+    "inline_keyboard": [
+     [
+      {
+       "text": "🚀 Apply / View Job",
+       "url": "https://example.com/job/4?a=1&b=2"
+      }
+     ]
+    ]
+   }
   }
  ],
  "update_notice": "\n\nℹ️ <i>Доступне оновлення python-jobspy: v1.5.0 (встановлено: v1.4.0).\nЩоб оновити: <code>pip install -U python-jobspy</code></i>",

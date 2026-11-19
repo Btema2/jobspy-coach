@@ -14,7 +14,8 @@ from src.bot.client import (
 )
 from tests.fake_telegram import FakeTelegram
 
-TOKEN = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef12345"
+# Token-shaped (so the redaction is really exercised) but assembled at runtime: no token literal in the source.
+TOKEN = "".join(["123456", ":", "FAKE-" * 8])
 
 
 def _client(fake: FakeTelegram) -> TelegramBotClient:

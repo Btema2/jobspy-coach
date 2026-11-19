@@ -556,12 +556,13 @@ def _legacy_jobs(count: int):
 def legacy_alert_strings(**kwargs):
     """Every alert/digest/update string for fixed inputs; ``kwargs`` (e.g. lang=) go to each formatter."""
     notice = format_version_update_notice(VersionCheckResult(True, "1.4.0", "1.5.0"), **kwargs)
-    jobs_wow = _legacy_jobs(4)
+    jobs_wow = _legacy_jobs(5)
     jobs_wow[0].salary_min, jobs_wow[0].salary_max = None, None
     jobs_wow[1].salary_min, jobs_wow[1].salary_max = None, 3000.0
     jobs_wow[2].salary_min, jobs_wow[2].salary_max = 1500.0, 2500.5
     jobs_wow[3].eval_summary_uk, jobs_wow[3].eval_reasoning, jobs_wow[3].eval_languages = None, None, []
     jobs_wow[3].eval_score = None
+    jobs_wow[4].salary_min, jobs_wow[4].salary_max = 1200.0, None  # the 'від {min}' variant
     wow = []
     for j in jobs_wow:
         text, markup = format_wow_alert(j, **kwargs)
