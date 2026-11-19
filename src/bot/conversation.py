@@ -94,6 +94,7 @@ LIMITED_REPLY = "Hourly limit of {limit} LLM calls reached; try again in {minute
 ERROR_REPLY = "Something went wrong; nothing was changed."
 WORKING_REPLY = "Working on it..."
 PROGRESS_REPLY = "Still working; the model can take up to 2 minutes."
+DELIVERY_FAILED_REPLY = "Could not deliver the proposal; send your request again."
 NO_CHANGE_REPLY = "That does not look like a profile change. Send /help for the commands."
 QUESTION_PREFIX = "Question: "
 NO_LONGER_ACTIVE_REPLY = "This proposal is no longer active."
@@ -866,8 +867,13 @@ class ConversationService:
             return
         if superseded is not None:
             self._send(chat_id, _reply(SUPERSEDED_REPLY))
-        last_id = self._send(chat_id, messages)
-        if last_id is None:
+        last_id, complete = self._send_checked(chat_id, messages)
+        if not complete:  # the user may not have seen all of it: a later bare "ok" must not apply it
+            with self._state_lock:
+                self._wconv.take_pending(chat_id, change_id)
+            self._reset_state(chat_id)
+            self._clear_buttons(chat_id, last_id)
+            self._send(chat_id, _reply(DELIVERY_FAILED_REPLY))
             return
         self._wconv.set_pending_message(chat_id, change_id, last_id)
         current = self._wconv.get_pending(chat_id)
@@ -878,14 +884,22 @@ class ConversationService:
 
     def _send(self, chat_id: int, messages: Sequence[OutgoingMessage]) -> Optional[int]:
         """Send messages in chunks (buttons on the last chunk only); the id of the last message sent."""
+        return self._send_checked(chat_id, messages)[0]
+
+    def _send_checked(self, chat_id: int, messages: Sequence[OutgoingMessage]) -> Tuple[Optional[int], bool]:
+        """Like ``_send``, and whether every chunk was delivered."""
         last_id: Optional[int] = None
+        complete = True
         for message in messages:
             pieces = chunk_html(message.text)
             for index, piece in enumerate(pieces):
                 markup = message.reply_markup if index == len(pieces) - 1 else None
                 sent_id = self._client.send_message(chat_id, piece, markup)
-                last_id = sent_id if sent_id is not None else last_id
-        return last_id
+                if sent_id is None:
+                    complete = False
+                else:
+                    last_id = sent_id
+        return last_id, complete
 
     def _clear_buttons(self, chat_id: int, message_id: Optional[int]) -> None:
         if message_id is None:

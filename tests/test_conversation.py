@@ -1016,3 +1016,36 @@ def test_reset_memory_drops_buffers_held_text_and_running_result(svc, clock, tra
     translator.gate.set()
     worker.join(5)
     assert not any("Proposed change" in t for t in sent(telegram))
+
+
+def _ok_reply(message_id: int) -> dict:
+    return {"ok": True, "result": {"message_id": message_id}}
+
+
+def test_undelivered_proposal_is_not_kept_for_a_bare_ok(svc, clock, translator, telegram, conv_store, store):
+    telegram.respond("sendMessage", 200, _ok_reply(901))  # "Working on it..."
+    telegram.respond("sendMessage", 500, {"ok": False, "error_code": 500, "description": "boom"})  # the proposal
+    translator.add(prop(add_role("<ROLE2>")))
+    before = version(store)
+    run_request(svc, clock, "request")
+    assert conv_store.get_pending(111) is None
+    assert conv.DELIVERY_FAILED_REPLY in sent(telegram) and sent(telegram).count(conv.DELIVERY_FAILED_REPLY) == 1
+    assert conv_store.get_state(111).state == "idle"
+    assert texts(say(svc, "ok")) == conv.NO_PENDING_REPLY
+    assert texts(svc.on_ok(text_update("/ok"))) == conv.NO_PENDING_REPLY
+    assert version(store) == before
+
+
+def test_proposal_with_a_lost_middle_chunk_is_discarded(svc, clock, translator, telegram, conv_store, store):
+    persona = "\n".join(f"line {i} " + "x" * 60 for i in range(110))
+    telegram.respond("sendMessage", 200, _ok_reply(901))  # "Working on it..."
+    telegram.respond("sendMessage", 200, _ok_reply(902))  # first chunk
+    telegram.respond("sendMessage", 500, {"ok": False, "error_code": 500, "description": "boom"})  # second chunk lost
+    translator.add(prop({"op": "set_text", "field": "persona", "value": persona}))
+    before = version(store)
+    run_request(svc, clock, "request")
+    assert conv_store.get_pending(111) is None
+    assert conv.DELIVERY_FAILED_REPLY in sent(telegram)
+    assert telegram.calls("editMessageReplyMarkup")  # the buttons of the last chunk were removed
+    assert texts(say(svc, "yes")) == conv.NO_PENDING_REPLY
+    assert version(store) == before
