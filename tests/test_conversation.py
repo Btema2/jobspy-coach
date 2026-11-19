@@ -15,10 +15,13 @@ import pytest
 
 import src.bot.conversation as conv
 from src.bot.chat_llm import (
+    ChatFailure,
+    ChatLLMError,
     ChatLLMLimited,
     ChatLLMNotConfigured,
     ChatLLMNotUnderstood,
     ChatLLMUnavailable,
+    describe_failure,
 )
 from src.bot.client import TelegramBotClient
 from src.bot.commands import TRIGGER_STARTED, BotContext
@@ -709,23 +712,214 @@ def test_cancel_during_call_discards_result(svc, clock, translator, telegram, co
     "error, expected",
     [
         (ChatLLMNotConfigured("x"), "Free-text requests need an LLM key (NVIDIA_API_KEY or OPENROUTER_API_KEY in .env); the commands keep working: /help"),
-        (ChatLLMUnavailable("x"), "The language model is unavailable right now; try again later or use a command (/help)."),
-        (ChatLLMNotUnderstood("x"), "Couldn't understand that, try a command (/help)."),
-        (ChatLLMLimited(125.0), "Hourly limit of 60 LLM calls reached; try again in 3 min, or use the commands (/help)."),
-        (ChatLLMLimited(1.0), "Hourly limit of 60 LLM calls reached; try again in 1 min, or use the commands (/help)."),
         (ValueError(MARKER), conv.ERROR_REPLY),
         (TypeError(MARKER), conv.ERROR_REPLY),
     ],
 )
-def test_llm_unavailable_and_not_configured_replies(svc, clock, translator, telegram, caplog, error, expected):
+def test_not_configured_and_unexpected_error_replies(svc, clock, translator, telegram, caplog, error, expected):
     caplog.set_level(logging.DEBUG)
     translator.add(error)
     run_request(svc, clock, "request")
     assert sent(telegram)[-1] == expected
+    assert not telegram.calls("sendMessage")[-1].get("reply_markup")  # not configured: nothing to retry
     assert MARKER not in caplog.text  # only the exception type name is logged
     translator.add(NoChange())
     run_request(svc, clock, "again")  # the worker survived
     assert sent(telegram)[-1] == conv.NO_CHANGE_REPLY
+
+
+def failure_error(failure: ChatFailure, retry_in=None) -> ChatLLMError:
+    if failure is ChatFailure.CAPPED:
+        return ChatLLMLimited(retry_in if retry_in is not None else 60.0)
+    if failure in (ChatFailure.BAD_ANSWER, ChatFailure.TIMEOUT):
+        return ChatLLMNotUnderstood("x", failure=failure, retry_in=retry_in)
+    return ChatLLMUnavailable("x", failure=failure, retry_in=retry_in)
+
+
+def retry_button(telegram: FakeTelegram) -> str:
+    data = button_data(last_markup(telegram))
+    assert len(data) == 1 and data[0].startswith("rt:") and data[0].endswith(":go") and len(data[0].encode()) <= 64
+    return data[0]
+
+
+@pytest.mark.parametrize("failure", list(ChatFailure))
+@pytest.mark.parametrize("retry_in", [None, 125.0])
+def test_each_failure_class_gets_its_reason_text_and_a_retry_button(svc, clock, translator, telegram, conv_store, failure, retry_in):
+    translator.add(Clarification("Q?"), failure_error(failure, retry_in))
+    run_request(svc, clock, "a")
+    run_request(svc, clock, "b")
+    expected_in = 60.0 if failure is ChatFailure.CAPPED and retry_in is None else retry_in  # ChatLLMLimited needs one
+    assert sent(telegram)[-1] == describe_failure(failure, expected_in)
+    retry_button(telegram)
+    state = conv_store.get_state(111)  # the clarification stays open: nothing was purged
+    assert state.state == "awaiting_clarification" and state.context["rounds"] == [["a", "Q?"]]
+
+
+def test_daily_share_reply_says_today(svc, clock, translator, telegram):
+    translator.add(ChatLLMLimited(3 * 3600.0, daily=True))
+    run_request(svc, clock, "request")
+    assert sent(telegram)[-1] == "Too many model requests today; try again in 3 h."
+    assert "hour" not in sent(telegram)[-1]
+    retry_button(telegram)
+
+
+def test_hourly_cap_reply_keeps_the_fixed_head(svc, clock, translator, telegram):
+    translator.add(ChatLLMLimited(125.0))
+    run_request(svc, clock, "request")
+    assert sent(telegram)[-1] == "Too many model requests this hour; try again in 3 min."
+
+
+def test_translation_problem_has_no_retry_and_purges(svc, clock, translator, telegram, conv_store):
+    translator.add(Clarification("Q?"), TranslationProblem(["Unknown country"]))
+    run_request(svc, clock, "a")
+    run_request(svc, clock, "b")
+    assert not telegram.calls("sendMessage")[-1].get("reply_markup")
+    assert conv_store.get_state(111).state == "idle" and conv_store.get_state(111).context is None
+    assert svc._retry is None
+
+
+def test_progress_note_text():
+    assert conv.PROGRESS_REPLY == "Still working; this can take a few minutes."
+
+
+def test_retry_button_reruns_the_same_masked_parts_without_resending(svc, clock, translator, telegram, conv_store):
+    translator.add(Clarification("Q?"), ChatLLMUnavailable("x"))
+    run_request(svc, clock, "first")
+    say(svc, "write me at first.last@example.org")
+    clock.value += 1
+    say(svc, "second part")
+    clock.value += conv.DEBOUNCE_SECONDS
+    assert svc.process_next(clock.value) is True
+    data = retry_button(telegram)
+    assert translator.calls[1]["parts"] == ["write me at [email]", "second part"]
+    translator.add(prop(add_role("<ROLE2>")))
+    assert svc.on_callback(callback(data, message_id=77)) == []
+    assert {"chat_id": 111, "message_id": 77} in telegram.calls("editMessageReplyMarkup")
+    assert svc.process_next(clock.value) is True  # immediate: no debounce wait, nothing re-sent
+    assert translator.calls[2]["parts"] == translator.calls[1]["parts"]
+    assert translator.calls[2]["history"] == [("first", "Q?")]  # the clarification context was kept
+    assert [d for d in button_data(last_markup(telegram)) if d.endswith(":a")]
+    assert conv_store.get_state(111).state == "awaiting_confirm"
+    assert svc._retry is None
+
+
+def test_retry_that_fails_again_offers_a_new_button(svc, clock, translator, telegram):
+    translator.add(ChatLLMUnavailable("x"), ChatLLMNotUnderstood("x", failure=ChatFailure.TIMEOUT))
+    run_request(svc, clock, "request")
+    first = retry_button(telegram)
+    svc.on_callback(callback(first))
+    assert svc.process_next(clock.value) is True
+    assert sent(telegram)[-1] == describe_failure(ChatFailure.TIMEOUT)
+    second = retry_button(telegram)
+    assert second != first
+    assert texts(svc.on_callback(callback(first))) == conv.CONSENT_STALE_REPLY
+
+
+def test_stale_replaced_double_and_foreign_retry_buttons(svc, clock, translator, telegram):
+    for bad in ("rt:deadbeef:go", "rt:deadbeef", "rt:deadbeef:stop", "rt::go"):
+        assert texts(svc.on_callback(callback(bad))) == conv.CONSENT_STALE_REPLY
+    translator.add(ChatLLMUnavailable("x"), ChatLLMUnavailable("x"))
+    run_request(svc, clock, "one")
+    first = retry_button(telegram)
+    first_id = 100 + len(telegram.calls("sendMessage"))
+    run_request(svc, clock, "two")
+    second = retry_button(telegram)
+    assert {"chat_id": 111, "message_id": first_id} in telegram.calls("editMessageReplyMarkup")  # old buttons go away
+    assert texts(svc.on_callback(callback(first))) == conv.CONSENT_STALE_REPLY  # replaced
+    assert svc.process_next(clock.value) is False
+    translator.add(NoChange())
+    assert svc.on_callback(callback(second)) == []
+    assert texts(svc.on_callback(callback(second))) == conv.CONSENT_STALE_REPLY  # a double tap runs once
+    assert svc.process_next(clock.value) is True
+    assert svc.process_next(clock.value) is False
+    assert [c["parts"] for c in translator.calls] == [["one"], ["two"], ["two"]]
+
+
+def test_retry_from_another_chat_is_stale(svc, clock, translator, telegram):
+    translator.add(ChatLLMUnavailable("x"))
+    run_request(svc, clock, "request")
+    data = retry_button(telegram)
+    foreign = parse_update(callback_update(next(_ids), data, message_id=5, chat_id=222, user_id=222))
+    assert texts(svc.on_callback(foreign)) == conv.CONSENT_STALE_REPLY
+    assert svc._retry is not None
+
+
+def test_cancel_drops_the_retry_holder_and_its_button(svc, clock, translator, telegram):
+    translator.add(ChatLLMUnavailable("x"))
+    run_request(svc, clock, "request")
+    data = retry_button(telegram)
+    message_id = 100 + len(telegram.calls("sendMessage"))
+    assert texts(svc.on_cancel(text_update("/cancel"))) == conv.CANCELLED_REPLY  # something was in memory
+    assert {"chat_id": 111, "message_id": message_id} in telegram.calls("editMessageReplyMarkup")
+    assert svc._retry is None
+    assert texts(svc.on_callback(callback(data))) == conv.CONSENT_STALE_REPLY
+
+
+def test_pairing_change_drops_the_retry_holder(svc, clock, translator, telegram):
+    translator.add(ChatLLMUnavailable("x"))
+    run_request(svc, clock, "request")
+    data = retry_button(telegram)
+    svc.reset_memory()
+    assert svc._retry is None
+    assert texts(svc.on_callback(callback(data))) == conv.CONSENT_STALE_REPLY
+
+
+def test_retry_holder_expires_after_24_hours(svc, clock, translator, telegram):
+    translator.add(ChatLLMUnavailable("x"))
+    run_request(svc, clock, "request")
+    data = retry_button(telegram)
+    svc.sweep(clock.value + 86399)
+    assert svc._retry is not None
+    svc.sweep(clock.value + 86401)
+    assert svc._retry is None
+    assert texts(svc.on_callback(callback(data))) == conv.CONSENT_STALE_REPLY
+
+
+def test_expired_retry_button_is_stale_even_before_the_sweep(svc, clock, translator, telegram):
+    translator.add(ChatLLMUnavailable("x"))
+    run_request(svc, clock, "request")
+    data = retry_button(telegram)
+    clock.value += 86401
+    assert texts(svc.on_callback(callback(data))) == conv.CONSENT_STALE_REPLY
+
+
+def test_retry_button_after_a_restart_is_stale(svc, clock, translator, telegram, tmp_path, db, store, control):
+    translator.add(ChatLLMUnavailable("x"))
+    run_request(svc, clock, "request")
+    data = retry_button(telegram)
+    ctx = BotContext(
+        db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
+        trigger_cycle=control.trigger, is_cycle_running=control.is_running, scraper=None, clock=clock,
+    )
+    client = TelegramBotClient(TOKEN, transport=telegram.transport)
+    fresh = ConversationService(ctx, client, SetupWizard(BotStateStore(db), store, clock=clock), translator=translator, clock=clock)
+    assert texts(fresh.on_callback(callback(data))) == conv.CONSENT_STALE_REPLY
+
+
+def test_cancel_during_the_failing_call_leaves_no_retry_button(svc, clock, translator, telegram):
+    translator.gate = threading.Event()
+    translator.add(ChatLLMUnavailable("x"))
+    say(svc, "request")
+    clock.value += conv.DEBOUNCE_SECONDS
+    worker = threading.Thread(target=svc.process_next, args=(clock.value,))
+    worker.start()
+    assert translator.entered.wait(5)
+    svc.on_cancel(text_update("/cancel"))
+    translator.gate.set()
+    worker.join(5)
+    assert svc._retry is None
+    assert describe_failure(ChatFailure.UNAVAILABLE) not in sent(telegram)
+
+
+def test_no_prompt_text_in_logs_on_failure_and_retry(svc, clock, translator, telegram, caplog):
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.WARNING, logger="httpx")
+    caplog.set_level(logging.WARNING, logger="httpcore")
+    translator.add(ChatLLMUnavailable(MARKER), ChatLLMNotUnderstood(MARKER))
+    run_request(svc, clock, f"{MARKER} request first.last@example.org")
+    svc.on_callback(callback(retry_button(telegram)))
+    svc.process_next(clock.value)
+    assert "<MARKER" not in caplog.text and "example.org" not in caplog.text
 
 
 def test_llm_error_keeps_clarification_context_unavailable_only(svc, clock, translator, conv_store):

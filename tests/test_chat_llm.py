@@ -181,6 +181,7 @@ def test_hourly_cap_is_60():
         run(chat)
     assert exc_info.value.retry_in > 0
     assert exc_info.value.retry_in == pytest.approx(3590.0)
+    assert exc_info.value.daily is False
     assert len(nim.requests) == 60
     clock.now += 3600.0
     assert run(chat).value == 1
@@ -391,6 +392,7 @@ def test_openrouter_daily_share_stops_at_15():
         run(chat)
     assert exc_info.value.failure is ChatFailure.CAPPED
     assert exc_info.value.retry_in > 0
+    assert exc_info.value.daily is True  # the share is per UTC day, the hourly cap is not
     assert len(openrouter.requests) == 15
     clock.advance(86400.0)  # a new UTC day
     assert run(chat).provider == "openrouter"
@@ -487,3 +489,13 @@ def test_logs_contain_only_class_and_status(caplog):
     assert "503" in text and ChatFailure.UNAVAILABLE.value in text and ChatFailure.BAD_ANSWER.value in text
     for forbidden in ("<MARKER-IN>", "<MARKER-ERR>", "https://", "http://", "<NIM-KEY>", "<OR-KEY>", "nim.test", "upstream"):
         assert forbidden not in text
+
+
+def test_describe_failure_daily_wording_and_long_waits():
+    assert describe_failure(ChatFailure.CAPPED, 125.0) == "Too many model requests this hour; try again in 3 min."
+    assert describe_failure(ChatFailure.CAPPED, 125.0, daily=True) == "Too many model requests today; try again in 3 min."
+    assert describe_failure(ChatFailure.CAPPED, None, daily=True) == "Too many model requests today; try again in a minute."
+    assert describe_failure(ChatFailure.CAPPED, 3 * 3600.0, daily=True) == "Too many model requests today; try again in 3 h."
+    assert describe_failure(ChatFailure.CAPPED, 2.5 * 3600.0, daily=True) == "Too many model requests today; try again in 3 h."
+    assert describe_failure(ChatFailure.TIMEOUT, 3 * 3600.0, daily=True) == "The model timed out; try again in 3 h."  # daily only changes the capped head
+    assert ChatLLMLimited(30.0).daily is False and ChatLLMLimited(30.0, daily=True).daily is True

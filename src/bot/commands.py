@@ -219,6 +219,7 @@ class CommandRouter:
         self.register_callback("pc:", self.conversation.on_callback)
         self.register_callback("cs:", self.conversation.on_callback)
         self.register_callback("ob:", self.conversation.on_callback)
+        self.register_callback("rt:", self.conversation.on_callback)
         self.set_text_handler(self.conversation.on_text)
         self.register("stats", lambda update: stats_command(self._db, self._store, self._ctx.settings, update.args))
         self.register("test", ProbeRunner(self._ctx, self.client, clock=self._ctx.clock).request)

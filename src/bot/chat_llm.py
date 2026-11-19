@@ -18,7 +18,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Deque, Dict, Optional, Sequence, Tuple, TypeVar
 
 import pydantic
 
@@ -27,7 +27,6 @@ from src.evaluator.errors import (
     EvaluatorError,
     InvalidResponse,
     ProviderTimeout,
-    QuotaExhausted,
     RateLimited,
     RateLimitWaitExceeded,
     ServerError,
@@ -88,13 +87,22 @@ _FAILURE_HEADS = {
 }
 
 
-def describe_failure(failure: ChatFailure, retry_in: Optional[float] = None) -> str:
-    """Code-written reason text with a retry hint; callers add their own next-step sentence."""
-    if retry_in is not None:
-        hint = f"try again in {max(1, math.ceil(retry_in / 60))} min"
-    else:
+_DAILY_CAPPED_HEAD = "Too many model requests today"
+
+
+def describe_failure(failure: ChatFailure, retry_in: Optional[float] = None, daily: bool = False) -> str:
+    """Code-written reason text with a retry hint; callers add their own next-step sentence.
+
+    ``daily`` (only meaningful for ``CAPPED``) names the OpenRouter daily share instead of the hourly cap;
+    waits of more than two hours are given in hours (the daily share frees up at UTC midnight).
+    """
+    head = _DAILY_CAPPED_HEAD if daily and failure is ChatFailure.CAPPED else _FAILURE_HEADS[failure]
+    if retry_in is None:
         hint = "try again in a minute"
-    return f"{_FAILURE_HEADS[failure]}; {hint}."
+    else:
+        minutes = max(1, math.ceil(retry_in / 60))
+        hint = f"try again in {math.ceil(retry_in / 3600)} h" if minutes > 120 else f"try again in {minutes} min"
+    return f"{head}; {hint}."
 
 
 class ChatLLMError(Exception):
@@ -128,8 +136,9 @@ class ChatLLMLimited(ChatLLMError):
 
     failure = ChatFailure.CAPPED
 
-    def __init__(self, retry_in: float):
+    def __init__(self, retry_in: float, daily: bool = False):
         super().__init__("chat llm limit reached", retry_in=retry_in)
+        self.daily = daily  # True: the OpenRouter share of the UTC day, not the hourly cap
 
 
 def _classify(exc: EvaluatorError) -> ChatFailure:
@@ -142,9 +151,9 @@ def _classify(exc: EvaluatorError) -> ChatFailure:
     return ChatFailure.UNAVAILABLE  # quota, auth, ServerError, BadRequest, ModelNotFound, transport, ...
 
 
-def _error_for(failure: ChatFailure, retry_in: Optional[float]) -> ChatLLMError:
+def _error_for(failure: ChatFailure, retry_in: Optional[float], daily: bool = False) -> ChatLLMError:
     if failure is ChatFailure.CAPPED:
-        return ChatLLMLimited(retry_in if retry_in is not None else 60.0)
+        return ChatLLMLimited(retry_in if retry_in is not None else 60.0, daily=daily)
     if failure in (ChatFailure.BAD_ANSWER, ChatFailure.TIMEOUT):
         return ChatLLMNotUnderstood(f"no provider gave an answer that could be used ({failure.value})", failure=failure, retry_in=retry_in)
     return ChatLLMUnavailable(f"no provider is available ({failure.value})", failure=failure, retry_in=retry_in)
@@ -256,14 +265,16 @@ class ChatLLM:
         chars_in = sum(len(m.get("content", "")) for m in messages)
         worst: Optional[ChatFailure] = None
         retry_in: Optional[float] = None
+        worst_daily = False
         capped = False
 
-        def note(failure: ChatFailure, hint: Optional[float] = None) -> None:
-            nonlocal worst, retry_in
+        def note(failure: ChatFailure, hint: Optional[float] = None, daily: bool = False) -> None:
+            nonlocal worst, retry_in, worst_daily
             if worst is None or _PRECEDENCE[failure] > _PRECEDENCE[worst]:
-                worst, retry_in = failure, hint
+                worst, retry_in, worst_daily = failure, hint, daily
             elif failure is worst and hint is not None:
-                retry_in = hint if retry_in is None else max(retry_in, hint)
+                if retry_in is None or hint > retry_in:
+                    retry_in, worst_daily = hint, daily
 
         for provider in providers:
             if capped:
@@ -288,7 +299,7 @@ class ChatLLM:
                     share_in = self._share_spent()
                     if share_in is not None:
                         logger.warning("chat llm %s via %s skipped: %s", request_id, provider.name, ChatFailure.CAPPED.value)
-                        note(ChatFailure.CAPPED, share_in)
+                        note(ChatFailure.CAPPED, share_in, daily=True)
                         break
                 slot_in = self._cap.try_take()
                 if slot_in is not None:
@@ -331,7 +342,7 @@ class ChatLLM:
                     break
                 try:
                     value = validate(completion.data)
-                except (ValueError, pydantic.ValidationError) as exc:
+                except (ValueError, pydantic.ValidationError):
                     logger.warning("chat llm %s via %s rejected the answer: %s", request_id, provider.name, ChatFailure.BAD_ANSWER.value)
                     note(ChatFailure.BAD_ANSWER)
                     break
@@ -344,7 +355,7 @@ class ChatLLM:
                     self._clock() - started,
                 )
                 return ChatAnswer(value=value, provider=provider.name, model_used=completion.model_used, latency=completion.latency)
-        raise _error_for(worst if worst is not None else ChatFailure.UNAVAILABLE, retry_in)
+        raise _error_for(worst if worst is not None else ChatFailure.UNAVAILABLE, retry_in, worst_daily)
 
     def _retry_plan(self, exc: EvaluatorError, per_attempt: float, deadline: float) -> Optional[Tuple[float, float]]:
         """(attempt timeout, limiter wait) of the one extra NIM attempt, or None when it must not happen.

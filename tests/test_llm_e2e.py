@@ -17,7 +17,7 @@ import pytest
 
 import src.bot.conversation as conv
 from src.bot.auth import Authorizer
-from src.bot.chat_llm import ChatLLM
+from src.bot.chat_llm import ChatFailure, ChatLLM, describe_failure
 from src.bot.client import TelegramBotClient
 from src.bot.commands import COMMANDS, TRIGGER_STARTED, BotContext, CommandRouter
 from src.bot.poller import BotPoller
@@ -259,9 +259,10 @@ def test_e2e_injection_and_logs(tmp_path, caplog, quiet_httpx):
                 )
             ]
         )
-        assert wait_for(lambda: conv.NOT_UNDERSTOOD_REPLY in h.telegram.texts())
+        assert wait_for(lambda: describe_failure(ChatFailure.BAD_ANSWER) in h.telegram.texts())
         assert len(nim.bodies) == 1 and len(openrouter.bodies) == 1
         assert not any(b.startswith("pc:") for c in h.telegram.sent() for b in buttons(c))
+        assert any(b.startswith("rt:") for c in h.telegram.sent() for b in buttons(c))  # a bad answer can be retried
         # the pasted closing tag reached the model neutralised: one real data block, no second closer
         user_content = nim.bodies[0]["messages"][-1]["content"]
         assert user_content.count("</user_message>") == 1 and user_content.rstrip().endswith("</user_message>")
@@ -305,3 +306,29 @@ def test_e2e_clarification_round(tmp_path, quiet_httpx):
         h.finish()
     assert h.table("SELECT COUNT(*) FROM conversation WHERE context IS NOT NULL") == [(0,)]
     assert h.table("SELECT COUNT(*) FROM pending_change") == [(0,)]
+
+
+def test_e2e_failed_request_is_retried_with_the_button(tmp_path, quiet_httpx):
+    """Both models answer garbage: the reason and a Retry button; the button re-runs the same masked text."""
+    nim = ScriptedLLM(nim_reply("not json"), nim_reply(proposal_answer()))
+    openrouter = ScriptedLLM(nim_reply("not json"))
+    h = Harness(tmp_path, nim, openrouter, consent=True)
+    base_version = h.version()
+    h.start()
+    try:
+        h.telegram.fake.queue_updates([message_update(1, f"add {ROLE} with synonym {SYN}, my mail is {EMAIL}")])
+        assert wait_for(lambda: describe_failure(ChatFailure.BAD_ANSWER) in h.telegram.texts())
+        retry = next(b for c in h.telegram.sent() for b in buttons(c) if b.startswith("rt:"))
+        assert not any(b.startswith("pc:") for c in h.telegram.sent() for b in buttons(c))
+
+        h.telegram.fake.queue_updates([callback_update(2, retry)])  # no text is sent again
+        assert wait_for(lambda: any(b.startswith("pc:") for c in h.telegram.sent() for b in buttons(c)))
+        assert len(nim.bodies) == 2
+        for body in nim.bodies:
+            assert "[email]" in json.dumps(body) and EMAIL not in json.dumps(body)
+        assert h.version() == base_version  # nothing applied without the confirmation
+
+        h.telegram.fake.queue_updates([callback_update(3, retry)], ignore_offset=True)  # a second tap is stale
+        assert wait_for(lambda: conv.CONSENT_STALE_REPLY in h.telegram.texts())
+    finally:
+        h.finish()

@@ -13,20 +13,13 @@ validated operation list only. Nothing here logs user text, masked text, questio
 request ids and exception type names.
 """
 import logging
-import math
 import secrets
 import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from src.bot.chat_llm import (
-    CHAT_HOURLY_CAP,
-    ChatLLMLimited,
-    ChatLLMNotConfigured,
-    ChatLLMNotUnderstood,
-    ChatLLMUnavailable,
-)
+from src.bot.chat_llm import ChatLLMError, ChatLLMLimited, ChatLLMNotConfigured, describe_failure
 from src.bot.client import TelegramApiError, TelegramBotClient
 from src.bot.commands import BotContext, not_applied, trigger_note
 from src.bot.conversation_store import ConversationState, ConversationStore, PendingChange
@@ -88,12 +81,11 @@ NOT_CONFIGURED_REPLY = (
     "Free-text requests need an LLM key (NVIDIA_API_KEY or OPENROUTER_API_KEY in .env); "
     "the commands keep working: /help"
 )
-UNAVAILABLE_REPLY = "The language model is unavailable right now; try again later or use a command (/help)."
 NOT_UNDERSTOOD_REPLY = "Couldn't understand that, try a command (/help)."
-LIMITED_REPLY = "Hourly limit of {limit} LLM calls reached; try again in {minutes} min, or use the commands (/help)."
 ERROR_REPLY = "Something went wrong; nothing was changed."
 WORKING_REPLY = "Working on it..."
-PROGRESS_REPLY = "Still working; the model can take up to 2 minutes."
+PROGRESS_REPLY = "Still working; this can take a few minutes."
+RETRY_BUTTON = "Retry"
 DELIVERY_FAILED_REPLY = "Could not deliver the proposal; send your request again."
 NO_CHANGE_REPLY = "That does not look like a profile change. Send /help for the commands."
 QUESTION_PREFIX = "Question: "
@@ -174,6 +166,17 @@ class _Held:
 
 
 @dataclass
+class _Retry:
+    """Masked request text kept in memory (never the database) so the Retry button can run it again."""
+
+    nonce: str
+    chat_id: int
+    parts: List[str]
+    created: float
+    message_id: Optional[int] = None  # the failure reply carrying the button, so it can be removed when replaced
+
+
+@dataclass
 class _Work:
     buffer: _Buffer
     generation: int  # a /cancel after the request was taken makes its result stale
@@ -215,6 +218,7 @@ class ConversationService:
         # chat id, time of the last part of a dropped paste, and whether the user was told about it
         self._swallow: Optional[List[Any]] = None
         self._held: Optional[_Held] = None
+        self._retry: Optional[_Retry] = None
         self._generation = 0
         self._inflight = False
         self._next_sweep = 0.0
@@ -319,13 +323,16 @@ class ConversationService:
     def _drop_memory(self) -> bool:
         with self._cond:
             self._generation += 1  # a request already taken by the worker loses its result
-            held = self._held
-            anything = bool(self._buffers) or held is not None or self._inflight
+            held, retry = self._held, self._retry
+            anything = bool(self._buffers) or held is not None or retry is not None or self._inflight
             self._buffers.clear()
             self._held = None
+            self._retry = None
             self._swallow = None
         if held is not None and held.message_id is not None:
             self._clear_buttons(held.chat_id, held.message_id)
+        if retry is not None and retry.message_id is not None:
+            self._clear_buttons(retry.chat_id, retry.message_id)
         return anything
 
     def on_callback(self, update: Update) -> List[OutgoingMessage]:
@@ -333,6 +340,8 @@ class ConversationService:
             return self._on_proposal_button(update)
         if update.text.startswith("cs:"):
             return self._on_consent_button(update)
+        if update.text.startswith("rt:"):
+            return self._on_retry_button(update)
         if update.text.startswith("ob:"):
             return self._on_onboarding_button(update)
         return _reply(NO_LONGER_ACTIVE_REPLY)
@@ -429,6 +438,30 @@ class ConversationService:
             self._buffers.insert(
                 0,
                 _Buffer(held.chat_id, held.parts, sum(len(p) for p in held.parts), self._clock(),
+                        closed=True, immediate=True),
+            )
+            self._cond.notify_all()
+        return []
+
+    def _on_retry_button(self, update: Update) -> List[OutgoingMessage]:
+        """``rt:<nonce>:go``: run the failed request again with the same (already masked) parts."""
+        parts = update.text.split(":")
+        if len(parts) != 3 or parts[2] != "go":
+            return _reply(CONSENT_STALE_REPLY)
+        with self._cond:
+            retry = self._retry
+            if retry is None or retry.nonce != parts[1] or retry.chat_id != update.chat_id \
+                    or self._clock() - retry.created > CONTEXT_TTL_SECONDS:
+                retry = None
+            else:
+                self._retry = None
+        if retry is None:
+            return _reply(CONSENT_STALE_REPLY)
+        self._clear_buttons(update.chat_id, update.message_id)
+        with self._cond:
+            self._buffers.insert(
+                0,
+                _Buffer(retry.chat_id, retry.parts, sum(len(p) for p in retry.parts), self._clock(),
                         closed=True, immediate=True),
             )
             self._cond.notify_all()
@@ -586,8 +619,15 @@ class ConversationService:
                 self._held = None  # held text expires silently (its buttons just go away)
             else:
                 held = None
+            retry = self._retry
+            if retry is not None and now - retry.created > CONTEXT_TTL_SECONDS:
+                self._retry = None
+            else:
+                retry = None
         if held is not None and held.message_id is not None:
             self._clear_buttons(held.chat_id, held.message_id)
+        if retry is not None and retry.message_id is not None:
+            self._clear_buttons(retry.chat_id, retry.message_id)
 
     @staticmethod
     def _context_expired(state: ConversationState, now: float) -> bool:
@@ -730,25 +770,15 @@ class ConversationService:
         timer = threading.Timer(PROGRESS_NOTE_SECONDS, self._progress_note, args=(work,))
         timer.daemon = True
         timer.start()
+        failure: Optional[ChatLLMError] = None
         try:
             outcome = self._translator.translate(
                 parts, snapshot, mode=mode, history=history, request_id=request_id
             )
         except StopRequested:
             return
-        except ChatLLMLimited as exc:
-            minutes = max(1, math.ceil(exc.retry_in / 60))
-            self._finish(work, _reply(LIMITED_REPLY.format(limit=CHAT_HOURLY_CAP, minutes=minutes)), purge=False)
-            return
-        except ChatLLMNotConfigured:
-            self._finish(work, _reply(NOT_CONFIGURED_REPLY), purge=False)
-            return
-        except ChatLLMUnavailable:
-            self._finish(work, _reply(UNAVAILABLE_REPLY), purge=False)
-            return
-        except ChatLLMNotUnderstood:
-            self._finish(work, _reply(NOT_UNDERSTOOD_REPLY), purge=True)
-            return
+        except ChatLLMError as exc:
+            failure = exc
         except (TranslationProblem, ProfileValidationError) as exc:
             self._finish(work, _reply(not_applied(exc.messages)), purge=True)
             return
@@ -760,12 +790,43 @@ class ConversationService:
             timer.cancel()
             with self._note_lock:  # waits for a note that is already being sent, so it precedes the answer
                 work.done = True
+        if failure is not None:
+            self._reply_failure(work, parts, failure, request_id)
+            return
         if isinstance(outcome, Proposal):
             self._store_proposal(work, outcome, mode)
         elif isinstance(outcome, Clarification):
             self._ask(work, outcome, parts, history, mode, now)
         else:
             self._finish(work, _reply(NO_CHANGE_REPLY), purge=True)
+
+    def _reply_failure(self, work: _Work, parts: List[str], failure: ChatLLMError, request_id: str) -> None:
+        """Say why the model request failed (code-written text) and offer Retry; the conversation state is kept.
+
+        Not configured is the exception: there is nothing to retry until a key is set.
+        """
+        chat_id = work.buffer.chat_id
+        if isinstance(failure, ChatLLMNotConfigured):
+            self._finish(work, _reply(NOT_CONFIGURED_REPLY), purge=False)
+            return
+        daily = bool(getattr(failure, "daily", False)) if isinstance(failure, ChatLLMLimited) else False
+        text = describe_failure(failure.failure, failure.retry_in, daily=daily)
+        nonce = secrets.token_hex(4)
+        retry = _Retry(nonce, chat_id, list(parts), self._clock())  # memory only, never the database
+        with self._cond:
+            if work.generation != self._generation:
+                return  # /cancel arrived meanwhile: the result is discarded
+            replaced, self._retry = self._retry, retry
+        if replaced is not None and replaced.message_id is not None:
+            self._clear_buttons(replaced.chat_id, replaced.message_id)
+        markup = {"inline_keyboard": [[{"text": RETRY_BUTTON, "callback_data": f"rt:{nonce}:go"}]]}
+        message_id = self._send(chat_id, [OutgoingMessage(text, markup)])
+        with self._cond:
+            current = self._retry is retry
+            if current:
+                retry.message_id = message_id
+        if not current:  # replaced, used or cancelled while the reply was being sent
+            self._clear_buttons(chat_id, message_id)
 
     def _progress_note(self, work: _Work) -> None:
         # A separate lock, not ``_cond``: the send is network I/O and nothing slow may run under ``_cond``.
