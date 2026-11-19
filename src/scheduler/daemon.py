@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 
 _MAX_STORED_ERROR_CHARS = 300
+CHAT_UNCONFIGURED_TTL_SECONDS = 60.0
 
 # Default of ``evaluate_unprocessed(profile=...)``: "resolve the profile now". An explicit ``None`` means
 # "this cycle has no profile" and is never re-resolved (a profile created mid-cycle waits for the next one).
@@ -144,6 +145,7 @@ class DaemonService:
         self._bot_router: Optional[CommandRouter] = None
         self._conversation_thread: Optional[threading.Thread] = None
         self.chat_llm: Optional[ChatLLM] = None
+        self._chat_unconfigured_until = 0.0  # time.monotonic() until which the chat path skips the chain build
         self._chain_lock = threading.Lock()
         # Futures of the batch in flight (snapshot-cancelled by request_shutdown).
         self._futures: List[Future] = []
@@ -254,6 +256,19 @@ class DaemonService:
             if self.evaluator is None:
                 self.evaluator = build_chain_from_settings(self.settings, stop_event=self._stop_event)
             return self.evaluator
+
+    def _chat_providers(self) -> Any:
+        """The chain's providers for the chat path; an unconfigured install is not re-checked for a while.
+
+        Without a key every free-text message would rebuild the chain (and log its warnings) just to fail again.
+        """
+        if time.monotonic() < self._chat_unconfigured_until:
+            raise ConfigurationError("no LLM provider is configured")
+        try:
+            return self._get_evaluator().providers
+        except ConfigurationError:
+            self._chat_unconfigured_until = time.monotonic() + CHAT_UNCONFIGURED_TTL_SECONDS
+            raise
 
     def _policy(self, profile: Optional[CompiledProfile]) -> ScoringPolicy:
         """The scoring policy of a cycle: the profile's, else the ``.env`` thresholds (bonus off, legacy rules)."""
@@ -843,7 +858,7 @@ class DaemonService:
             env_path = Path(".env")
             # Always built: without a key ``available()`` is False and free text answers "not configured".
             # It drives the chain's own providers (shared limiters and budget), stops only at process shutdown.
-            self.chat_llm = ChatLLM(lambda: self._get_evaluator().providers, stop_event=self._shutdown_requested)
+            self.chat_llm = ChatLLM(self._chat_providers, stop_event=self._shutdown_requested)
             ctx = BotContext(
                 db_path=self.db.db_path,
                 env_path=env_path,
@@ -870,7 +885,10 @@ class DaemonService:
             self._bot_thread = poller.start()
             self._bot_poller = poller
             # The free-text worker (daemon thread, stops on the shutdown event; never joined without a timeout).
-            self._conversation_thread = router.conversation.start()
+            try:
+                self._conversation_thread = router.conversation.start()
+            except Exception as exc:  # free text is off; commands and the poller keep running
+                logger.warning("Telegram conversation worker could not start: %s", type(exc).__name__)
             logger.info("Telegram bot polling started.")
             return poller
         except Exception as exc:  # never the message: it can hold a request URL

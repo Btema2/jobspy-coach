@@ -3,6 +3,7 @@
 No network (``FakeTelegram``, scripted fake translator), no real .env, placeholders only.
 """
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -282,3 +283,79 @@ def test_setup_drops_a_running_request(svc, clock, translator, telegram):
     translator.gate.set()
     worker.join(5)
     assert not any("<ROLE2>" in t for t in sent(telegram))
+
+
+# --- review fixes: retry after a failed onboarding request, one 24 h check, progress note ordering ---------
+
+
+@pytest.mark.parametrize("failure", ["not_understood", "problem"])
+def test_failed_onboarding_request_keeps_description_state(svc, clock, translator, conv_store, failure):
+    from src.bot.chat_llm import ChatLLMNotUnderstood
+    from src.bot.translator import TranslationProblem
+
+    setup(svc)
+    started = conv_store.get_state(111).updated_at
+    translator.add(ChatLLMNotUnderstood("x") if failure == "not_understood" else TranslationProblem(["Unknown country"]))
+    run_request(svc, clock, "first try")
+    assert conv_store.get_state(111).state == "awaiting_description"
+    assert conv_store.get_state(111).updated_at == started  # the 24 h bound still counts from /setup
+
+    translator.add(prop(add_role("<ROLE2>")))
+    run_request(svc, clock, "second try")
+    assert [c["mode"] for c in translator.calls] == ["onboarding", "onboarding"]
+    assert conv_store.get_pending(111).mode == "onboarding"
+
+
+def test_failed_onboarding_state_still_expires_after_24h(svc, clock, translator, conv_store):
+    from src.bot.chat_llm import ChatLLMNotUnderstood
+
+    setup(svc)
+    translator.add(ChatLLMNotUnderstood("x"))
+    run_request(svc, clock, "first try")
+    clock.value += conv.CONTEXT_TTL_SECONDS + 1
+    translator.add(prop(add_role("<ROLE2>")))
+    run_request(svc, clock, "much later")
+    assert translator.calls[1]["mode"] == "chat"
+
+
+def test_expired_description_state_decline_is_a_plain_decline(svc, db, clock, telegram):
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute("DELETE FROM llm_consent")
+    setup(svc)
+    clock.value += conv.CONTEXT_TTL_SECONDS + 1
+    run_request(svc, clock, "late description")  # processed as chat: the description state expired
+    no = [d for d in button_data(telegram.calls("sendMessage")[-1]["reply_markup"]) if d.endswith(":no")][0]
+    assert texts(svc.on_callback(callback(no))) == conv.CONSENT_DECLINED_REPLY
+    assert not wizard_open(db)
+
+
+def test_progress_note_firing_late_is_not_sent_after_the_proposal(svc, clock, translator, telegram, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(conv, "PROGRESS_NOTE_SECONDS", 0.02)
+    translator.add(prop(add_role("<ROLE2>")))
+    translator.gate = threading.Event()
+    in_note, release_note = threading.Event(), threading.Event()
+    real_send = svc._send
+
+    def slow_send(chat_id, messages):
+        if messages and messages[0].text == conv.PROGRESS_REPLY:
+            in_note.set()  # the note is firing ...
+            assert release_note.wait(10)  # ... and stuck before it reaches Telegram
+        return real_send(chat_id, messages)
+
+    monkeypatch.setattr(svc, "_send", slow_send)
+    svc.on_text(text_update("add a role"))
+    clock.value += conv.DEBOUNCE_SECONDS
+    worker = threading.Thread(target=svc.process_next, args=(clock.value,))
+    worker.start()
+    assert translator.entered.wait(5) and in_note.wait(5)
+    translator.gate.set()  # the model answers while the note is still firing
+    time.sleep(0.2)
+    assert not any("pc:" in str(c.get("reply_markup")) for c in telegram.calls("sendMessage"))
+    release_note.set()
+    worker.join(10)
+    texts_sent = sent(telegram)
+    assert conv.PROGRESS_REPLY in texts_sent
+    proposal = next(i for i, c in enumerate(telegram.calls("sendMessage")) if "pc:" in str(c.get("reply_markup")))
+    assert texts_sent.index(conv.PROGRESS_REPLY) < proposal

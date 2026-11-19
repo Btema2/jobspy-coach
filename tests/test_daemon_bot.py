@@ -572,3 +572,45 @@ def test_on_paired_clears_conversation_tables(tmp_path, telegram):
         assert store.get_pending(5) is None and not store.has_consent(5, 1)
     finally:
         _stop(daemon)
+
+
+def test_conversation_worker_start_failure_keeps_the_bot_running(tmp_path, telegram, monkeypatch, caplog):
+    from src.bot.conversation import ConversationService
+
+    def boom(self):
+        raise RuntimeError("secret-detail")
+
+    monkeypatch.setattr(ConversationService, "start", boom)
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
+    try:
+        with caplog.at_level("WARNING"):
+            poller = daemon._start_bot()
+        assert poller is not None and daemon._bot_thread.is_alive()
+        assert daemon._conversation_thread is None
+        assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+        assert not any("secret-detail" in r.getMessage() or "Telegram bot could not start" in r.getMessage() for r in caplog.records)
+    finally:
+        _stop(daemon)
+
+
+def test_unconfigured_chain_build_is_not_retried_on_every_message(tmp_path, telegram, monkeypatch):
+    import src.scheduler.daemon as daemon_module
+    from src.evaluator.errors import ConfigurationError
+
+    builds = []
+
+    def failing_build(*args, **kwargs):
+        builds.append(1)
+        raise ConfigurationError("no provider")
+
+    monkeypatch.setattr(daemon_module, "build_chain_from_settings", failing_build)
+    daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>", NVIDIA_API_KEY="")
+    try:
+        daemon._start_bot()
+        assert [daemon.chat_llm.available() for _ in range(4)] == [False] * 4
+        assert len(builds) == 1
+        daemon._chat_unconfigured_until = 0.0  # the short TTL has passed
+        assert daemon.chat_llm.available() is False
+        assert len(builds) == 2
+    finally:
+        _stop(daemon)

@@ -172,10 +172,11 @@ class _Held:
     message_id: Optional[int] = None  # the consent notice, so its buttons can be removed when it is replaced
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Work:
     buffer: _Buffer
     generation: int  # a /cancel after the request was taken makes its result stale
+    done: bool = False  # the model call ended: a progress note that has not been sent yet must stay unsent
 
 
 class ConversationService:
@@ -205,6 +206,7 @@ class ConversationService:
             translator = Translator(ctx.chat_llm)
         self._translator = translator
         self._stop = ctx.stop_event if ctx.stop_event is not None else threading.Event()
+        self._note_lock = threading.Lock()  # a progress note is sent (or skipped) as a whole; see _progress_note
         self._cond = threading.Condition()  # memory state only: nothing slow (database, network) runs under it
         self._state_lock = threading.RLock()  # pending row + conversation state transitions (poller and worker)
         self._context_chats: set = set()
@@ -415,7 +417,7 @@ class ConversationService:
             return _reply(CONSENT_STALE_REPLY)
         self._clear_buttons(update.chat_id, update.message_id)
         if parts[2] == "no":
-            if self._conv.get_state(update.chat_id).state == STATE_DESCRIPTION:
+            if self._in_description(self._conv.get_state(update.chat_id), self._clock()):
                 # Onboarding without the language model: the step-by-step wizard takes over.
                 with self._state_lock:
                     self._conv.set_state(update.chat_id, STATE_IDLE, None, self._clock())
@@ -667,6 +669,11 @@ class ConversationService:
         return parts
 
     @staticmethod
+    def _in_description(state: ConversationState, now: float) -> bool:
+        """Waiting for an onboarding description, counted from ``/setup`` (24 hours at most)."""
+        return state.state == STATE_DESCRIPTION and now - state.updated_at <= CONTEXT_TTL_SECONDS
+
+    @staticmethod
     def _mode_and_history(state: ConversationState, now: float) -> Tuple[str, List[Tuple[str, str]]]:
         context = state.context
         if state.state == STATE_CLARIFICATION and isinstance(context, dict) \
@@ -678,7 +685,7 @@ class ConversationService:
                 if isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item):
                     history.append((item[0], item[1]))
             return mode, history[:MAX_CLARIFICATIONS]
-        if state.state == STATE_DESCRIPTION and now - state.updated_at <= CONTEXT_TTL_SECONDS:
+        if ConversationService._in_description(state, now):
             return "onboarding", []
         return "chat", []
 
@@ -750,6 +757,8 @@ class ConversationService:
             return
         finally:
             timer.cancel()
+            with self._note_lock:  # waits for a note that is already being sent, so it precedes the answer
+                work.done = True
         if isinstance(outcome, Proposal):
             self._store_proposal(work, outcome, mode)
         elif isinstance(outcome, Clarification):
@@ -758,8 +767,10 @@ class ConversationService:
             self._finish(work, _reply(NO_CHANGE_REPLY), purge=True)
 
     def _progress_note(self, work: _Work) -> None:
-        if not self._stale(work):
-            self._send(work.buffer.chat_id, _reply(PROGRESS_REPLY))
+        # A separate lock, not ``_cond``: the send is network I/O and nothing slow may run under ``_cond``.
+        with self._note_lock:
+            if not work.done and not self._stale(work):
+                self._send(work.buffer.chat_id, _reply(PROGRESS_REPLY))
 
     def _rest_state(self, chat_id: int) -> str:
         """The state a conversation returns to: waiting for the old proposal's answer, or idle."""
@@ -783,6 +794,8 @@ class ConversationService:
 
     def _reset_state(self, chat_id: int) -> None:
         with self._state_lock:
+            if self._in_description(self._wconv.get_state(chat_id), self._clock()):
+                return  # a failed onboarding request: the user can send the description again (no text is held)
             self._wconv.set_state(chat_id, self._rest_state(chat_id), None, self._clock())
 
     def _ask(
