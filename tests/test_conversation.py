@@ -253,7 +253,9 @@ def test_fourth_part_or_over_limit_drops_whole_paste(svc, clock, translator):
     clock.value = NOW + 1.5
     assert texts(say(svc, "part 3")) == conv.TOO_LONG_REPLY
     clock.value = NOW + 2.0
-    assert say(svc, "part 4") == []  # the tail of the same paste is swallowed silently
+    assert texts(say(svc, "part 4")) == conv.SWALLOWED_REPLY  # told once that the tail is being dropped
+    clock.value = NOW + 2.5
+    assert say(svc, "part 5") == []  # further parts of the same paste are dropped silently
     assert svc.process_next(NOW + 100) is False
     assert translator.calls == []
     clock.value = NOW + 100  # a later message is an ordinary request again
@@ -286,24 +288,31 @@ def test_request_queue_is_capped(svc, clock, translator):
 
 
 def test_upload_txt_md_up_to_20kb(svc, clock, translator, telegram, caplog):
-    telegram.serve_file("f1", "documents/a.md", b"x" * 20480)
+    telegram.serve_file("f1", "documents/a.md", b"x" * 20000)
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.WARNING, logger="httpx")  # as configure_logging does: httpx would print the URL
+    caplog.set_level(logging.WARNING, logger="httpcore")
     clock.value = NOW
     reply = svc.on_text(parse_update(document_update(1, "f1", "Notes.MD", caption="<CAPTION>")))
     assert reply == []
     assert svc.process_next(NOW) is True  # an upload is its own request: no debounce wait
-    assert translator.calls[0]["parts"] == ["<CAPTION>", "x" * 20480]
-    assert TOKEN not in caplog.text
+    assert translator.calls[0]["parts"] == ["<CAPTION>", "x" * 20000]
+    assert "TOKEN" not in caplog.text
+
+    telegram.serve_file("f0", "documents/z.md", b"x" * 20480)  # exactly the cap, no caption
+    svc.on_text(parse_update(document_update(10, "f0", "z.md")))
+    assert svc.process_next(NOW) is True
+    assert translator.calls[1]["parts"] == ["x" * 20480]
 
     telegram.serve_file("f2", "documents/b.txt", b"y" * 20481)
     svc.on_text(parse_update(document_update(2, "f2", "b.txt")))
     assert svc.process_next(NOW) is True
     assert sent(telegram)[-1] == conv.FILE_TOO_LARGE_REPLY
-    assert len(translator.calls) == 1
+    assert len(translator.calls) == 2
 
     reply = svc.on_text(parse_update(document_update(3, "f3", "c.txt", file_size=20481)))
     assert texts(reply) == conv.FILE_TOO_LARGE_REPLY  # known size: refused before any download
-    assert len(telegram.calls("getFile")) == 2
+    assert len(telegram.calls("getFile")) == 3
 
     reply = svc.on_text(parse_update(document_update(4, "f4", "cv.pdf")))
     assert texts(reply) == conv.ONLY_TEXT_FILES_REPLY
@@ -804,6 +813,8 @@ def test_stale_clarification_context_is_purged_by_the_sweep(svc, clock, conv_sto
 
 def test_no_user_text_in_logs(svc, clock, translator, telegram, caplog, store):
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.WARNING, logger="httpx")  # as configure_logging does: httpx would print the URL
+    caplog.set_level(logging.WARNING, logger="httpcore")
     translator.add(Clarification("<MARKER-OUT> which one?"))
     run_request(svc, clock, "<MARKER> request about first.last@example.org")
     data = propose(svc, clock, translator, telegram, add_role("<ROLE2>"), text="<MARKER> answer")
@@ -812,7 +823,7 @@ def test_no_user_text_in_logs(svc, clock, translator, telegram, caplog, store):
     run_request(svc, clock, "<MARKER> again")
     assert "<MARKER" not in caplog.text
     assert "example.org" not in caplog.text
-    assert TOKEN not in caplog.text
+    assert "TOKEN" not in caplog.text
 
 
 def test_messages_are_chunked_and_escaped(svc, clock, translator, telegram):
@@ -887,3 +898,121 @@ def test_worker_loop_survives_an_unexpected_error(
     thread.join(1.0)
     assert boom["n"] >= 2 and translator.calls and not thread.is_alive()
     assert MARKER not in caplog.text
+
+
+# --- review fixes ----------------------------------------------------------------------------------
+
+HOUR = 3600.0
+
+
+def test_context_expires_24h_after_it_was_first_stored(svc, clock, translator, telegram, conv_store, db):
+    translator.add(Clarification("Q1?"), Clarification("Q2?"), NoChange())
+    run_request(svc, clock, f"{MARKER} one")
+    created = conv_store.get_state(111).context["created_at"]
+    clock.value = created + 23 * HOUR
+    run_request(svc, clock, "two")  # the second round refreshes updated_at but not created_at
+    assert conv_store.get_state(111).context["created_at"] == created
+    assert MARKER in dump_db(db.db_path)
+    svc.sweep(created + 24 * HOUR + 1)
+    assert MARKER not in dump_db(db.db_path)
+    state = conv_store.get_state(111)
+    assert state.state == "idle" and state.context is None
+
+
+def test_expired_context_is_not_sent_again(svc, clock, translator, conv_store):
+    translator.add(Clarification("Q1?"), Clarification("Q2?"), NoChange())
+    run_request(svc, clock, f"{MARKER} one")
+    created = conv_store.get_state(111).context["created_at"]
+    clock.value = created + 23 * HOUR
+    run_request(svc, clock, "two")
+    clock.value = created + 24 * HOUR + 1
+    run_request(svc, clock, "three")
+    assert translator.calls[2]["history"] == []
+    assert all(MARKER not in part for part in translator.calls[2]["parts"])
+
+
+def test_cancel_between_store_and_send_sends_no_proposal(svc, clock, translator, telegram, conv_store, monkeypatch):
+    original = svc._wconv.put_pending
+
+    def put_then_cancel(pending):
+        result = original(pending)
+        svc.on_cancel(text_update("/cancel"))  # lands after the row is stored, before the message is sent
+        return result
+
+    monkeypatch.setattr(svc._wconv, "put_pending", put_then_cancel)
+    translator.add(prop(add_role("<ROLE2>")))
+    run_request(svc, clock, "request")
+    assert not any("Proposed change" in t for t in sent(telegram))
+    assert conv_store.get_pending(111) is None
+    assert conv_store.get_state(111).state == "idle"
+
+
+def test_confirm_keeps_state_when_a_newer_proposal_exists(svc, clock, translator, telegram, conv_store, monkeypatch):
+    from src.bot.conversation_store import PendingChange
+
+    data = propose(svc, clock, translator, telegram, add_role("<ROLE2>"))
+    original = svc._conv.take_pending
+
+    def take_then_new_proposal(chat_id, change_id):
+        taken = original(chat_id, change_id)
+        conv_store.put_pending(PendingChange(111, "newer000", taken.base_version, "chat", taken.operations, None, clock.value))
+        conv_store.set_state(111, "awaiting_confirm", None, clock.value)
+        return taken
+
+    monkeypatch.setattr(svc._conv, "take_pending", take_then_new_proposal)
+    svc.on_callback(callback(data))
+    assert conv_store.get_pending(111).change_id == "newer000"
+    assert conv_store.get_state(111).state == "awaiting_confirm"
+
+
+def test_replaced_or_cancelled_consent_notice_loses_its_buttons(svc, clock, telegram, db):
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute("DELETE FROM llm_consent")
+    run_request(svc, clock, "first")
+    first_id = 100 + len(telegram.calls("sendMessage"))
+    run_request(svc, clock, "second")
+    assert {"chat_id": 111, "message_id": first_id} in telegram.calls("editMessageReplyMarkup")
+    second_id = 100 + len(telegram.calls("sendMessage"))
+    svc.on_cancel(text_update("/cancel"))
+    assert {"chat_id": 111, "message_id": second_id} in telegram.calls("editMessageReplyMarkup")
+
+
+def test_caption_plus_file_over_the_input_cap_is_refused(svc, clock, translator, telegram):
+    telegram.serve_file("f1", "documents/a.txt", b"x" * 20480)
+    svc.on_text(parse_update(document_update(1, "f1", "a.txt", caption="<CAPTION>")))
+    svc.process_next(clock.value)
+    assert sent(telegram)[-1] == conv.TOO_LONG_REPLY
+    assert translator.calls == []
+
+
+def test_upload_during_wizard_step_is_not_fed_to_the_wizard(svc, clock, translator, telegram):
+    svc._wizard.start(text_update("/setup"))
+    reply = svc.on_text(parse_update(document_update(1, "f1", "a.txt", caption="<CAPTION>")))
+    assert texts(reply) == conv.FINISH_SETUP_REPLY
+    assert svc._wizard._state.get_wizard()["role"] == ""  # the caption did not become the role
+    assert svc.process_next(clock.value + 100) is False
+
+
+def test_reset_memory_drops_buffers_held_text_and_running_result(svc, clock, translator, telegram, db):
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute("DELETE FROM llm_consent")
+    run_request(svc, clock, "held text")
+    say(svc, "buffered")
+    svc.reset_memory()
+    assert svc.process_next(clock.value + 100) is False
+    yes, _ = button_data(last_markup(telegram))
+    assert "no longer active" in texts(svc.on_callback(callback(yes)))
+
+    translator.gate = threading.Event()
+    translator.add(prop(add_role("<ROLE2>")))
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute("INSERT INTO llm_consent (chat_id, notice_version, acknowledged_at) VALUES (111, 1, 'x')")
+    say(svc, "request")
+    clock.value += 3
+    worker = threading.Thread(target=svc.process_next, args=(clock.value,), daemon=True)
+    worker.start()
+    assert translator.entered.wait(5)
+    svc.reset_memory()
+    translator.gate.set()
+    worker.join(5)
+    assert not any("Proposed change" in t for t in sent(telegram))

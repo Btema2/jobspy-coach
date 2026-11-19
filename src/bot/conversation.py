@@ -17,7 +17,7 @@ import math
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.bot.chat_llm import (
@@ -43,7 +43,9 @@ from src.bot.translator import (
     render_proposal,
     to_operations,
 )
+from src.bot.state import BotStateStore
 from src.bot.updates import DocumentRef, OutgoingMessage, Update
+from src.bot.wizard import STALE as WIZARD_STALE
 from src.bot.wizard import SetupWizard
 from src.evaluator.errors import StopRequested
 from src.profile.backtest import backtest_snapshots, render_backtest
@@ -79,6 +81,8 @@ FILE_TOO_LARGE_REPLY = "That file is larger than 20 KB; send a shorter one."
 NOT_UTF8_REPLY = "The file must be UTF-8 text."
 EMPTY_FILE_REPLY = "The file is empty."
 DOWNLOAD_FAILED_REPLY = "I could not download that file; send it again or paste the text."
+SWALLOWED_REPLY = "Ignored: still dropping your too-long paste; resend in a few seconds."
+FINISH_SETUP_REPLY = "Finish or cancel the /setup step first."
 BUSY_REPLY = "Still working on your earlier requests; send this again in a moment."
 NOT_CONFIGURED_REPLY = (
     "Free-text requests need an LLM key (NVIDIA_API_KEY or OPENROUTER_API_KEY in .env); "
@@ -154,6 +158,7 @@ class _Held:
     chat_id: int
     parts: List[str]
     created: float
+    message_id: Optional[int] = None  # the consent notice, so its buttons can be removed when it is replaced
 
 
 @dataclass(frozen=True)
@@ -188,9 +193,12 @@ class ConversationService:
             translator = Translator(ctx.chat_llm)
         self._translator = translator
         self._stop = ctx.stop_event if ctx.stop_event is not None else threading.Event()
-        self._cond = threading.Condition()
+        self._cond = threading.Condition()  # memory state only: nothing slow (database, network) runs under it
+        self._state_lock = threading.RLock()  # pending row + conversation state transitions (poller and worker)
+        self._context_chats: set = set()
         self._buffers: List[_Buffer] = []
-        self._swallow: Optional[Tuple[int, float]] = None  # chat id and time of the last part of a dropped paste
+        # chat id, time of the last part of a dropped paste, and whether the user was told about it
+        self._swallow: Optional[List[Any]] = None
         self._held: Optional[_Held] = None
         self._generation = 0
         self._inflight = False
@@ -200,9 +208,15 @@ class ConversationService:
 
     def on_text(self, update: Update) -> Optional[List[OutgoingMessage]]:
         """The router's text handler: wizard first, then bare words, then the language model."""
-        wizard_reply = self._wizard.on_text(update)
-        if wizard_reply is not None:
-            return wizard_reply
+        if update.document is not None:
+            # An upload never answers a wizard step: its caption is not a step answer.
+            wizard_reply = self._wizard.on_text(replace(update, text="", document=None))
+            if wizard_reply is not None:
+                return wizard_reply if wizard_reply[0].text == WIZARD_STALE else _reply(FINISH_SETUP_REPLY)
+        else:
+            wizard_reply = self._wizard.on_text(update)
+            if wizard_reply is not None:
+                return wizard_reply
         if update.chat_id is None or (update.document is None and not update.text.strip()):
             return None
         if update.document is None:
@@ -226,20 +240,34 @@ class ConversationService:
     def on_cancel(self, update: Update) -> List[OutgoingMessage]:
         """Discard everything in flight: buffer, held text, running request, clarification and proposal."""
         chat_id = update.chat_id
+        anything = self._drop_memory()
+        with self._state_lock:
+            pending = self._conv.delete_pending(chat_id)
+            state = self._conv.get_state(chat_id)
+            if state.state != STATE_IDLE or state.context is not None:
+                self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+                anything = True
+        if pending is not None:
+            self._clear_buttons(chat_id, pending.message_id)
+        return _reply(CANCELLED_REPLY if anything or pending is not None else NOTHING_TO_CANCEL_REPLY)
+
+    def reset_memory(self) -> None:
+        """Forget buffers, held text and any running result (unpair and a new pairing; the tables are cleared
+        separately by ``ConversationStore.clear_all``)."""
+        self._drop_memory()
+        self._context_chats.clear()
+
+    def _drop_memory(self) -> bool:
         with self._cond:
-            self._generation += 1
-            anything = bool(self._buffers) or self._held is not None or self._inflight
+            self._generation += 1  # a request already taken by the worker loses its result
+            held = self._held
+            anything = bool(self._buffers) or held is not None or self._inflight
             self._buffers.clear()
             self._held = None
             self._swallow = None
-        pending = self._conv.delete_pending(chat_id)
-        state = self._conv.get_state(chat_id)
-        if pending is not None:
-            self._clear_buttons(chat_id, pending.message_id)
-        if state.state != STATE_IDLE or state.context is not None:
-            self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
-            anything = True
-        return _reply(CANCELLED_REPLY if anything or pending is not None else NOTHING_TO_CANCEL_REPLY)
+        if held is not None and held.message_id is not None:
+            self._clear_buttons(held.chat_id, held.message_id)
+        return anything
 
     def on_callback(self, update: Update) -> List[OutgoingMessage]:
         if update.text.startswith("pc:"):
@@ -274,10 +302,11 @@ class ConversationService:
     def _add_part(self, chat_id: int, text: str, now: float) -> List[OutgoingMessage]:
         with self._cond:
             if self._swallow is not None:
-                swallow_chat, swallow_last = self._swallow
+                swallow_chat, swallow_last, told = self._swallow
                 if swallow_chat == chat_id and now - swallow_last < DEBOUNCE_SECONDS:
-                    self._swallow = (chat_id, now)  # the tail of a paste that was already refused
-                    return []
+                    # The tail of a paste that was already refused: the user is told once, then it is silent.
+                    self._swallow = [chat_id, now, True]
+                    return [] if told else _reply(SWALLOWED_REPLY)
                 self._swallow = None
             buffer = self._open_buffer(chat_id, now)
             if buffer is None:
@@ -288,7 +317,7 @@ class ConversationService:
             if len(buffer.parts) == MAX_PARTS or buffer.chars + len(text) > MAX_MERGED_CHARS:
                 # A truncated paste is worse than none: the whole merged request is dropped.
                 self._buffers.remove(buffer)
-                self._swallow = (chat_id, now)
+                self._swallow = [chat_id, now, False]
                 return _reply(TOO_LONG_REPLY)
             buffer.parts.append(text)
             buffer.chars += len(text)
@@ -359,9 +388,16 @@ class ConversationService:
         if taken is None:
             return _reply(NO_LONGER_ACTIVE_REPLY)
         self._clear_buttons(chat_id, button_message_id if button_message_id is not None else taken.message_id)
-        if self._conv.get_state(chat_id).state == STATE_CONFIRM:
-            self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+        self._idle_unless_pending(chat_id, only_from=STATE_CONFIRM)
         return _reply(CANCELLED_REPLY)
+
+    def _idle_unless_pending(self, chat_id: int, only_from: Optional[str] = None) -> None:
+        """Back to idle, but never over a newer proposal the worker stored meanwhile."""
+        with self._state_lock:
+            if self._conv.get_pending(chat_id) is not None:
+                return
+            if only_from is None or self._conv.get_state(chat_id).state == only_from:
+                self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
 
     def _confirm(
         self, chat_id: int, change_id: Optional[str], button_message_id: Optional[int]
@@ -376,7 +412,7 @@ class ConversationService:
         if taken is None:
             return _reply(NO_LONGER_ACTIVE_REPLY)
         self._clear_buttons(chat_id, button_message_id if button_message_id is not None else taken.message_id)
-        self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+        self._idle_unless_pending(chat_id)
         return self._apply(taken)
 
     def _apply(self, taken: PendingChange) -> List[OutgoingMessage]:
@@ -477,9 +513,33 @@ class ConversationService:
                 self._wconv.set_state(taken.chat_id, STATE_IDLE, None, now)
             self._send(taken.chat_id, _reply(EXPIRED_REPLY))
         self._wconv.purge_contexts(now - CONTEXT_TTL_SECONDS)
+        self._purge_old_contexts(now)
         with self._cond:
-            if self._held is not None and now - self._held.created > CONTEXT_TTL_SECONDS:
-                self._held = None  # held text expires silently
+            held = self._held
+            if held is not None and now - held.created > CONTEXT_TTL_SECONDS:
+                self._held = None  # held text expires silently (its buttons just go away)
+            else:
+                held = None
+        if held is not None and held.message_id is not None:
+            self._clear_buttons(held.chat_id, held.message_id)
+
+    @staticmethod
+    def _context_expired(state: ConversationState, now: float) -> bool:
+        """The 24 hours count from when the first round's text was stored, not from the last round."""
+        created = state.context.get("created_at") if isinstance(state.context, dict) else None
+        start = float(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else state.updated_at
+        return now - start > CONTEXT_TTL_SECONDS
+
+    def _purge_old_contexts(self, now: float) -> None:
+        chats = set(self._context_chats)
+        pairing = BotStateStore(self._wdb).get_pairing()
+        if pairing is not None:
+            chats.add(pairing.chat_id)
+        for chat_id in chats:
+            state = self._wconv.get_state(chat_id)
+            if state.state == STATE_CLARIFICATION and self._context_expired(state, now):
+                with self._state_lock:
+                    self._wconv.set_state(chat_id, self._rest_state(chat_id), None, now)
 
     # --- worker thread: one request --------------------------------------------------------------
 
@@ -537,13 +597,17 @@ class ConversationService:
         if not text.strip():
             self._finish(work, _reply(EMPTY_FILE_REPLY), purge=False)
             return None
-        return ([buffer.caption] if buffer.caption else []) + [text]
+        parts = ([buffer.caption] if buffer.caption else []) + [text]
+        if len("\n\n".join(parts)) > MAX_INPUT_CHARS:  # the translator would cut the end silently
+            self._finish(work, _reply(TOO_LONG_REPLY), purge=False)
+            return None
+        return parts
 
     @staticmethod
     def _mode_and_history(state: ConversationState, now: float) -> Tuple[str, List[Tuple[str, str]]]:
         context = state.context
         if state.state == STATE_CLARIFICATION and isinstance(context, dict) \
-                and now - state.updated_at <= CONTEXT_TTL_SECONDS:
+                and not ConversationService._context_expired(state, now):
             mode = context.get("mode") if context.get("mode") in MODES else "chat"
             history: List[Tuple[str, str]] = []
             rounds = context.get("rounds")
@@ -557,17 +621,26 @@ class ConversationService:
 
     def _hold_for_consent(self, work: _Work, parts: List[str], now: float) -> None:
         nonce = secrets.token_hex(4)
+        held = _Held(nonce, work.buffer.chat_id, parts, now)  # memory only, never the database
         with self._cond:
             if work.generation != self._generation:
                 return
-            self._held = _Held(nonce, work.buffer.chat_id, parts, now)  # memory only, never the database
+            replaced, self._held = self._held, held
+        if replaced is not None and replaced.message_id is not None:
+            self._clear_buttons(replaced.chat_id, replaced.message_id)
         markup = {
             "inline_keyboard": [[
                 {"text": "Yes, continue", "callback_data": f"cs:{nonce}:yes"},
                 {"text": "No", "callback_data": f"cs:{nonce}:no"},
             ]]
         }
-        self._send(work.buffer.chat_id, [OutgoingMessage(CONSENT_NOTICE, markup)])
+        message_id = self._send(work.buffer.chat_id, [OutgoingMessage(CONSENT_NOTICE, markup)])
+        with self._cond:
+            current = self._held is held
+            if current:
+                held.message_id = message_id
+        if not current:  # answered, replaced or cancelled while the notice was being sent
+            self._clear_buttons(work.buffer.chat_id, message_id)
 
     def _translate(
         self,
@@ -630,14 +703,24 @@ class ConversationService:
         return STATE_CONFIRM if self._wconv.get_pending(chat_id) is not None else STATE_IDLE
 
     def _finish(self, work: _Work, messages: Sequence[OutgoingMessage], *, purge: bool) -> None:
-        """Send the final reply of a request; ``purge`` also ends any clarification (raw context is dropped)."""
+        """Send the final reply of a request; ``purge`` also ends any clarification (raw context is dropped).
+
+        Writes run outside the memory lock; the generation is re-checked after them, so a ``/cancel`` that
+        lands in between wins (the state is reset again and nothing is sent).
+        """
         chat_id = work.buffer.chat_id
-        with self._cond:
-            if work.generation != self._generation:
-                return  # /cancel arrived meanwhile: the result is discarded
-            if purge:
-                self._wconv.set_state(chat_id, self._rest_state(chat_id), None, self._clock())
+        if self._stale(work):
+            return  # /cancel arrived meanwhile: the result is discarded
+        if purge:
+            self._reset_state(chat_id)
+            if self._stale(work):
+                self._reset_state(chat_id)
+                return
         self._send(chat_id, messages)
+
+    def _reset_state(self, chat_id: int) -> None:
+        with self._state_lock:
+            self._wconv.set_state(chat_id, self._rest_state(chat_id), None, self._clock())
 
     def _ask(
         self,
@@ -659,10 +742,14 @@ class ConversationService:
         if history and isinstance(state.context, dict) and isinstance(state.context.get("created_at"), (int, float)):
             created = float(state.context["created_at"])
         context: Dict[str, Any] = {"mode": mode, "rounds": rounds, "created_at": created}
-        with self._cond:
-            if work.generation != self._generation:
-                return
+        if self._stale(work):
+            return
+        with self._state_lock:
             self._wconv.set_state(chat_id, STATE_CLARIFICATION, context, now)
+        self._context_chats.add(chat_id)
+        if self._stale(work):  # /cancel landed during the write: drop the context again
+            self._reset_state(chat_id)
+            return
         self._send(chat_id, _reply(QUESTION_PREFIX + esc(clarification.question)))
 
     def _proposal_extras(self, proposal: Proposal) -> Tuple[List[str], List[str]]:
@@ -689,13 +776,19 @@ class ConversationService:
             message_id=None,
             created_at=self._clock(),
         )
-        with self._cond:
-            if work.generation != self._generation:
-                return
+        if self._stale(work):
+            return
+        with self._state_lock:
             superseded = self._wconv.put_pending(pending)
             self._wconv.set_state(chat_id, STATE_CONFIRM, None, self._clock())
         if superseded is not None:
             self._clear_buttons(chat_id, superseded.message_id)
+        if self._stale(work):  # /cancel landed after the row was stored: no proposal may follow "Cancelled"
+            with self._state_lock:
+                self._wconv.take_pending(chat_id, change_id)
+            self._reset_state(chat_id)
+            return
+        if superseded is not None:
             self._send(chat_id, _reply(SUPERSEDED_REPLY))
         last_id = self._send(chat_id, messages)
         if last_id is None:
