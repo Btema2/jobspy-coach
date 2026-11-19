@@ -113,6 +113,7 @@ def test_store_skip_confirm_cancel():
     s = state()
     assert store_answer(s, "avoid", "none.", now=1.0) == "skipped"
     assert s.status["avoid"] == "skipped" and "avoid" not in s.facts and s.created_at is None
+    s.current = "bonus"
     assert store_answer(s, "bonus", "Yes", now=1.0) == "partial"
     assert s.status["bonus"] == "partial" and s.facts["bonus"] == "Yes"
     assert store_answer(s, "level", "cancel", now=1.0) == "cancel"
@@ -462,3 +463,85 @@ def test_each_call_uses_its_kind():
     with pytest.raises(TranslationProblem):
         llm.draft(_filled_state(), None, request_id="r3")
     assert kinds == ["turn", "extract", "draft"]
+
+
+# --- fix round 1 ----------------------------------------------------------------------------------
+
+
+def test_peek_step_does_not_mutate():
+    s = state()
+    before = s.to_json()
+    assert iv.peek_step(s) == Step("question", "roles", QUESTIONS["roles"])
+    assert iv.peek_step(s) == Step("question", "roles", QUESTIONS["roles"])
+    assert s.to_json() == before
+    next_step(s)
+    store_answer(s, "roles", "yes", now=1.0)
+    before = s.to_json()
+    assert iv.peek_step(s) == Step("followup", "roles", "Which ones?")
+    assert iv.peek_step(s) == Step("followup", "roles", "Which ones?")
+    assert s.to_json() == before
+    assert next_step(s) == Step("followup", "roles", "Which ones?")
+    s.asked_count = iv.MAX_INTERVIEW_QUESTIONS
+    assert iv.peek_step(s) == Step("draft", None, "")
+
+
+def test_late_confirm_word_for_another_slot_is_a_plain_answer():
+    s = state()
+    next_step(s)  # roles
+    store_answer(s, "roles", "yes", now=1.0)  # follow-up pending on roles
+    assert store_answer(s, "markets", "yes", now=2.0) == "stored"
+    assert s.status["markets"] == "filled" and s.facts["markets"] == "yes"
+    assert "markets" not in s.followed_up
+    assert (s.followup_slot, s.followup_text) == ("roles", "Which ones?")
+
+
+def test_confirm_on_current_slot_with_another_follow_up_pending_is_plain():
+    s = state()
+    next_step(s)
+    s.followup_slot, s.followup_text = "markets", "Which?"
+    assert store_answer(s, "roles", "yes", now=1.0) == "stored"
+    assert s.status["roles"] == "filled" and (s.followup_slot, s.followup_text) == ("markets", "Which?")
+
+
+def test_confirm_at_the_question_cap_is_filled():
+    s = state()
+    next_step(s)
+    s.asked_count = iv.MAX_INTERVIEW_QUESTIONS
+    assert store_answer(s, "roles", "Yes", now=1.0) == "stored"
+    assert s.status["roles"] == "filled" and s.facts["roles"] == "Yes"
+    assert s.followup_slot is None and s.followed_up == []
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\t "])
+def test_empty_answer_is_nothing(text):
+    s = state()
+    next_step(s)
+    before = s.to_json()
+    assert store_answer(s, "roles", text, now=1.0) == iv.EMPTY == "empty"
+    assert s.to_json() == before
+
+
+def test_turn_reply_blank_followup_and_duplicate_covers():
+    assert TurnReply.model_validate({"covers": [], "followup": "   "}).followup is None
+    assert TurnReply.model_validate({"covers": [], "followup": ""}).followup is None
+    many = ["markets"] * 10 + ["level", "markets"]
+    assert TurnReply.model_validate({"covers": many, "followup": None}).covers == ["markets", "level"]
+    assert ExtractReply.model_validate({"covers": ["roles"] * 9, "facts": {}}).covers == ["roles"]
+
+
+def test_turn_catches_any_exception_and_logs_only_the_type(caplog):
+    class Boom:
+        def complete(self, *a, **k):
+            raise RuntimeError("SECRET-ANSWER-TEXT")
+
+    llm = InterviewLLM(Boom(), Translator(Boom()))
+    with caplog.at_level("DEBUG"):
+        assert llm.turn(state(), "roles", "a long answer with SECRET words", request_id="r1") is None
+    assert "RuntimeError" in caplog.text and "SECRET" not in caplog.text
+
+    class Stop:
+        def complete(self, *a, **k):
+            raise StopRequested("stop")
+
+    with pytest.raises(StopRequested):
+        InterviewLLM(Stop(), Translator(Stop())).turn(state(), "roles", "a long answer here", request_id="r2")

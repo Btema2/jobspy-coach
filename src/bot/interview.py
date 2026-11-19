@@ -13,12 +13,13 @@ import time
 from dataclasses import dataclass
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
 
 from src.bot.chat_llm import ChatLLM, ChatLLMError
 from src.bot.cv import MAX_CV_CHARS
 from src.bot.privacy import mask_all
-from src.bot.translator import Proposal, TranslationProblem, Translator, _clean
+from src.bot.translator import Proposal, Translator, _clean
+from src.evaluator.errors import StopRequested
 from src.profile.snapshot import ProfileSnapshot
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ TOO_LONG = "too_long"
 SKIPPED = "skipped"
 PARTIAL = "partial"
 CANCEL = "cancel"  # not stored; the caller answers ``CANCEL_HINT``
+EMPTY = "empty"  # a blank answer: nothing stored, nothing changed
 
 _SKIP_WORDS = frozenset({"no", "none", "skip", "-", "n", "nope"})
 _CONFIRM_WORDS = frozenset({"yes", "y", "ok", "okay", "sure", "yep", "confirm", "apply"})
@@ -176,11 +178,18 @@ def store_answer(state: InterviewState, slot: str, text: str, *, now: Optional[f
 
     Returns ``stored`` (status ``filled``: a short answer, a long one until ``apply_turn`` says otherwise, or a
     follow-up answer), ``partial`` (a bare confirm word: a code follow-up ``Which ones?`` is pending),
-    ``skipped`` (a bare skip word), ``cancel`` (nothing stored) or ``too_long`` (the slot's facts would exceed
-    ``MAX_SLOT_FACTS_CHARS``; nothing stored). ``created_at`` is set at the first stored answer.
+    ``skipped`` (a bare skip word), ``cancel`` (nothing stored), ``empty`` (blank after stripping: nothing stored,
+    nothing changed) or ``too_long`` (the slot's facts would exceed ``MAX_SLOT_FACTS_CHARS``; nothing stored).
+    ``created_at`` is set at the first stored answer.
+
+    A confirm word becomes ``partial`` with the follow-up only for the current slot, when it has not had its
+    follow-up, no other follow-up is pending and the question cap is not reached; otherwise it is an ordinary
+    answer (``filled``, text kept).
     """
     if slot not in SLOTS:
         raise ValueError(f"unknown slot '{slot[:20]}'")
+    if not text.strip():
+        return EMPTY
     kind = classify_answer(text)
     if kind == "cancel":
         return CANCEL
@@ -197,7 +206,13 @@ def store_answer(state: InterviewState, slot: str, text: str, *, now: Optional[f
     state.facts[slot] = combined
     if state.created_at is None:
         state.created_at = float(now if now is not None else time.time())
-    if kind == "confirm" and slot not in state.followed_up:
+    if (
+        kind == "confirm"
+        and slot == state.current
+        and slot not in state.followed_up
+        and state.followup_slot is None
+        and state.asked_count < MAX_INTERVIEW_QUESTIONS
+    ):
         _set_followup(state, slot, CONFIRM_FOLLOWUP)
         return PARTIAL
     state.status[slot] = "filled"
@@ -216,38 +231,63 @@ class Step:
     text: str
 
 
-def next_step(state: InterviewState) -> Step:
-    """The next step, decided by code, recorded as asked: the pending follow-up, else the next ``empty`` slot,
-    else ``draft`` (also once ``MAX_INTERVIEW_QUESTIONS`` questions, follow-ups included, were asked)."""
+def peek_step(state: InterviewState) -> Step:
+    """The step ``next_step`` would take, without changing ``state`` (for re-rendering the current question)."""
     if state.asked_count >= MAX_INTERVIEW_QUESTIONS:
         return Step("draft", None, "")
     if state.followup_slot is not None and state.followup_text is not None:
-        step = Step("followup", state.followup_slot, state.followup_text)
-        state.followup_slot = state.followup_text = None
-        state.current = step.slot
-        state.asked_count += 1
-        return step
+        return Step("followup", state.followup_slot, state.followup_text)
     for slot in SLOTS:
         if state.status[slot] == "empty":
-            state.current = slot
-            state.asked_count += 1
             return Step("question", slot, QUESTIONS[slot])
     return Step("draft", None, "")
 
 
+def next_step(state: InterviewState) -> Step:
+    """The next step, decided by code, recorded as asked: the pending follow-up, else the next ``empty`` slot,
+    else ``draft`` (also once ``MAX_INTERVIEW_QUESTIONS`` questions, follow-ups included, were asked).
+
+    Mutating: it sets ``current``, counts the question and clears the pending follow-up. Call it exactly once
+    per step, under the state lock; re-rendering a question must use ``peek_step`` and never call this."""
+    step = peek_step(state)
+    if step.kind == "followup":
+        state.followup_slot = state.followup_text = None
+    if step.kind != "draft":
+        state.current = step.slot
+        state.asked_count += 1
+    return step
+
+
 Slot = Literal["roles", "markets", "languages", "level", "avoid", "bonus"]
+
+
+def _dedupe(value: Any) -> Any:
+    """Duplicates removed (order kept) before the length check."""
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(dict.fromkeys(value))
+    return value  # anything else is left to the schema
+
+
+def _blank_to_none(value: Any) -> Any:
+    return None if isinstance(value, str) and not value.strip() else value
+
+
+Covers = Annotated[List[Slot], BeforeValidator(_dedupe), Field(max_length=len(SLOTS))]
 _STRICT = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
 class TurnReply(BaseModel):
     model_config = _STRICT
-    covers: List[Slot] = Field(default_factory=list, max_length=len(SLOTS))
-    followup: Optional[Annotated[str, StringConstraints(min_length=1, max_length=FOLLOWUP_MAX_CHARS)]] = None
+    covers: Covers = Field(default_factory=list)
+    followup: Annotated[
+        Optional[Annotated[str, StringConstraints(min_length=1, max_length=FOLLOWUP_MAX_CHARS)]],
+        BeforeValidator(_blank_to_none),
+    ] = None
 
 
 class ExtractReply(BaseModel):
     model_config = _STRICT
-    covers: List[Slot] = Field(default_factory=list, max_length=len(SLOTS))
+    covers: Covers = Field(default_factory=list)
     facts: Dict[Slot, Annotated[str, StringConstraints(max_length=MAX_SLOT_FACTS_CHARS)]] = Field(default_factory=dict)
 
 
@@ -328,10 +368,15 @@ class InterviewLLM:
             answer_value = self._llm.complete(
                 messages, validate=TurnReply.model_validate, request_id=request_id, kind="turn"
             ).value
+        except StopRequested:
+            raise
         except ChatLLMError as exc:
             logger.warning(
                 "interview turn %s not checked: %s (%s)", request_id, type(exc).__name__, exc.failure.value
             )
+            return None
+        except Exception as exc:  # the type name only, never the text
+            logger.warning("interview turn %s not checked: %s", request_id, type(exc).__name__)
             return None
         reply: TurnReply = answer_value
         followup = _clean(reply.followup, FOLLOWUP_MAX_CHARS) if reply.followup else None
