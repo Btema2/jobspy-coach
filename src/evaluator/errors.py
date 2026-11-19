@@ -23,6 +23,14 @@ class RateLimited(TransientProviderError):
         return (type(self), (self.retry_after, self.message))
 
 
+class ProviderTimeout(TransientProviderError):
+    """An HTTP request timed out (connect, read, write or pool); a transient error with a name of its own."""
+
+
+class RateLimitWaitExceeded(RateLimited):
+    """A caller bounded its rate-limit wait (``max_wait``) and the next slot is further away than that."""
+
+
 class PermanentProviderError(EvaluatorError):
     """A provider call failed in a way retrying cannot fix (401/403/404/400/422)."""
 

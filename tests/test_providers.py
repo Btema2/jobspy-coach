@@ -14,13 +14,16 @@ from src.evaluator.errors import (
     PermanentProviderError,
     QuotaExhausted,
     RateLimited,
+    ProviderTimeout,
     ResponseTruncated,
     StopRequested,
     TransientProviderError,
     UnexpectedStatus,
 )
 from src.evaluator.providers import (
+    CompletionOptions,
     CompletionResult,
+    JsonCompletion,
     NvidiaNimProvider,
     OpenRouterProvider,
     strip_think,
@@ -570,3 +573,193 @@ def test_openrouter_daily_counter_is_thread_safe():
     assert outcomes.count("ok") == budget
     assert outcomes.count("quota") == threads_n - budget
     assert len(seen) == budget
+
+
+# ---------- complete_json (chat path) ----------
+
+MESSAGES = [
+    {"role": "system", "content": "SYS"},
+    {"role": "user", "content": "USER"},
+    {"role": "assistant", "content": "EARLIER"},
+    {"role": "user", "content": "AGAIN"},
+]
+
+
+def options(**kw):
+    args = dict(timeout=120.0)
+    args.update(kw)
+    return CompletionOptions(**args)
+
+
+def test_evaluation_bodies_unchanged_by_refactor():
+    h = Harness(ok(), ok())
+    h.nim(temperature=0.6, max_tokens=4096, reasoning_effort="low").complete("SYS", "USER")
+    assert h.body() == {
+        "model": "nim/model",
+        "messages": [{"role": "system", "content": "SYS"}, {"role": "user", "content": "USER"}],
+        "temperature": 0.6,
+        "max_tokens": 4096,
+        "reasoning_effort": "low",
+    }
+    h.openrouter(temperature=0.3, max_tokens=2048).complete("SYS", "USER")
+    assert h.body() == {
+        "models": ["or/a:free", "or/b:free"],
+        "messages": [{"role": "system", "content": "SYS"}, {"role": "user", "content": "USER"}],
+        "temperature": 0.3,
+        "max_tokens": 2048,
+        "response_format": {"type": "json_object"},
+        "provider": {"require_parameters": True},
+    }
+    assert list(h.body()) == ["models", "messages", "temperature", "max_tokens", "response_format", "provider"]
+
+
+def test_evaluation_path_calls_limiter_acquire_without_arguments():
+    h = Harness(ok())
+    h.nim().complete("s", "u")  # FakeLimiter.acquire() takes no arguments
+    assert h.limiter.acquires == 1
+
+
+def test_complete_json_nim_body_has_messages_and_no_response_format():
+    h = Harness(ok('{"a": 1}'))
+    provider = h.nim(temperature=0.6, max_tokens=4096, reasoning_effort="low")
+    provider.complete_json(MESSAGES, options(max_tokens=8192))
+    body = h.body()
+    assert body["messages"] == MESSAGES
+    assert "response_format" not in body
+    assert "thinking_token_budget" not in body
+    assert body["temperature"] == 0.6
+    assert body["reasoning_effort"] == "low"
+    assert body["max_tokens"] == 8192
+
+
+def test_complete_json_max_tokens_defaults_to_provider_value():
+    h = Harness(ok('{"a": 1}'))
+    h.nim(max_tokens=4096).complete_json(MESSAGES, options())
+    assert h.body()["max_tokens"] == 4096
+
+
+def test_complete_json_one_attempt_on_5xx():
+    h = Harness(httpx.Response(503), ok('{"a": 1}'))
+    with pytest.raises(TransientProviderError):
+        h.nim().complete_json(MESSAGES, options())
+    assert len(h.requests) == 1
+    assert h.waits == []
+
+
+def test_complete_json_max_attempts_is_honoured():
+    h = Harness(httpx.Response(503), ok('{"a": 1}'))
+    assert h.nim().complete_json(MESSAGES, options(max_attempts=2)).data == {"a": 1}
+    assert len(h.requests) == 2
+    h = Harness(httpx.Response(503), httpx.Response(503), ok('{"a": 1}'))
+    with pytest.raises(TransientProviderError):
+        h.nim().complete_json(MESSAGES, options(max_attempts=2))
+    assert len(h.requests) == 2
+
+
+def test_complete_json_timeout_is_provider_timeout():
+    h = Harness(httpx.ReadTimeout("slow"))
+    with pytest.raises(ProviderTimeout) as exc_info:
+        h.nim().complete_json(MESSAGES, options(timeout=120.0))
+    assert isinstance(exc_info.value, TransientProviderError)
+    assert len(h.requests) == 1
+    assert h.requests[0].extensions["timeout"]["read"] == 120.0
+    assert h.requests[0].extensions["timeout"]["connect"] == 10.0
+
+
+def test_evaluation_timeout_is_also_provider_timeout_and_still_transient():
+    h = Harness(httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow"))
+    with pytest.raises(ProviderTimeout):
+        h.nim().complete("s", "u")
+    assert len(h.requests) == 3
+
+
+class KwargLimiter(FakeLimiter):
+    """A limiter double that also takes the chat path's keyword arguments."""
+
+    def acquire(self, priority=False, stop_event=None, max_wait=None):
+        return super().acquire()
+
+
+def test_complete_json_uses_per_call_stop_event():
+    h = Harness(ok('{"a": 1}'), ok('{"a": 1}'))
+    h.limiter = KwargLimiter()
+    h.stop_event.set()  # the batch/provider event
+    provider = h.nim()
+    result = provider.complete_json(MESSAGES, options(stop_event=threading.Event()))
+    assert result.data == {"a": 1}
+    own = threading.Event()
+    own.set()
+    with pytest.raises(StopRequested):
+        provider.complete_json(MESSAGES, options(stop_event=own))
+    assert len(h.requests) == 1
+
+
+def test_complete_json_passes_priority_stop_event_and_max_wait_to_limiter():
+    calls = []
+
+    class RecordingLimiter(KwargLimiter):
+        def acquire(self, priority=False, stop_event=None, max_wait=None):
+            calls.append((priority, stop_event, max_wait))
+            return 0.0
+
+    h = Harness(ok('{"a": 1}'))
+    h.limiter = RecordingLimiter()
+    event = threading.Event()
+    h.nim().complete_json(MESSAGES, options(stop_event=event, priority=True, limiter_max_wait=30.0))
+    assert calls == [(True, event, 30.0)]
+
+
+def test_complete_json_429_still_pauses_the_shared_limiter():
+    h = Harness(httpx.Response(429, headers={"Retry-After": "7"}))
+    with pytest.raises(RateLimited):
+        h.nim().complete_json(MESSAGES, options())
+    assert h.limiter.pauses == [7.0]
+
+
+def test_complete_json_returns_dict_and_rejects_non_object():
+    h = Harness(ok('{"a": 1}', model="the/model"), ok("[1]"), ok("SECRET prose answer"))
+    provider = h.nim()
+    result = provider.complete_json(MESSAGES, options())
+    assert isinstance(result, JsonCompletion)
+    assert result.data == {"a": 1}
+    assert result.model_used == "the/model"
+    assert result.latency >= 0
+    with pytest.raises(InvalidResponse):
+        provider.complete_json(MESSAGES, options())
+    with pytest.raises(InvalidResponse) as exc_info:
+        provider.complete_json(MESSAGES, options())
+    assert "SECRET" not in str(exc_info.value)
+    assert "prose" not in str(exc_info.value)
+
+
+def test_complete_json_rejects_unknown_roles():
+    h = Harness(ok('{"a": 1}'))
+    with pytest.raises(ValueError):
+        h.nim().complete_json([{"role": "tool", "content": "x"}], options())
+    assert h.requests == []
+
+
+def test_complete_json_never_touches_breaker():
+    h = Harness(ok('{"a": 1}'), httpx.Response(503), httpx.Response(401))
+    provider = h.nim()
+    before = (provider.breaker.state, provider.breaker._failures)
+    provider.complete_json(MESSAGES, options())
+    with pytest.raises(TransientProviderError):
+        provider.complete_json(MESSAGES, options())
+    with pytest.raises(AuthenticationFailed):
+        provider.complete_json(MESSAGES, options())
+    assert (provider.breaker.state, provider.breaker._failures) == before
+
+
+def test_openrouter_complete_json_counts_daily_budget():
+    clock = Clock(utc(2026, 11, 5))
+    h = Harness(ok('{"a": 1}'), ok('{"a": 1}'), ok('{"a": 1}'))
+    provider = h.openrouter(daily_budget=2, now_fn=clock)
+    provider.complete_json(MESSAGES, options())
+    provider.complete_json(MESSAGES, options())
+    assert provider.is_available() is False
+    with pytest.raises(QuotaExhausted) as exc_info:
+        provider.complete_json(MESSAGES, options())
+    assert len(h.requests) == 2
+    assert exc_info.value.reset_at == utc(2026, 11, 6, 0, 0).timestamp()
+    assert h.body(0)["response_format"] == {"type": "json_object"}

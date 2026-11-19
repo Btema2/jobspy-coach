@@ -33,6 +33,7 @@ from src.evaluator.errors import (
     BadRequest,
     InvalidResponse,
     ModelNotFound,
+    ProviderTimeout,
     QuotaExhausted,
     RateLimited,
     ResponseTruncated,
@@ -40,6 +41,7 @@ from src.evaluator.errors import (
     TransientProviderError,
     UnexpectedStatus,
 )
+from src.evaluator.parsing import extract_json_payload
 from src.evaluator.rate_limiter import SlidingWindowRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,28 @@ class CompletionResult:
     model_used: str
     latency: float
     finish_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CompletionOptions:
+    """Per-call settings of ``complete_json`` (the chat path): one bounded request, its own stop event."""
+
+    timeout: float
+    max_attempts: int = 1
+    stop_event: Optional[threading.Event] = None
+    priority: bool = False
+    max_tokens: Optional[int] = None
+    limiter_max_wait: Optional[float] = None
+
+
+@dataclass
+class JsonCompletion:
+    data: Dict[str, Any]
+    model_used: str
+    latency: float
+
+
+_CHAT_ROLES = frozenset({"system", "user", "assistant"})
 
 
 def _parse_retry_after(value: Optional[str], now: Callable[[], float]) -> Optional[float]:
@@ -146,6 +170,7 @@ class OpenAICompatibleProvider:
             rpm_limit, 60.0, stop_event=self.stop_event
         )
         self.breaker = breaker if breaker is not None else CircuitBreaker()
+        self._wait_fn = wait_fn
         self._wait = wait_fn if wait_fn is not None else (lambda seconds: self.stop_event.wait(seconds))
         self._rand = rand_fn
         self._time = time_fn
@@ -158,8 +183,13 @@ class OpenAICompatibleProvider:
 
     # ----- hooks for subclasses -----
 
-    def _build_body(self, system: str, user: str, max_tokens: int) -> Dict[str, Any]:
+    def _build_messages_body(self, messages: Sequence[Dict[str, str]], max_tokens: int) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def _build_body(self, system: str, user: str, max_tokens: int) -> Dict[str, Any]:
+        return self._build_messages_body(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens
+        )
 
     def _extra_headers(self) -> Dict[str, str]:
         return {}
@@ -188,38 +218,88 @@ class OpenAICompatibleProvider:
     def _jittered(self, seconds: float) -> float:
         return seconds * (1.0 + JITTER_FRACTION * self._rand())
 
-    def _check_stop(self) -> None:
-        if self.stop_event.is_set():
+    def _check_stop(self, stop_event: Optional[threading.Event] = None) -> None:
+        event = stop_event if stop_event is not None else self.stop_event
+        if event.is_set():
             raise StopRequested(f"stop requested ({self.name})")
 
-    def _sleep(self, seconds: float) -> None:
-        self._wait(seconds)
-        self._check_stop()
+    def _sleep(self, seconds: float, stop_event: Optional[threading.Event] = None) -> None:
+        if stop_event is not None and self._wait_fn is None:
+            stop_event.wait(seconds)
+        else:
+            self._wait(seconds)
+        self._check_stop(stop_event)
 
-    def complete(self, system: str, user: str, max_tokens: Optional[int] = None) -> CompletionResult:
+    def _check_budget(self) -> None:
+        """Raise ``QuotaExhausted`` before any request when the provider is disabled (hook, see OpenRouter)."""
         if not self.is_available():
             raise QuotaExhausted(message=f"{self.name} unavailable (quota)")
+
+    def complete(self, system: str, user: str, max_tokens: Optional[int] = None) -> CompletionResult:
+        self._check_budget()
         body = self._build_body(system, user, max_tokens or self.max_tokens)
         started, response = self._post_with_retries(body)
         return self._parse(response, self._time() - started)
 
-    def _post_with_retries(self, body: Dict[str, Any]):
+    def complete_json(self, messages: Sequence[Dict[str, str]], options: CompletionOptions) -> JsonCompletion:
+        """One chat-style call that must answer a JSON object (the chat path; never touches ``breaker``)."""
+        for message in messages:
+            if message.get("role") not in _CHAT_ROLES or not isinstance(message.get("content"), str):
+                raise ValueError("messages need a system, user or assistant role and text content")
+        self._check_budget()
+        body = self._build_messages_body(messages, options.max_tokens or self.max_tokens)
+        started, response = self._post_with_retries(
+            body,
+            max_attempts=options.max_attempts,
+            stop_event=options.stop_event,
+            timeout=options.timeout,
+            priority=options.priority,
+            limiter_max_wait=options.limiter_max_wait,
+        )
+        latency = self._time() - started
+        result = self._parse(response, latency)
+        try:
+            data = extract_json_payload(result.content)
+        except ValueError:
+            raise InvalidResponse(f"{self.name}: reply is not JSON ({len(result.content)} chars)") from None
+        if not isinstance(data, dict):
+            raise InvalidResponse(f"{self.name}: reply is not a JSON object ({len(result.content)} chars)")
+        return JsonCompletion(data=data, model_used=result.model_used, latency=latency)
+
+    def _post_with_retries(
+        self,
+        body: Dict[str, Any],
+        *,
+        max_attempts: int = MAX_HTTP_ATTEMPTS,
+        stop_event: Optional[threading.Event] = None,
+        timeout: Optional[float] = None,
+        priority: bool = False,
+        limiter_max_wait: Optional[float] = None,
+    ):
         url = f"{self.base_url}/chat/completions"
+        chat_path = priority or stop_event is not None or limiter_max_wait is not None
+        request_timeout = (
+            httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=30.0) if timeout is not None else httpx.USE_CLIENT_DEFAULT
+        )
         slept = 0.0
         attempt = 0
         while True:
             attempt += 1
-            self._check_stop()
-            self.limiter.acquire()  # wraps EVERY HTTP attempt, retries included
+            self._check_stop(stop_event)
+            if chat_path:
+                self.limiter.acquire(priority=priority, stop_event=stop_event, max_wait=limiter_max_wait)
+            else:
+                self.limiter.acquire()  # wraps EVERY HTTP attempt, retries included
             self._reserve_request()
             started = self._time()
             error: TransientProviderError
             delay: float
             try:
-                response = self._client.post(url, json=body, headers=self._headers())
+                response = self._client.post(url, json=body, headers=self._headers(), timeout=request_timeout)
             except httpx.TransportError as exc:
-                logger.warning("%s transport error (%s) on attempt %d/%d", self.name, type(exc).__name__, attempt, MAX_HTTP_ATTEMPTS)
-                error = TransientProviderError(f"{self.name}: {type(exc).__name__}")
+                logger.warning("%s transport error (%s) on attempt %d/%d", self.name, type(exc).__name__, attempt, max_attempts)
+                error_type = ProviderTimeout if isinstance(exc, httpx.TimeoutException) else TransientProviderError
+                error = error_type(f"{self.name}: {type(exc).__name__}")
                 delay = self._jittered(TRANSIENT_BACKOFF_BASE_SECONDS * 3 ** (attempt - 1))
             else:
                 status = response.status_code
@@ -234,10 +314,10 @@ class OpenAICompatibleProvider:
                         delay = self._jittered(RATE_LIMIT_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
                     # All workers must back off, whether or not this call retries.
                     self.limiter.pause_for(delay)
-                    logger.warning("%s HTTP 429 on attempt %d/%d (retry-after=%s)", self.name, attempt, MAX_HTTP_ATTEMPTS, retry_after)
+                    logger.warning("%s HTTP 429 on attempt %d/%d (retry-after=%s)", self.name, attempt, max_attempts, retry_after)
                     error = RateLimited(retry_after, f"{self.name}: HTTP 429")
                 elif status >= 500 or status == 408:
-                    logger.warning("%s HTTP %d on attempt %d/%d", self.name, status, attempt, MAX_HTTP_ATTEMPTS)
+                    logger.warning("%s HTTP %d on attempt %d/%d", self.name, status, attempt, max_attempts)
                     error = TransientProviderError(f"{self.name}: HTTP {status}")
                     delay = self._jittered(TRANSIENT_BACKOFF_BASE_SECONDS * 3 ** (attempt - 1))
                 elif status in (401, 403):
@@ -254,9 +334,9 @@ class OpenAICompatibleProvider:
                     logger.warning("%s answered with unexpected HTTP %d", self.name, status)
                     raise UnexpectedStatus(f"{self.name}: unexpected HTTP {status}")
 
-            if attempt >= MAX_HTTP_ATTEMPTS or slept + delay > MAX_CUMULATIVE_SLEEP_SECONDS:
+            if attempt >= max_attempts or slept + delay > MAX_CUMULATIVE_SLEEP_SECONDS:
                 raise error
-            self._sleep(delay)
+            self._sleep(delay, stop_event)
             slept += delay
 
     def _parse(self, response: httpx.Response, latency: float) -> CompletionResult:
@@ -301,13 +381,10 @@ class NvidiaNimProvider(OpenAICompatibleProvider):
         super().__init__(**kwargs)
         self.reasoning_effort = reasoning_effort
 
-    def _build_body(self, system: str, user: str, max_tokens: int) -> Dict[str, Any]:
+    def _build_messages_body(self, messages: Sequence[Dict[str, str]], max_tokens: int) -> Dict[str, Any]:
         return {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
             "temperature": self.temperature,
             "max_tokens": max_tokens,
             "reasoning_effort": self.reasoning_effort,
@@ -377,12 +454,11 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 raise QuotaExhausted(self._reset_at(), "openrouter daily budget spent")
             self._used += 1
 
-    def complete(self, system: str, user: str, max_tokens: Optional[int] = None) -> CompletionResult:
+    def _check_budget(self) -> None:
         with self._quota_lock:
             self._roll_day()
             if self._now() < self._disabled_until or self._used >= self.daily_budget:
                 raise QuotaExhausted(self._reset_at(), "openrouter daily budget spent")
-        return super().complete(system, user, max_tokens)
 
     def _check_429(self, response: httpx.Response) -> None:
         try:
@@ -403,13 +479,10 @@ class OpenRouterProvider(OpenAICompatibleProvider):
     def _extra_headers(self) -> Dict[str, str]:
         return {"HTTP-Referer": "https://github.com/jobspy-coach", "X-Title": "JobSpy Coach Evaluator"}
 
-    def _build_body(self, system: str, user: str, max_tokens: int) -> Dict[str, Any]:
+    def _build_messages_body(self, messages: Sequence[Dict[str, str]], max_tokens: int) -> Dict[str, Any]:
         return {
             "models": list(self.models),
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
             "temperature": self.temperature,
             "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
