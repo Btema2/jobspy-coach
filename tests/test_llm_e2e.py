@@ -262,6 +262,10 @@ def test_e2e_injection_and_logs(tmp_path, caplog, quiet_httpx):
         assert wait_for(lambda: conv.NOT_UNDERSTOOD_REPLY in h.telegram.texts())
         assert len(nim.bodies) == 1 and len(openrouter.bodies) == 1
         assert not any(b.startswith("pc:") for c in h.telegram.sent() for b in buttons(c))
+        # the pasted closing tag reached the model neutralised: one real data block, no second closer
+        user_content = nim.bodies[0]["messages"][-1]["content"]
+        assert user_content.count("</user_message>") == 1 and user_content.rstrip().endswith("</user_message>")
+        assert "[/user_message]" in user_content
     finally:
         h.finish()
 
@@ -271,3 +275,33 @@ def test_e2e_injection_and_logs(tmp_path, caplog, quiet_httpx):
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     for secret in (TOKEN, "E2E-TOKEN", SYN, MARKER, "TELEGRAM_CHAT_ID", "unrestricted", "set_env"):
         assert secret not in log_text
+
+
+def test_e2e_clarification_round(tmp_path, quiet_httpx):
+    """A question, the user's answer sent with the earlier context, then a proposal that is confirmed."""
+    clarify = json.dumps({"kind": "clarify", "question": "Which country should I search in?"})
+    nim = ScriptedLLM(nim_reply(clarify), nim_reply(proposal_answer()))
+    h = Harness(tmp_path, nim, ScriptedLLM(), consent=True)
+    base_version = h.version()
+    h.start()
+    try:
+        h.telegram.fake.queue_updates([message_update(1, "add a role for <ROLE>")])
+        assert wait_for(lambda: any(t.startswith(conv.QUESTION_PREFIX) for t in h.telegram.texts()))
+        assert h.table("SELECT state FROM conversation") == [("awaiting_clarification",)]
+        assert h.table("SELECT COUNT(*) FROM conversation WHERE context IS NOT NULL") == [(1,)]
+
+        h.telegram.fake.queue_updates([message_update(2, "<MARKET>")])
+        assert wait_for(lambda: any(b.startswith("pc:") for c in h.telegram.sent() for b in buttons(c)))
+        second = json.dumps(nim.bodies[1])
+        assert "Which country should I search in?" in second and "&lt;MARKET&gt;" not in second and "<MARKET>" in second
+        assert "add a role for <ROLE>" in second  # the earlier message travels with the answer
+        assert h.version() == base_version
+
+        proposal = next(c for c in h.telegram.sent() if any(b.startswith("pc:") for b in buttons(c)))
+        accept = next(b for b in buttons(proposal) if b.endswith(":a"))
+        h.telegram.fake.queue_updates([callback_update(3, accept)])
+        assert wait_for(lambda: h.version() == base_version + 1)
+    finally:
+        h.finish()
+    assert h.table("SELECT COUNT(*) FROM conversation WHERE context IS NOT NULL") == [(0,)]
+    assert h.table("SELECT COUNT(*) FROM pending_change") == [(0,)]
