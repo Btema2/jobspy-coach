@@ -284,20 +284,24 @@ def test_priority_acquire_beats_saturated_batch():
         with order_lock:
             order.append(("priority" if priority else "batch", stamp))
 
-    batch = threading.Thread(target=run, args=(False,), name="batch")
+    batch = threading.Thread(target=run, args=(False,), name="batch", daemon=True)
     batch.start()
     gates.wait_until_waiting("batch")
-    chat = threading.Thread(target=run, args=(True,), name="chat")
+    chat = threading.Thread(target=run, args=(True,), name="chat", daemon=True)
     chat.start()
     gates.wait_until_waiting("chat")
     assert limiter.priority_waiters == 1
 
     clock.now = 1010.1  # the oldest stamp has aged out: exactly one slot is free
-    gates.release("chat")
+    gates.release("batch")  # the batch caller wakes first, while the priority caller is still registered
+    gates.wait_until_waiting("batch", count=2)
+    assert gates.waits["batch"][1] >= PRIORITY_YIELD_SECONDS  # it yielded instead of taking the free slot
+    assert order == []
+    assert limiter.priority_waiters == 1
+
+    gates.release("chat")  # the priority caller takes the free slot
     chat.join(timeout=5)
     assert not chat.is_alive()
-    gates.release("batch")  # wakes, sees the full window again (or yields) and waits once more
-    gates.wait_until_waiting("batch", count=2)
     assert [name for name, _ in order] == ["priority"]
 
     clock.now = 1015.2  # the second stamp ages out: the following slot goes to the batch caller
