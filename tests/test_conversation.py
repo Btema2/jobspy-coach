@@ -1334,6 +1334,7 @@ def _interview_row(conv_store, clock, *, created_at, updated_at):
 def test_purge_counts_interview_from_created_at(svc, db, clock, telegram, conv_store):
     start_interview(svc, clock, telegram)
     t0 = clock.value
+    clock.value = t0 + conv.CONTEXT_TTL_SECONDS + 1  # free text after the purge
     # the first answer was stored at t0; the row was rewritten an hour before the sweep
     _interview_row(conv_store, clock, created_at=t0, updated_at=t0 + conv.CONTEXT_TTL_SECONDS - 3600)
     svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS - 60)
@@ -1342,6 +1343,18 @@ def test_purge_counts_interview_from_created_at(svc, db, clock, telegram, conv_s
     state = conv_store.get_state(111)
     assert state.state == "idle" and state.context is None
     assert 111 not in svc._interview
+    _free_text_reaches_translator(svc, clock)
+
+
+def _free_text_reaches_translator(svc, clock) -> None:
+    """After the purge the chat is out of the interview: free text is a normal request again."""
+    assert svc.on_text(text_update("add a role")) == []
+    buffer = svc._buffers[-1]
+    assert buffer.interview is False and buffer.closed is False
+    clock.value += conv.DEBOUNCE_SECONDS
+    calls = len(svc._translator.calls)
+    assert svc.process_next(clock.value) is True
+    assert len(svc._translator.calls) == calls + 1 and svc._translator.calls[-1]["mode"] == "chat"
 
 
 def test_purge_counts_from_updated_at_while_created_at_is_null(svc, db, clock, telegram, conv_store):
@@ -1350,5 +1363,37 @@ def test_purge_counts_from_updated_at_while_created_at_is_null(svc, db, clock, t
     _interview_row(conv_store, clock, created_at=None, updated_at=t0)
     svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS - 60)
     assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
-    svc.sweep(t0 + conv.CONTEXT_TTL_SECONDS + 1)
+    assert 111 in svc._interview
+    clock.value = t0 + conv.CONTEXT_TTL_SECONDS + 1
+    svc.sweep(clock.value)  # the SQL purge (updated_at rule) idles the row first
     assert conv_store.get_state(111).state == "idle"
+    assert 111 not in svc._interview
+    _free_text_reaches_translator(svc, clock)
+
+
+def test_sweep_drops_mirror_entry_whose_row_has_another_nonce(svc, clock, telegram, conv_store):
+    start_interview(svc, clock, telegram)
+    state = conv_store.get_state(111)
+    context = dict(state.context, nonce="0000ffff")
+    conv_store.set_state(111, conv.STATE_INTERVIEW, context, clock.value)
+    svc.sweep(clock.value)
+    assert 111 not in svc._interview
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW  # the row itself is not touched
+
+
+def test_onboarding_proposal_apply_labels_and_paused_note(svc, clock, conv_store, store, telegram):
+    """A proposal stored with mode ``onboarding`` (the interview draft) is applied as ``llm onboarding``;
+    a paused profile gets the note to /resume."""
+    apply_changes(store, [SetField("paused", True)], label="pause")
+    operations = json.dumps([add_role("<ROLE2>")])
+    conv_store.put_pending(
+        conv.PendingChange(111, "abcd0002", version(store), "onboarding", operations, None, clock.value)
+    )
+    conv_store.set_state(111, "awaiting_confirm", None, clock.value)
+    before = version(store)
+    reply = texts(svc.on_callback(callback(f"pc:abcd0002:{before}:a")))
+    assert version(store) == before + 1
+    assert store.list_versions()[0].label == "llm onboarding"
+    assert conv.PAUSED_NOTE in reply
+    assert [r.name for r in store.read_snapshot().roles if r.name == "<ROLE2>"] == ["<ROLE2>"]
+    assert conv_store.get_pending(111) is None and conv_store.get_state(111).state == "idle"

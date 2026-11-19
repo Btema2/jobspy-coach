@@ -753,6 +753,7 @@ class ConversationService:
             self._send(taken.chat_id, _reply(EXPIRED_REPLY))
         self._wconv.purge_contexts(now - CONTEXT_TTL_SECONDS)
         self._purge_old_contexts(now)
+        self._prune_mirror()
         with self._cond:
             held = self._held
             if held is not None and now - held.created > CONTEXT_TTL_SECONDS:
@@ -768,6 +769,25 @@ class ConversationService:
             self._clear_buttons(held.chat_id, held.message_id)
         if retry is not None and retry.message_id is not None:
             self._clear_buttons(retry.chat_id, retry.message_id)
+
+    def _prune_mirror(self) -> None:
+        """Drop every mirror entry whose row is no longer that interview (purged by either purge, or replaced),
+        so the poller stops treating the chat's free text as interview answers. ``_state_lock`` then ``_cond``,
+        nothing sent under them."""
+        with self._cond:
+            entries = dict(self._interview)
+        if not entries:
+            return
+        with self._state_lock:
+            for chat_id, (nonce, _slot) in entries.items():
+                state = self._wconv.get_state(chat_id)
+                row_nonce = state.context.get("nonce") if isinstance(state.context, dict) else None
+                if state.state == STATE_INTERVIEW and row_nonce == nonce:
+                    continue
+                with self._cond:
+                    entry = self._interview.get(chat_id)
+                    if entry is not None and entry[0] == nonce:
+                        del self._interview[chat_id]
 
     @staticmethod
     def _context_expired(state: ConversationState, now: float) -> bool:
