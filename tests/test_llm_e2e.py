@@ -167,7 +167,7 @@ def proposal_answer() -> str:
 
 
 def test_free_text_change_end_to_end(tmp_path, quiet_httpx):
-    nim = ScriptedLLM(TIMEOUT)
+    nim = ScriptedLLM(TIMEOUT, TIMEOUT)
     openrouter = ScriptedLLM(nim_reply(proposal_answer()))
     h = Harness(tmp_path, nim, openrouter, consent=False)
     base_version = h.version()
@@ -189,7 +189,7 @@ def test_free_text_change_end_to_end(tmp_path, quiet_httpx):
         assert h.version() == base_version  # nothing applied yet
 
         # the model saw the masked text only; NIM's body has no response_format
-        assert len(nim.bodies) == 1 and len(openrouter.bodies) == 1
+        assert len(nim.bodies) == 2 and len(openrouter.bodies) == 1
         for body in (nim.bodies[0], openrouter.bodies[0]):
             sent_text = json.dumps(body)
             assert "[email]" in sent_text

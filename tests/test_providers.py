@@ -16,8 +16,10 @@ from src.evaluator.errors import (
     RateLimited,
     ProviderTimeout,
     ResponseTruncated,
+    ServerError,
     StopRequested,
     TransientProviderError,
+    UpstreamErrorEnvelope,
     UnexpectedStatus,
 )
 from src.evaluator.providers import (
@@ -763,3 +765,39 @@ def test_openrouter_complete_json_counts_daily_budget():
     assert len(h.requests) == 2
     assert exc_info.value.reset_at == utc(2026, 11, 6, 0, 0).timestamp()
     assert h.body(0)["response_format"] == {"type": "json_object"}
+
+
+# ---------- typed transient errors (chat retry rules) ----------
+
+@pytest.mark.parametrize("status", [500, 502, 503, 408])
+def test_5xx_raises_server_error(status):
+    h = Harness(httpx.Response(status), ok('{"a": 1}'))
+    with pytest.raises(ServerError) as exc_info:
+        h.nim().complete_json(MESSAGES, options(max_attempts=1))
+    assert exc_info.value.status == status
+    assert isinstance(exc_info.value, TransientProviderError)
+    assert not isinstance(exc_info.value, RateLimited)
+    assert len(h.requests) == 1
+    assert h.waits == []
+
+
+def test_http200_error_body_raises_upstream_envelope():
+    envelope = httpx.Response(200, json={"error": {"code": 502, "message": "Provider returned error"}})
+    h = Harness(envelope, ok('{"a": 1}'))
+    with pytest.raises(UpstreamErrorEnvelope) as exc_info:
+        h.openrouter().complete_json(MESSAGES, options(max_attempts=1))
+    assert exc_info.value.status == 200
+    assert isinstance(exc_info.value, TransientProviderError)
+    assert not isinstance(exc_info.value, ServerError)
+    assert len(h.requests) == 1
+
+
+def test_rate_limited_carries_status_429_and_survives_pickling():
+    import pickle
+
+    h = Harness(httpx.Response(429, headers={"Retry-After": "7"}))
+    with pytest.raises(RateLimited) as exc_info:
+        h.nim().complete_json(MESSAGES, options(max_attempts=1))
+    assert (exc_info.value.status, exc_info.value.retry_after) == (429, 7.0)
+    clone = pickle.loads(pickle.dumps(exc_info.value))
+    assert (clone.status, clone.retry_after) == (429, 7.0)

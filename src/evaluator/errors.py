@@ -12,15 +12,43 @@ class TransientProviderError(EvaluatorError):
 
 
 class RateLimited(TransientProviderError):
-    """The provider answered HTTP 429. ``retry_after`` is seconds, or None if no header."""
+    """The provider answered HTTP 429. ``retry_after`` is seconds, or None if no header.
 
-    def __init__(self, retry_after: Optional[float] = None, message: str = "rate limited"):
+    ``status`` is the HTTP status (429), for logs instead of ``str(exc)``.
+    """
+
+    def __init__(self, retry_after: Optional[float] = None, message: str = "rate limited", status: Optional[int] = 429):
         super().__init__(message)
         self.retry_after = retry_after
         self.message = message
+        self.status = status
 
     def __reduce__(self):
-        return (type(self), (self.retry_after, self.message))
+        return (type(self), (self.retry_after, self.message, self.status))
+
+
+class ServerError(TransientProviderError):
+    """HTTP 5xx or 408 from the provider."""
+
+    def __init__(self, message: str = "server error", status: Optional[int] = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+    def __reduce__(self):
+        return (type(self), (self.message, self.status))
+
+
+class UpstreamErrorEnvelope(TransientProviderError):
+    """HTTP 200 whose body is an upstream error envelope instead of a completion (seen on OpenRouter)."""
+
+    def __init__(self, message: str = "upstream error in HTTP 200 body", status: Optional[int] = 200):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+    def __reduce__(self):
+        return (type(self), (self.message, self.status))
 
 
 class ProviderTimeout(TransientProviderError):
@@ -29,6 +57,9 @@ class ProviderTimeout(TransientProviderError):
 
 class RateLimitWaitExceeded(RateLimited):
     """A caller bounded its rate-limit wait (``max_wait``) and the next slot is further away than that."""
+
+    def __init__(self, retry_after: Optional[float] = None, message: str = "rate limited", status: Optional[int] = None):
+        super().__init__(retry_after, message, status)  # no HTTP request was made: no status
 
 
 class PermanentProviderError(EvaluatorError):

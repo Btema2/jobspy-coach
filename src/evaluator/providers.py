@@ -37,8 +37,10 @@ from src.evaluator.errors import (
     QuotaExhausted,
     RateLimited,
     ResponseTruncated,
+    ServerError,
     StopRequested,
     TransientProviderError,
+    UpstreamErrorEnvelope,
     UnexpectedStatus,
 )
 from src.evaluator.parsing import extract_json_payload
@@ -315,10 +317,10 @@ class OpenAICompatibleProvider:
                     # All workers must back off, whether or not this call retries.
                     self.limiter.pause_for(delay)
                     logger.warning("%s HTTP 429 on attempt %d/%d (retry-after=%s)", self.name, attempt, max_attempts, retry_after)
-                    error = RateLimited(retry_after, f"{self.name}: HTTP 429")
+                    error = RateLimited(retry_after, f"{self.name}: HTTP 429", 429)
                 elif status >= 500 or status == 408:
                     logger.warning("%s HTTP %d on attempt %d/%d", self.name, status, attempt, max_attempts)
-                    error = TransientProviderError(f"{self.name}: HTTP {status}")
+                    error = ServerError(f"{self.name}: HTTP {status}", status)
                     delay = self._jittered(TRANSIENT_BACKOFF_BASE_SECONDS * 3 ** (attempt - 1))
                 elif status in (401, 403):
                     logger.error("%s rejected the API key (HTTP %d); check the configured key", self.name, status)
@@ -350,7 +352,7 @@ class OpenAICompatibleProvider:
         if not choices:
             if data.get("error"):
                 # HTTP 200 carrying an upstream error envelope (seen on OpenRouter).
-                raise TransientProviderError(f"{self.name}: upstream error in HTTP 200 body")
+                raise UpstreamErrorEnvelope(f"{self.name}: upstream error in HTTP 200 body", 200)
             raise InvalidResponse(f"{self.name}: response has no choices")
         if not isinstance(choices, list):
             raise InvalidResponse(f"{self.name}: unexpected shape of choices")
