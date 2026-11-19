@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from src.bot import conversation_store
 from src.bot.conversation_store import STATES, ConversationState, ConversationStore, PendingChange
 from src.storage.db import Database
 
@@ -132,3 +133,88 @@ def test_connections_enable_secure_delete(store, monkeypatch):
     assert any("secure_delete" in s.lower() for s in seen)
     first_write = next(i for i, s in enumerate(seen) if s.lstrip().upper().startswith(("INSERT", "DELETE")))
     assert any("secure_delete" in s.lower() for s in seen[:first_write])
+
+
+@pytest.fixture(params=["returning", "fallback"])
+def either_store(request, tmp_path, monkeypatch) -> ConversationStore:
+    """The store with ``DELETE ... RETURNING`` and with the SQLite < 3.35 fallback forced."""
+    if request.param == "fallback":
+        monkeypatch.setattr(conversation_store, "_HAS_RETURNING", False)
+    db = Database(tmp_path / "either.db")
+    db.init_db()
+    return ConversationStore(db)
+
+
+def test_take_and_delete_work_with_and_without_returning(either_store):
+    store = either_store
+    store.put_pending(pending("aaaa1111"))
+    assert store.take_pending(CHAT, "wrong000") is None
+    assert store.get_pending(CHAT) is not None
+    assert store.take_pending(CHAT, "aaaa1111") == pending("aaaa1111")
+    assert store.take_pending(CHAT, "aaaa1111") is None
+    store.put_pending(pending("bbbb2222"))
+    assert store.delete_pending(CHAT) == pending("bbbb2222")
+    assert store.delete_pending(CHAT) is None
+
+
+def test_fallback_take_is_atomic_across_threads(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(conversation_store, "_HAS_RETURNING", False)
+    db = Database(tmp_path / "race.db")
+    db.init_db()
+    stores = [ConversationStore(Database(db.db_path)) for _ in range(6)]
+    stores[0].put_pending(pending("aaaa1111"))
+    results = []
+    barrier = threading.Barrier(len(stores))
+
+    def run(store):
+        barrier.wait(timeout=5)
+        results.append(store.take_pending(CHAT, "aaaa1111"))
+
+    threads = [threading.Thread(target=run, args=(s,)) for s in stores]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len([r for r in results if r is not None]) == 1  # applied exactly once
+
+
+def _spy_connect(monkeypatch, *, fail_on: str = ""):
+    seen = []
+    real_connect = sqlite3.connect
+
+    class Spy(sqlite3.Connection):
+        def execute(self, sql, *args):
+            seen.append(sql)
+            if fail_on and fail_on in sql.lower():
+                raise sqlite3.OperationalError("scripted failure")
+            return super().execute(sql, *args)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: real_connect(*a, factory=Spy, **k))
+    return seen
+
+
+@pytest.mark.parametrize("action", ["take", "delete", "clear_all", "purge"])
+def test_removals_checkpoint_the_wal(store, monkeypatch, action):
+    store.put_pending(pending("aaaa1111"))
+    store.set_state(CHAT, "awaiting_clarification", {"k": "v"}, now=1.0)
+    seen = _spy_connect(monkeypatch)
+
+    {
+        "take": lambda: store.take_pending(CHAT, "aaaa1111"),
+        "delete": lambda: store.delete_pending(CHAT),
+        "clear_all": store.clear_all,
+        "purge": lambda: store.purge_contexts(100.0),
+    }[action]()
+
+    assert any("wal_checkpoint(passive)" in s.lower().replace(" ", "") for s in seen)
+
+
+def test_checkpoint_failure_never_raises(store, monkeypatch):
+    store.put_pending(pending("aaaa1111"))
+    _spy_connect(monkeypatch, fail_on="wal_checkpoint")
+
+    assert store.take_pending(CHAT, "aaaa1111") == pending("aaaa1111")
+    store.clear_all()  # nothing raised

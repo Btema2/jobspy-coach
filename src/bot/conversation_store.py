@@ -4,9 +4,14 @@
 Retention: ``pending_change`` holds the validated operation list only (never raw pasted text);
 ``conversation.context`` may hold raw earlier messages while a clarifying question is open and is purged
 on apply, cancel, supersede and expiry. Every connection sets ``PRAGMA secure_delete = ON`` before it
-writes, so deleted text is overwritten in the database file.
+writes, so deleted text is overwritten in the database file; in WAL mode the old page images also sit in
+the ``-wal`` file until it is checkpointed, so every removal is followed by a best-effort
+``PRAGMA wal_checkpoint(PASSIVE)`` (it never raises and does not wait for readers). Retention is therefore
+bounded by that checkpoint plus the 24 h time-to-live of a context, not guaranteed to the byte.
 """
 import json
+import logging
+import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,6 +19,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional
 
 from src.storage.db import Database
+
+logger = logging.getLogger(__name__)
+
+# ``DELETE ... RETURNING`` needs SQLite 3.35; older libraries use SELECT + DELETE in one immediate transaction.
+_HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
 
 STATES = ("idle", "awaiting_description", "awaiting_clarification", "awaiting_confirm")
 
@@ -62,6 +72,29 @@ class ConversationStore:
             conn.execute("PRAGMA secure_delete = ON;")
             yield conn
 
+    def _scrub(self) -> None:
+        """Best-effort WAL checkpoint after a removal of text (see the module docstring); never raises."""
+        try:
+            with self._conn() as conn:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except Exception as exc:  # a failed checkpoint must never lose or block the user's action
+            logger.debug("wal checkpoint skipped: %s", type(exc).__name__)
+
+    def _delete_returning(self, where: str, params: tuple) -> Optional[PendingChange]:
+        """Atomically delete the ``pending_change`` row matching ``where`` and return it (None: no match)."""
+        with self._conn() as conn:
+            if _HAS_RETURNING:
+                row = conn.execute(
+                    f"DELETE FROM pending_change WHERE {where} RETURNING {_PENDING_COLUMNS}", params
+                ).fetchone()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(f"SELECT {_PENDING_COLUMNS} FROM pending_change WHERE {where}", params).fetchone()
+                if row is not None:
+                    conn.execute(f"DELETE FROM pending_change WHERE {where}", params)
+        self._scrub()
+        return _pending(row) if row is not None else None
+
     # --- pending proposal ------------------------------------------------------------------
 
     def put_pending(self, p: PendingChange) -> Optional[PendingChange]:
@@ -86,19 +119,10 @@ class ConversationStore:
 
     def take_pending(self, chat_id: int, change_id: str) -> Optional[PendingChange]:
         """Atomically remove and return the proposal when ``change_id`` matches, else None (row kept)."""
-        with self._conn() as conn:
-            row = conn.execute(
-                f"DELETE FROM pending_change WHERE chat_id = ? AND change_id = ? RETURNING {_PENDING_COLUMNS}",
-                (chat_id, change_id),
-            ).fetchone()
-        return _pending(row) if row is not None else None
+        return self._delete_returning("chat_id = ? AND change_id = ?", (chat_id, change_id))
 
     def delete_pending(self, chat_id: int) -> Optional[PendingChange]:
-        with self._conn() as conn:
-            row = conn.execute(
-                f"DELETE FROM pending_change WHERE chat_id = ? RETURNING {_PENDING_COLUMNS}", (chat_id,)
-            ).fetchone()
-        return _pending(row) if row is not None else None
+        return self._delete_returning("chat_id = ?", (chat_id,))
 
     def set_pending_message(self, chat_id: int, change_id: str, message_id: int) -> None:
         with self._conn() as conn:
@@ -154,6 +178,7 @@ class ConversationStore:
                 "AND (context IS NOT NULL OR state != 'idle')",
                 (before,),
             )
+        self._scrub()
         return int(count)
 
     # --- consent ---------------------------------------------------------------------------
@@ -177,3 +202,4 @@ class ConversationStore:
         with self._conn() as conn:
             for table in ("pending_change", "conversation", "llm_consent"):
                 conn.execute(f"DELETE FROM {table}")
+        self._scrub()
