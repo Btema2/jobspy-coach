@@ -109,6 +109,17 @@ CONSENT_DECLINED_REPLY = "Nothing was sent. Use the commands (/help) or /setup g
 CONSENT_STALE_REPLY = "This choice is no longer active; send your request again."
 COMPILE_ERROR_REPLY = "The stored profile cannot be compiled; nothing was changed."
 PAUSED_NOTE = "The profile is paused; send /resume to start searching."
+SETUP_NO_LLM_REPLY = "No LLM is configured; using step-by-step questions."
+PROPOSAL_DISCARDED_REPLY = "Your pending proposal was discarded."
+GUIDED_BUTTON = "Step-by-step questions instead"
+GUIDED_CALLBACK = "ob:guided"
+CONSENT_DECLINED_SETUP_REPLY = "Nothing was sent. Continuing with step-by-step questions."
+ONBOARDING_PROMPT = (
+    "Describe what you are looking for in your own words, in one message or a .txt / .md file: the roles and "
+    "their synonyms, the countries or remote work, your seniority level, and what to avoid. "
+    "I will draft the profile and show it for your confirmation before anything changes. "
+    "Prefer questions? Press the button."
+)
 
 STATE_IDLE = "idle"
 STATE_CLARIFICATION = "awaiting_clarification"
@@ -184,6 +195,7 @@ class ConversationService:
         # The poller thread's instances ...
         self._db = Database(ctx.db_path)
         self._conv = ConversationStore(self._db)
+        self._bot_state = BotStateStore(self._db)
         self._profiles = ProfileStore(self._db)
         # ... and the worker's own (pending_change / conversation writes only).
         self._wdb = Database(ctx.db_path)
@@ -234,6 +246,50 @@ class ConversationService:
             return self._add_upload(update)
         return self._add_part(update.chat_id, update.text, self._clock())
 
+    def start_setup(self, update: Update) -> List[OutgoingMessage]:
+        """``/setup``: a free-text description when a language model is configured, else the wizard.
+
+        ``/setup guided`` always runs the wizard. Either way a pending proposal is discarded (with a notice),
+        a request still in flight loses its result and any earlier wizard or description prompt is replaced.
+        """
+        chat_id = update.chat_id
+        guided = update.args.strip().lower() == "guided"
+        llm = self._ctx.chat_llm
+        ready = self._translator is not None and (llm is None or llm.available())
+        notes = self._reset_for_setup(chat_id) if chat_id is not None else []
+        if guided or not ready:
+            extra = [] if guided else _reply(SETUP_NO_LLM_REPLY)
+            return notes + extra + self._wizard.start(update)
+        self._bot_state.set_wizard(None)
+        with self._state_lock:
+            self._conv.set_state(chat_id, STATE_DESCRIPTION, None, self._clock())
+        markup = {"inline_keyboard": [[{"text": GUIDED_BUTTON, "callback_data": GUIDED_CALLBACK}]]}
+        return notes + [OutgoingMessage(ONBOARDING_PROMPT, markup)]
+
+    def _reset_for_setup(self, chat_id: int) -> List[OutgoingMessage]:
+        self._drop_memory()
+        with self._state_lock:
+            pending = self._conv.delete_pending(chat_id)
+            state = self._conv.get_state(chat_id)
+            if state.state != STATE_IDLE or state.context is not None:
+                self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+        if pending is None:
+            return []
+        self._clear_buttons(chat_id, pending.message_id)
+        return _reply(PROPOSAL_DISCARDED_REPLY)
+
+    def _on_onboarding_button(self, update: Update) -> List[OutgoingMessage]:
+        """``ob:guided``: leave the description prompt for the step-by-step wizard."""
+        chat_id = update.chat_id
+        if update.text != GUIDED_CALLBACK or chat_id is None \
+                or self._conv.get_state(chat_id).state != STATE_DESCRIPTION:
+            return _reply(NO_LONGER_ACTIVE_REPLY)
+        self._clear_buttons(chat_id, update.message_id)
+        self._drop_memory()
+        with self._state_lock:
+            self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+        return self._wizard.start(update)
+
     def on_ok(self, update: Update) -> List[OutgoingMessage]:
         return self._confirm(update.chat_id, None, None)
 
@@ -274,6 +330,8 @@ class ConversationService:
             return self._on_proposal_button(update)
         if update.text.startswith("cs:"):
             return self._on_consent_button(update)
+        if update.text.startswith("ob:"):
+            return self._on_onboarding_button(update)
         return _reply(NO_LONGER_ACTIVE_REPLY)
 
     # --- poller thread: buffering ------------------------------------------------------------
@@ -357,6 +415,11 @@ class ConversationService:
             return _reply(CONSENT_STALE_REPLY)
         self._clear_buttons(update.chat_id, update.message_id)
         if parts[2] == "no":
+            if self._conv.get_state(update.chat_id).state == STATE_DESCRIPTION:
+                # Onboarding without the language model: the step-by-step wizard takes over.
+                with self._state_lock:
+                    self._conv.set_state(update.chat_id, STATE_IDLE, None, self._clock())
+                return _reply(CONSENT_DECLINED_SETUP_REPLY) + self._wizard.start(update)
             return _reply(CONSENT_DECLINED_REPLY)
         self._conv.record_consent(update.chat_id, CONSENT_VERSION)  # the poller thread writes llm_consent
         with self._cond:
@@ -615,7 +678,7 @@ class ConversationService:
                 if isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item):
                     history.append((item[0], item[1]))
             return mode, history[:MAX_CLARIFICATIONS]
-        if state.state == STATE_DESCRIPTION:
+        if state.state == STATE_DESCRIPTION and now - state.updated_at <= CONTEXT_TTL_SECONDS:
             return "onboarding", []
         return "chat", []
 

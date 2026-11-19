@@ -210,14 +210,15 @@ class CommandRouter:
         from src.bot.wizard import SetupWizard
 
         wizard = SetupWizard(BotStateStore(self._db), self._store, clock=self._ctx.clock)
-        self.register("setup", wizard.start)
         self.register_callback("wz:", wizard.on_callback)
         # Free text: the wizard answers first (inside ``on_text``), then bare words, then the language model.
         self.conversation = ConversationService(self._ctx, self.client, wizard, clock=self._ctx.clock)
+        self.register("setup", self.conversation.start_setup)  # description prompt or the wizard
         self.register("ok", self.conversation.on_ok)
         self.register("cancel", self.conversation.on_cancel)
         self.register_callback("pc:", self.conversation.on_callback)
         self.register_callback("cs:", self.conversation.on_callback)
+        self.register_callback("ob:", self.conversation.on_callback)
         self.set_text_handler(self.conversation.on_text)
         self.register("stats", lambda update: stats_command(self._db, self._store, self._ctx.settings, update.args))
         self.register("test", ProbeRunner(self._ctx, self.client, clock=self._ctx.clock).request)
