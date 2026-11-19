@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence, Tuple
 
+from src.bot.chat_llm import ChatLLM
 from src.bot.client import TelegramBotClient
 from src.bot.countries import CountryMatch, resolve_country
 from src.bot.render import PAGE_SIZE, chunk_html, esc, paginate, render_apply
@@ -79,6 +80,8 @@ COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("resume", "Resume scraping and start a cycle"),
     ("run_now", "Start a scrape cycle now"),
     ("setup", "Guided setup: role, synonyms, market"),
+    ("ok", "Apply the pending proposal"),
+    ("cancel", "Discard the pending proposal"),
     ("undo", "Undo the last change (repeat to toggle)"),
     ("history", "List the stored profile versions"),
     ("restore", "Restore a version: /restore number"),
@@ -89,7 +92,7 @@ COMMANDS: Tuple[Tuple[str, str], ...] = (
 
 MUTATING_COMMANDS = frozenset({
     "/add_role", "/remove_role", "/add_market", "/exclude", "/threshold", "/pause", "/resume", "/run_now",
-    "/undo", "/restore", "/requeue", "/setup", "/test",
+    "/undo", "/restore", "/requeue", "/setup", "/test", "/ok", "/cancel",
 })
 
 _KIND_ORDER = ("block", "soft", "seniority", "rescue")  # RULE_KINDS is a set: keep the listing stable
@@ -109,6 +112,7 @@ class BotContext:
     # Atomically takes the cycle (and digest) locks for a data-changing command; yields False when one is held.
     cycle_guard: Optional[Callable[[], ContextManager[bool]]] = None
     stop_event: Optional[threading.Event] = None  # set at shutdown; makes waits of worker threads abortable
+    chat_llm: Optional[ChatLLM] = None  # the free-text path; None: plain text keeps the help hint
 
 
 def market_from_match(match: CountryMatch, remote: bool, remote_only: bool) -> Market:
@@ -156,12 +160,24 @@ def _paged(command: str, lines: Sequence[str], page: int, tail: Sequence[str] = 
     return "\n".join(out)
 
 
+def trigger_note(outcome: str) -> str:
+    """The sentence that tells the user what a requested cycle start did (shared by /resume and chat)."""
+    if outcome == TRIGGER_STARTED:
+        return "A cycle starts now."
+    if outcome == TRIGGER_BUSY:
+        return "A cycle is already running; the next one will scrape."
+    return "Scraping resumes at the next scheduled cycle."
+
+
 def _not_applied(messages: Sequence[str]) -> str:
     shown = [esc(m) for m in messages[:MAX_ERROR_LINES]]
     lines = ["Not applied: " + shown[0]] + ["  " + m for m in shown[1:]]
     if len(messages) > MAX_ERROR_LINES:
         lines.append(f"  ... and {len(messages) - MAX_ERROR_LINES} more")
     return "\n".join(lines)
+
+
+not_applied = _not_applied
 
 
 class CommandRouter:
@@ -186,7 +202,8 @@ class CommandRouter:
         self._register_features()
 
     def _register_features(self) -> None:
-        """Plug in /setup, /stats and /test (their modules import this one, hence the local imports)."""
+        """Plug in /setup, /stats, /test and free text (their modules import this one, hence the local imports)."""
+        from src.bot.conversation import ConversationService
         from src.bot.probe import ProbeRunner
         from src.bot.state import BotStateStore
         from src.bot.stats import stats_command
@@ -195,7 +212,13 @@ class CommandRouter:
         wizard = SetupWizard(BotStateStore(self._db), self._store, clock=self._ctx.clock)
         self.register("setup", wizard.start)
         self.register_callback("wz:", wizard.on_callback)
-        self.set_text_handler(wizard.on_text)
+        # Free text: the wizard answers first (inside ``on_text``), then bare words, then the language model.
+        self.conversation = ConversationService(self._ctx, self.client, wizard, clock=self._ctx.clock)
+        self.register("ok", self.conversation.on_ok)
+        self.register("cancel", self.conversation.on_cancel)
+        self.register_callback("pc:", self.conversation.on_callback)
+        self.register_callback("cs:", self.conversation.on_callback)
+        self.set_text_handler(self.conversation.on_text)
         self.register("stats", lambda update: stats_command(self._db, self._store, self._ctx.settings, update.args))
         self.register("test", ProbeRunner(self._ctx, self.client, clock=self._ctx.clock).request)
 
@@ -503,13 +526,7 @@ class CommandRouter:
         except Exception as exc:  # the profile is already changed: the reply must still be sent
             logger.warning("trigger_cycle failed: %s", type(exc).__name__)
             outcome = TRIGGER_NOT_READY
-        if outcome == TRIGGER_STARTED:
-            note = "A cycle starts now."
-        elif outcome == TRIGGER_BUSY:
-            note = "A cycle is already running; the next one will scrape."
-        else:
-            note = "Scraping resumes at the next scheduled cycle."
-        return self._applied(result, [note])
+        return self._applied(result, [trigger_note(outcome)])
 
     def _run_now(self, update: Update) -> List[OutgoingMessage]:
         outcome = self._ctx.trigger_cycle()

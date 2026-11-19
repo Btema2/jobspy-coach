@@ -1,0 +1,727 @@
+"""Free text in the paired chat: debounce, consent, clarification, one pending proposal, confirm / cancel.
+
+Threads (AGENTS.md 3.C.4, amended by Branch 5): the BotPoller thread buffers text parts (memory only), takes
+the consent button, handles ``/ok``, ``/cancel`` and the ``pc:`` buttons, and is the only thread that writes
+profile tables (``take_pending`` + ``apply_changes``) or the ``llm_consent`` table. One ``bot-conversation``
+worker thread flushes the debounce buffer, downloads uploads, masks, gates on consent, calls the translator,
+and writes only ``pending_change`` / ``conversation`` rows; it has its own ``Database`` instance. A
+``threading.Timer`` only sends the progress note. Memory state is guarded by one ``threading.Condition``.
+
+Retention: raw text lives in memory and, while a clarifying question is open, in ``conversation.context``
+(masked, at most 24 hours); it is purged on apply, cancel, supersede and expiry. ``pending_change`` holds the
+validated operation list only. Nothing here logs user text, masked text, questions or replies: only lengths,
+request ids and exception type names.
+"""
+import logging
+import math
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from src.bot.chat_llm import (
+    CHAT_HOURLY_CAP,
+    ChatLLMLimited,
+    ChatLLMNotConfigured,
+    ChatLLMNotUnderstood,
+    ChatLLMUnavailable,
+)
+from src.bot.client import TelegramApiError, TelegramBotClient
+from src.bot.commands import BotContext, not_applied, trigger_note
+from src.bot.conversation_store import ConversationState, ConversationStore, PendingChange
+from src.bot.privacy import CONSENT_NOTICE, CONSENT_VERSION, mask_personal_data
+from src.bot.render import chunk_html, esc, render_apply
+from src.bot.translator import (
+    MAX_INPUT_CHARS,
+    MODES,
+    Clarification,
+    Proposal,
+    TranslationProblem,
+    Translator,
+    operations_from_json,
+    render_proposal,
+    to_operations,
+)
+from src.bot.updates import DocumentRef, OutgoingMessage, Update
+from src.bot.wizard import SetupWizard
+from src.evaluator.errors import StopRequested
+from src.profile.backtest import backtest_snapshots, render_backtest
+from src.profile.compiler import compile_profile
+from src.profile.errors import ProfileCompileError, ProfileValidationError, VersionConflict
+from src.profile.ops import apply_changes
+from src.profile.store import ProfileStore
+from src.storage.db import Database
+
+logger = logging.getLogger(__name__)
+
+DEBOUNCE_SECONDS = 3.0
+MAX_PARTS = 3
+MAX_MERGED_CHARS = 12000
+MAX_UPLOAD_BYTES = 20480
+PENDING_TTL_SECONDS = 86400
+CONTEXT_TTL_SECONDS = 86400
+SWEEP_SECONDS = 60.0
+PROGRESS_NOTE_SECONDS = 20.0
+MAX_CLARIFICATIONS = 2
+MAX_QUEUED_REQUESTS = 5  # requests waiting behind the one in flight (an upload or a debounced paste each)
+BARE_CONFIRM_MAX_AGE_SECONDS = 900
+_IDLE_WAIT_SECONDS = 0.5  # the longest the worker sleeps: it must notice the stop event within a second
+_UPLOAD_SUFFIXES = (".txt", ".md")
+_BOM = b"\xef\xbb\xbf"
+
+BARE_CONFIRM = frozenset({"ok", "okay", "yes", "y", "yep", "sure", "confirm", "apply"})
+BARE_CANCEL = frozenset({"no", "n", "nope", "cancel"})
+
+TOO_LONG_REPLY = "That is too long; send it as a .txt or .md file (up to 20 KB)."
+ONLY_TEXT_FILES_REPLY = "Only .txt and .md files are read."
+FILE_TOO_LARGE_REPLY = "That file is larger than 20 KB; send a shorter one."
+NOT_UTF8_REPLY = "The file must be UTF-8 text."
+EMPTY_FILE_REPLY = "The file is empty."
+DOWNLOAD_FAILED_REPLY = "I could not download that file; send it again or paste the text."
+BUSY_REPLY = "Still working on your earlier requests; send this again in a moment."
+NOT_CONFIGURED_REPLY = (
+    "Free-text requests need an LLM key (NVIDIA_API_KEY or OPENROUTER_API_KEY in .env); "
+    "the commands keep working: /help"
+)
+UNAVAILABLE_REPLY = "The language model is unavailable right now; try again later or use a command (/help)."
+NOT_UNDERSTOOD_REPLY = "Couldn't understand that, try a command (/help)."
+LIMITED_REPLY = "Hourly limit of {limit} LLM calls reached; try again in {minutes} min, or use the commands (/help)."
+ERROR_REPLY = "Something went wrong; nothing was changed."
+WORKING_REPLY = "Working on it..."
+PROGRESS_REPLY = "Still working; the model can take up to 2 minutes."
+NO_CHANGE_REPLY = "That does not look like a profile change. Send /help for the commands."
+QUESTION_PREFIX = "Question: "
+NO_LONGER_ACTIVE_REPLY = "This proposal is no longer active."
+PROPOSAL_UNREADABLE_REPLY = "That proposal could not be read; send your request again."
+EXPIRED_REPLY = "Your proposal expired after 24 hours and was discarded; send your request again."
+CONFLICT_REPLY = "The profile changed since this proposal; send your request again."
+SUPERSEDED_REPLY = "Your previous proposal was replaced by this one."
+NO_PENDING_REPLY = "There is no pending proposal. Send /help for the commands."
+BARE_STALE_REPLY = 'That "ok" is more than 15 minutes old; send /ok to apply.'
+CANCELLED_REPLY = "Cancelled. Nothing was changed."
+NOTHING_TO_CANCEL_REPLY = "There is nothing to cancel."
+CONSENT_DECLINED_REPLY = "Nothing was sent. Use the commands (/help) or /setup guided."
+CONSENT_STALE_REPLY = "This choice is no longer active; send your request again."
+COMPILE_ERROR_REPLY = "The stored profile cannot be compiled; nothing was changed."
+PAUSED_NOTE = "The profile is paused; send /resume to start searching."
+
+STATE_IDLE = "idle"
+STATE_CLARIFICATION = "awaiting_clarification"
+STATE_CONFIRM = "awaiting_confirm"
+STATE_DESCRIPTION = "awaiting_description"
+
+
+def _reply(text: str) -> List[OutgoingMessage]:
+    return [OutgoingMessage(text)]
+
+
+def _bare_word(text: str) -> Optional[str]:
+    """``confirm`` or ``cancel`` when ``text`` is just such a word (case and trailing punctuation ignored)."""
+    word = text.strip().lower().rstrip(".!?,;: ").strip()
+    if word in BARE_CONFIRM:
+        return "confirm"
+    if word in BARE_CANCEL:
+        return "cancel"
+    return None
+
+
+@dataclass
+class _Buffer:
+    """One request while it waits for its debounce window to close (or an upload / released consent text)."""
+
+    chat_id: int
+    parts: List[str]
+    chars: int
+    last: float
+    closed: bool = False  # no more parts are merged into it
+    immediate: bool = False  # due at once (uploads, text released by the consent button)
+    doc: Optional[DocumentRef] = None
+    caption: str = ""
+
+    def due(self, now: float) -> bool:
+        return self.immediate or now - self.last >= DEBOUNCE_SECONDS
+
+    def due_at(self) -> float:
+        return float("-inf") if self.immediate else self.last + DEBOUNCE_SECONDS
+
+
+@dataclass
+class _Held:
+    """Masked request text waiting in memory (never in the database) for the consent answer."""
+
+    nonce: str
+    chat_id: int
+    parts: List[str]
+    created: float
+
+
+@dataclass(frozen=True)
+class _Work:
+    buffer: _Buffer
+    generation: int  # a /cancel after the request was taken makes its result stale
+
+
+class ConversationService:
+    def __init__(
+        self,
+        ctx: BotContext,
+        client: TelegramBotClient,
+        wizard: SetupWizard,
+        *,
+        translator: Optional[Translator] = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        self._ctx = ctx
+        self._client = client
+        self._wizard = wizard
+        self._clock = clock
+        # The poller thread's instances ...
+        self._db = Database(ctx.db_path)
+        self._conv = ConversationStore(self._db)
+        self._profiles = ProfileStore(self._db)
+        # ... and the worker's own (pending_change / conversation writes only).
+        self._wdb = Database(ctx.db_path)
+        self._wconv = ConversationStore(self._wdb)
+        self._wprofiles = ProfileStore(self._wdb)
+        if translator is None and ctx.chat_llm is not None:
+            translator = Translator(ctx.chat_llm)
+        self._translator = translator
+        self._stop = ctx.stop_event if ctx.stop_event is not None else threading.Event()
+        self._cond = threading.Condition()
+        self._buffers: List[_Buffer] = []
+        self._swallow: Optional[Tuple[int, float]] = None  # chat id and time of the last part of a dropped paste
+        self._held: Optional[_Held] = None
+        self._generation = 0
+        self._inflight = False
+        self._next_sweep = 0.0
+
+    # --- poller thread: entry points --------------------------------------------------------
+
+    def on_text(self, update: Update) -> Optional[List[OutgoingMessage]]:
+        """The router's text handler: wizard first, then bare words, then the language model."""
+        wizard_reply = self._wizard.on_text(update)
+        if wizard_reply is not None:
+            return wizard_reply
+        if update.chat_id is None or (update.document is None and not update.text.strip()):
+            return None
+        if update.document is None:
+            kind = _bare_word(update.text)
+            if kind is not None:
+                routed = self._route_bare(update, kind)
+                if routed is not None:
+                    return routed
+        if self._translator is None:
+            return None  # no language model behind this router: the router's own hint answers
+        llm = self._ctx.chat_llm
+        if llm is not None and not llm.available():
+            return _reply(NOT_CONFIGURED_REPLY)
+        if update.document is not None:
+            return self._add_upload(update)
+        return self._add_part(update.chat_id, update.text, self._clock())
+
+    def on_ok(self, update: Update) -> List[OutgoingMessage]:
+        return self._confirm(update.chat_id, None, None)
+
+    def on_cancel(self, update: Update) -> List[OutgoingMessage]:
+        """Discard everything in flight: buffer, held text, running request, clarification and proposal."""
+        chat_id = update.chat_id
+        with self._cond:
+            self._generation += 1
+            anything = bool(self._buffers) or self._held is not None or self._inflight
+            self._buffers.clear()
+            self._held = None
+            self._swallow = None
+        pending = self._conv.delete_pending(chat_id)
+        state = self._conv.get_state(chat_id)
+        if pending is not None:
+            self._clear_buttons(chat_id, pending.message_id)
+        if state.state != STATE_IDLE or state.context is not None:
+            self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+            anything = True
+        return _reply(CANCELLED_REPLY if anything or pending is not None else NOTHING_TO_CANCEL_REPLY)
+
+    def on_callback(self, update: Update) -> List[OutgoingMessage]:
+        if update.text.startswith("pc:"):
+            return self._on_proposal_button(update)
+        if update.text.startswith("cs:"):
+            return self._on_consent_button(update)
+        return _reply(NO_LONGER_ACTIVE_REPLY)
+
+    # --- poller thread: buffering ------------------------------------------------------------
+
+    def _route_bare(self, update: Update, kind: str) -> Optional[List[OutgoingMessage]]:
+        """A bare yes / no: the answer to a question, a confirmation, or a hint (never an LLM call by itself)."""
+        chat_id = update.chat_id
+        if self._conv.get_state(chat_id).state == STATE_CLARIFICATION:
+            return None  # the answer to the open question: it goes to the translator with the history
+        pending = self._conv.get_pending(chat_id)
+        if pending is None:
+            return _reply(NO_PENDING_REPLY)
+        if kind == "confirm":
+            if update.date and self._clock() - update.date > BARE_CONFIRM_MAX_AGE_SECONDS:
+                return _reply(BARE_STALE_REPLY)
+            return self._confirm(chat_id, pending.change_id, None)
+        return self._cancel_proposal(chat_id, pending.change_id, None)
+
+    def _open_buffer(self, chat_id: int, now: float) -> Optional[_Buffer]:
+        """The newest text buffer of this chat that is still inside its debounce window."""
+        for buffer in reversed(self._buffers):
+            if buffer.chat_id == chat_id and not buffer.closed:
+                return buffer if now - buffer.last < DEBOUNCE_SECONDS else None
+        return None
+
+    def _add_part(self, chat_id: int, text: str, now: float) -> List[OutgoingMessage]:
+        with self._cond:
+            if self._swallow is not None:
+                swallow_chat, swallow_last = self._swallow
+                if swallow_chat == chat_id and now - swallow_last < DEBOUNCE_SECONDS:
+                    self._swallow = (chat_id, now)  # the tail of a paste that was already refused
+                    return []
+                self._swallow = None
+            buffer = self._open_buffer(chat_id, now)
+            if buffer is None:
+                if len(self._buffers) >= MAX_QUEUED_REQUESTS:
+                    return _reply(BUSY_REPLY)
+                buffer = _Buffer(chat_id, [], 0, now)
+                self._buffers.append(buffer)
+            if len(buffer.parts) == MAX_PARTS or buffer.chars + len(text) > MAX_MERGED_CHARS:
+                # A truncated paste is worse than none: the whole merged request is dropped.
+                self._buffers.remove(buffer)
+                self._swallow = (chat_id, now)
+                return _reply(TOO_LONG_REPLY)
+            buffer.parts.append(text)
+            buffer.chars += len(text)
+            buffer.last = now
+            self._cond.notify_all()
+        return []
+
+    def _add_upload(self, update: Update) -> List[OutgoingMessage]:
+        document = update.document
+        if not document.file_name.lower().endswith(_UPLOAD_SUFFIXES):
+            return _reply(ONLY_TEXT_FILES_REPLY)
+        if document.file_size is not None and document.file_size > MAX_UPLOAD_BYTES:
+            return _reply(FILE_TOO_LARGE_REPLY)
+        with self._cond:
+            if len(self._buffers) >= MAX_QUEUED_REQUESTS:
+                return _reply(BUSY_REPLY)
+            self._buffers.append(
+                _Buffer(update.chat_id, [], 0, self._clock(), closed=True, immediate=True,
+                        doc=document, caption=update.text.strip())
+            )
+            self._cond.notify_all()
+        return []
+
+    # --- poller thread: consent button -------------------------------------------------------
+
+    def _on_consent_button(self, update: Update) -> List[OutgoingMessage]:
+        parts = update.text.split(":")
+        if len(parts) != 3 or parts[2] not in ("yes", "no"):
+            return _reply(CONSENT_STALE_REPLY)
+        with self._cond:
+            held = self._held
+            if held is None or held.nonce != parts[1] or held.chat_id != update.chat_id:
+                held = None
+            else:
+                self._held = None
+        if held is None:
+            return _reply(CONSENT_STALE_REPLY)
+        self._clear_buttons(update.chat_id, update.message_id)
+        if parts[2] == "no":
+            return _reply(CONSENT_DECLINED_REPLY)
+        self._conv.record_consent(update.chat_id, CONSENT_VERSION)  # the poller thread writes llm_consent
+        with self._cond:
+            self._buffers.insert(
+                0,
+                _Buffer(held.chat_id, held.parts, sum(len(p) for p in held.parts), self._clock(),
+                        closed=True, immediate=True),
+            )
+            self._cond.notify_all()
+        return []
+
+    # --- poller thread: confirm and cancel -----------------------------------------------------
+
+    def _on_proposal_button(self, update: Update) -> List[OutgoingMessage]:
+        parts = update.text.split(":")
+        if len(parts) != 4 or not (parts[2].isascii() and parts[2].isdigit()) or parts[3] not in ("a", "c"):
+            return _reply(NO_LONGER_ACTIVE_REPLY)
+        pending = self._conv.get_pending(update.chat_id)
+        if pending is None or pending.change_id != parts[1] or pending.base_version != int(parts[2]):
+            return _reply(NO_LONGER_ACTIVE_REPLY)
+        if parts[3] == "a":
+            return self._confirm(update.chat_id, pending.change_id, update.message_id)
+        return self._cancel_proposal(update.chat_id, pending.change_id, update.message_id)
+
+    def _cancel_proposal(
+        self, chat_id: int, change_id: str, button_message_id: Optional[int]
+    ) -> List[OutgoingMessage]:
+        taken = self._conv.take_pending(chat_id, change_id)
+        if taken is None:
+            return _reply(NO_LONGER_ACTIVE_REPLY)
+        self._clear_buttons(chat_id, button_message_id if button_message_id is not None else taken.message_id)
+        if self._conv.get_state(chat_id).state == STATE_CONFIRM:
+            self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+        return _reply(CANCELLED_REPLY)
+
+    def _confirm(
+        self, chat_id: int, change_id: Optional[str], button_message_id: Optional[int]
+    ) -> List[OutgoingMessage]:
+        """Apply the pending proposal once (``/ok``, a bare word or a button); every profile write is here."""
+        if change_id is None:
+            pending = self._conv.get_pending(chat_id)
+            if pending is None:
+                return _reply(NO_PENDING_REPLY)
+            change_id = pending.change_id
+        taken = self._conv.take_pending(chat_id, change_id)  # atomic: a second press finds nothing
+        if taken is None:
+            return _reply(NO_LONGER_ACTIVE_REPLY)
+        self._clear_buttons(chat_id, button_message_id if button_message_id is not None else taken.message_id)
+        self._conv.set_state(chat_id, STATE_IDLE, None, self._clock())
+        return self._apply(taken)
+
+    def _apply(self, taken: PendingChange) -> List[OutgoingMessage]:
+        if self._clock() - taken.created_at > PENDING_TTL_SECONDS:
+            return _reply(EXPIRED_REPLY)
+        try:
+            operations = operations_from_json(taken.operations)  # stored JSON is re-validated, never trusted
+        except ValueError:
+            return _reply(PROPOSAL_UNREADABLE_REPLY)
+        snapshot = self._profiles.read_snapshot()
+        if (snapshot.version if snapshot is not None else 0) != taken.base_version:
+            return _reply(CONFLICT_REPLY)
+        label = "llm onboarding" if taken.mode == "onboarding" else f"chat change ({len(operations)} operations)"
+        try:
+            profile_ops = to_operations(operations, snapshot)
+            result = apply_changes(self._profiles, profile_ops, label=label, expected_version=taken.base_version)
+        except VersionConflict:
+            return _reply(CONFLICT_REPLY)
+        except (TranslationProblem, ProfileValidationError) as exc:
+            return _reply(not_applied(exc.messages))
+        except ProfileCompileError:
+            return _reply(COMPILE_ERROR_REPLY)
+        extra: List[str] = []
+        if result.old is not None and result.old.fields.paused and result.new is not None \
+                and not result.new.fields.paused:
+            extra.append(self._trigger())
+        if taken.mode == "onboarding" and result.new is not None and result.new.fields.paused:
+            extra.append(PAUSED_NOTE)
+        return _reply(render_apply(result, extra))
+
+    def _trigger(self) -> str:
+        try:
+            outcome = self._ctx.trigger_cycle()
+        except Exception as exc:  # the profile is already changed: the reply must still be sent
+            logger.warning("trigger_cycle failed: %s", type(exc).__name__)
+            outcome = ""
+        return trigger_note(outcome)
+
+    # --- worker thread ---------------------------------------------------------------------------
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run_forever, name="bot-conversation", daemon=True)
+        thread.start()
+        return thread
+
+    def run_forever(self) -> None:
+        while not self._stop.is_set():
+            try:
+                with self._cond:
+                    wait = self._wait_seconds(self._clock())
+                    if wait > 0:
+                        self._cond.wait(wait)
+                if self._stop.is_set():
+                    break
+                now = self._clock()
+                self.process_next(now)
+                if now >= self._next_sweep:
+                    self._next_sweep = now + SWEEP_SECONDS
+                    self.sweep(now)
+            except Exception as exc:  # never the message: it can hold user text
+                logger.error("conversation worker failed: %s", type(exc).__name__)
+                self._stop.wait(0.2)
+
+    def _wait_seconds(self, now: float) -> float:
+        if self._next_sweep <= now:
+            return 0.0
+        wait = min(_IDLE_WAIT_SECONDS, self._next_sweep - now)
+        for buffer in self._buffers:
+            wait = min(wait, buffer.due_at() - now)
+        return max(0.0, wait)
+
+    def process_next(self, now: float) -> bool:
+        """Flush one due request through the pipeline; False when nothing is due."""
+        with self._cond:
+            for index, buffer in enumerate(self._buffers):
+                if buffer.due(now):
+                    del self._buffers[index]
+                    work = _Work(buffer, self._generation)
+                    self._inflight = True
+                    break
+            else:
+                return False
+        try:
+            self._process(work)
+        finally:
+            with self._cond:
+                self._inflight = False
+        return True
+
+    def sweep(self, now: float) -> None:
+        """Expire proposals older than 24 hours (with a notice) and purge stale conversation contexts."""
+        for stale in self._wconv.expired_pending(now - PENDING_TTL_SECONDS):
+            taken = self._wconv.take_pending(stale.chat_id, stale.change_id)
+            if taken is None:  # confirmed or cancelled in the meantime
+                continue
+            self._clear_buttons(taken.chat_id, taken.message_id)
+            if self._wconv.get_state(taken.chat_id).state == STATE_CONFIRM:
+                self._wconv.set_state(taken.chat_id, STATE_IDLE, None, now)
+            self._send(taken.chat_id, _reply(EXPIRED_REPLY))
+        self._wconv.purge_contexts(now - CONTEXT_TTL_SECONDS)
+        with self._cond:
+            if self._held is not None and now - self._held.created > CONTEXT_TTL_SECONDS:
+                self._held = None  # held text expires silently
+
+    # --- worker thread: one request --------------------------------------------------------------
+
+    def _stale(self, work: _Work) -> bool:
+        with self._cond:
+            return work.generation != self._generation
+
+    def _process(self, work: _Work) -> None:
+        request_id = secrets.token_hex(4)
+        try:
+            self._run(work, request_id)
+        except Exception as exc:  # the worker must outlive any one request; never log the message
+            logger.error("conversation request %s failed: %s", request_id, type(exc).__name__)
+            try:
+                self._finish(work, _reply(ERROR_REPLY), purge=True)
+            except Exception as exc2:
+                logger.error("conversation request %s: reply failed: %s", request_id, type(exc2).__name__)
+
+    def _run(self, work: _Work, request_id: str) -> None:
+        buffer = work.buffer
+        chat_id = buffer.chat_id
+        parts = self._collect_parts(work)
+        if parts is None:
+            return
+        parts = [mask_personal_data(part)[0] for part in parts]
+        now = self._clock()
+        mode, history = self._mode_and_history(self._wconv.get_state(chat_id), now)
+        logger.info("conversation request %s: %d parts, %d chars", request_id, len(parts), sum(map(len, parts)))
+        if not self._wconv.has_consent(chat_id, CONSENT_VERSION):
+            self._hold_for_consent(work, parts, now)
+            return
+        self._translate(work, parts, mode, history, request_id, now)
+
+    def _collect_parts(self, work: _Work) -> Optional[List[str]]:
+        buffer = work.buffer
+        if buffer.doc is None:
+            return list(buffer.parts)
+        path = self._client.get_file_path(buffer.doc.file_id)
+        if path is None:
+            self._finish(work, _reply(DOWNLOAD_FAILED_REPLY), purge=False)
+            return None
+        try:
+            data = self._client.download_file(path, MAX_UPLOAD_BYTES)
+        except TelegramApiError as exc:
+            reply = FILE_TOO_LARGE_REPLY if exc.status == 413 else DOWNLOAD_FAILED_REPLY
+            self._finish(work, _reply(reply), purge=False)
+            return None
+        if data.startswith(_BOM):
+            data = data[len(_BOM):]
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            self._finish(work, _reply(NOT_UTF8_REPLY), purge=False)
+            return None
+        if not text.strip():
+            self._finish(work, _reply(EMPTY_FILE_REPLY), purge=False)
+            return None
+        return ([buffer.caption] if buffer.caption else []) + [text]
+
+    @staticmethod
+    def _mode_and_history(state: ConversationState, now: float) -> Tuple[str, List[Tuple[str, str]]]:
+        context = state.context
+        if state.state == STATE_CLARIFICATION and isinstance(context, dict) \
+                and now - state.updated_at <= CONTEXT_TTL_SECONDS:
+            mode = context.get("mode") if context.get("mode") in MODES else "chat"
+            history: List[Tuple[str, str]] = []
+            rounds = context.get("rounds")
+            for item in rounds if isinstance(rounds, list) else []:
+                if isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item):
+                    history.append((item[0], item[1]))
+            return mode, history[:MAX_CLARIFICATIONS]
+        if state.state == STATE_DESCRIPTION:
+            return "onboarding", []
+        return "chat", []
+
+    def _hold_for_consent(self, work: _Work, parts: List[str], now: float) -> None:
+        nonce = secrets.token_hex(4)
+        with self._cond:
+            if work.generation != self._generation:
+                return
+            self._held = _Held(nonce, work.buffer.chat_id, parts, now)  # memory only, never the database
+        markup = {
+            "inline_keyboard": [[
+                {"text": "Yes, continue", "callback_data": f"cs:{nonce}:yes"},
+                {"text": "No", "callback_data": f"cs:{nonce}:no"},
+            ]]
+        }
+        self._send(work.buffer.chat_id, [OutgoingMessage(CONSENT_NOTICE, markup)])
+
+    def _translate(
+        self,
+        work: _Work,
+        parts: List[str],
+        mode: str,
+        history: List[Tuple[str, str]],
+        request_id: str,
+        now: float,
+    ) -> None:
+        chat_id = work.buffer.chat_id
+        snapshot = self._wprofiles.read_snapshot()
+        if self._stale(work):
+            return
+        self._send(chat_id, _reply(WORKING_REPLY))
+        timer = threading.Timer(PROGRESS_NOTE_SECONDS, self._progress_note, args=(work,))
+        timer.daemon = True
+        timer.start()
+        try:
+            outcome = self._translator.translate(
+                parts, snapshot, mode=mode, history=history, request_id=request_id
+            )
+        except StopRequested:
+            return
+        except ChatLLMLimited as exc:
+            minutes = max(1, math.ceil(exc.retry_in / 60))
+            self._finish(work, _reply(LIMITED_REPLY.format(limit=CHAT_HOURLY_CAP, minutes=minutes)), purge=False)
+            return
+        except ChatLLMNotConfigured:
+            self._finish(work, _reply(NOT_CONFIGURED_REPLY), purge=False)
+            return
+        except ChatLLMUnavailable:
+            self._finish(work, _reply(UNAVAILABLE_REPLY), purge=False)
+            return
+        except ChatLLMNotUnderstood:
+            self._finish(work, _reply(NOT_UNDERSTOOD_REPLY), purge=True)
+            return
+        except (TranslationProblem, ProfileValidationError) as exc:
+            self._finish(work, _reply(not_applied(exc.messages)), purge=True)
+            return
+        except Exception as exc:  # ValueError, TypeError, httpx errors: the type name only, never the text
+            logger.error("conversation request %s failed: %s", request_id, type(exc).__name__)
+            self._finish(work, _reply(ERROR_REPLY), purge=True)
+            return
+        finally:
+            timer.cancel()
+        if isinstance(outcome, Proposal):
+            self._store_proposal(work, outcome, mode)
+        elif isinstance(outcome, Clarification):
+            self._ask(work, outcome, parts, history, mode, now)
+        else:
+            self._finish(work, _reply(NO_CHANGE_REPLY), purge=True)
+
+    def _progress_note(self, work: _Work) -> None:
+        if not self._stale(work):
+            self._send(work.buffer.chat_id, _reply(PROGRESS_REPLY))
+
+    def _rest_state(self, chat_id: int) -> str:
+        """The state a conversation returns to: waiting for the old proposal's answer, or idle."""
+        return STATE_CONFIRM if self._wconv.get_pending(chat_id) is not None else STATE_IDLE
+
+    def _finish(self, work: _Work, messages: Sequence[OutgoingMessage], *, purge: bool) -> None:
+        """Send the final reply of a request; ``purge`` also ends any clarification (raw context is dropped)."""
+        chat_id = work.buffer.chat_id
+        with self._cond:
+            if work.generation != self._generation:
+                return  # /cancel arrived meanwhile: the result is discarded
+            if purge:
+                self._wconv.set_state(chat_id, self._rest_state(chat_id), None, self._clock())
+        self._send(chat_id, messages)
+
+    def _ask(
+        self,
+        work: _Work,
+        clarification: Clarification,
+        parts: List[str],
+        history: List[Tuple[str, str]],
+        mode: str,
+        now: float,
+    ) -> None:
+        if len(history) >= MAX_CLARIFICATIONS:
+            self._finish(work, _reply(NOT_UNDERSTOOD_REPLY), purge=True)
+            return
+        chat_id = work.buffer.chat_id
+        rounds = [[earlier, question] for earlier, question in history]
+        rounds.append(["\n\n".join(parts)[:MAX_INPUT_CHARS], clarification.question])
+        state = self._wconv.get_state(chat_id)
+        created = now
+        if history and isinstance(state.context, dict) and isinstance(state.context.get("created_at"), (int, float)):
+            created = float(state.context["created_at"])
+        context: Dict[str, Any] = {"mode": mode, "rounds": rounds, "created_at": created}
+        with self._cond:
+            if work.generation != self._generation:
+                return
+            self._wconv.set_state(chat_id, STATE_CLARIFICATION, context, now)
+        self._send(chat_id, _reply(QUESTION_PREFIX + esc(clarification.question)))
+
+    def _proposal_extras(self, proposal: Proposal) -> Tuple[List[str], List[str]]:
+        """Compile warnings and a rule backtest for the proposal (best effort: never blocks the proposal)."""
+        try:
+            compiled = compile_profile(proposal.proposed, scrape_interval_hours=self._ctx.settings.scrape_interval_hours)
+            result = backtest_snapshots(self._wdb, proposal.base, proposal.proposed)
+            return list(compiled.warnings), render_backtest(result) if result is not None else []
+        except Exception as exc:
+            logger.debug("proposal extras skipped: %s", type(exc).__name__)
+            return [], []
+
+    def _store_proposal(self, work: _Work, proposal: Proposal, mode: str) -> None:
+        chat_id = work.buffer.chat_id
+        change_id = secrets.token_hex(4)
+        warnings, backtest_lines = self._proposal_extras(proposal)
+        messages = render_proposal(proposal, change_id, backtest_lines=backtest_lines, warnings=warnings)
+        pending = PendingChange(
+            chat_id=chat_id,
+            change_id=change_id,
+            base_version=proposal.base.version if proposal.base is not None else 0,
+            mode=mode,
+            operations=proposal.operations_json,
+            message_id=None,
+            created_at=self._clock(),
+        )
+        with self._cond:
+            if work.generation != self._generation:
+                return
+            superseded = self._wconv.put_pending(pending)
+            self._wconv.set_state(chat_id, STATE_CONFIRM, None, self._clock())
+        if superseded is not None:
+            self._clear_buttons(chat_id, superseded.message_id)
+            self._send(chat_id, _reply(SUPERSEDED_REPLY))
+        last_id = self._send(chat_id, messages)
+        if last_id is None:
+            return
+        self._wconv.set_pending_message(chat_id, change_id, last_id)
+        current = self._wconv.get_pending(chat_id)
+        if current is None or current.change_id != change_id:  # confirmed or cancelled while it was being sent
+            self._clear_buttons(chat_id, last_id)
+
+    # --- sending -----------------------------------------------------------------------------------
+
+    def _send(self, chat_id: int, messages: Sequence[OutgoingMessage]) -> Optional[int]:
+        """Send messages in chunks (buttons on the last chunk only); the id of the last message sent."""
+        last_id: Optional[int] = None
+        for message in messages:
+            pieces = chunk_html(message.text)
+            for index, piece in enumerate(pieces):
+                markup = message.reply_markup if index == len(pieces) - 1 else None
+                sent_id = self._client.send_message(chat_id, piece, markup)
+                last_id = sent_id if sent_id is not None else last_id
+        return last_id
+
+    def _clear_buttons(self, chat_id: int, message_id: Optional[int]) -> None:
+        if message_id is None:
+            return
+        try:
+            self._client.edit_message_reply_markup(chat_id, message_id)
+        except Exception as exc:
+            logger.debug("removing buttons failed: %s", type(exc).__name__)

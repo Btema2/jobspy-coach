@@ -598,6 +598,31 @@ def test_unknown_command_and_plain_text_hint(router):
     assert "Unknown command" not in send(router, "/setup")  # the wizard is plugged in by the router itself
 
 
+def test_plain_text_without_llm_keeps_hint(router):
+    # no chat LLM behind the router: free text, bare words and uploads keep today's hint, nothing is queued
+    from tests.fake_telegram import document_update
+
+    assert router.conversation is not None
+    assert send(router, "please add a role") == "Send /help to see what I can do."
+    messages = router.handle(parse_update(document_update(5, "f1", "notes.txt")))
+    assert [m.text for m in messages] == ["Send /help to see what I can do."]
+    assert router.conversation.process_next(10**12) is False
+
+
+def test_ok_and_cancel_are_routed_to_the_conversation(router):
+    assert send(router, "/ok") == "There is no pending proposal. Send /help for the commands."
+    assert send(router, "/cancel") == "There is nothing to cancel."
+    assert send(router, "yes") == "There is no pending proposal. Send /help for the commands."
+    assert "no longer active" in "\n".join(
+        m.text for m in router.handle(parse_update(callback_update(7, "pc:abc:1:a")))
+    )
+    assert "no longer active" in "\n".join(
+        m.text for m in router.handle(parse_update(callback_update(8, "cs:abc:yes")))
+    )
+    names = [name for name, _ in COMMANDS]
+    assert names[names.index("setup") + 1:names.index("setup") + 3] == ["ok", "cancel"]
+
+
 def test_args_too_long(router, store):
     before = version(store)
     assert send(router, "/add_role " + "x" * (MAX_ARGS_CHARS + 1)) == "That is too long."
@@ -651,7 +676,7 @@ def test_errors_are_translated(router, store, monkeypatch):
 def test_mutating_set_matches_spec(router):
     assert MUTATING_COMMANDS == frozenset(
         {"/add_role", "/remove_role", "/add_market", "/exclude", "/threshold", "/pause", "/resume",
-         "/run_now", "/undo", "/restore", "/requeue", "/setup", "/test"}
+         "/run_now", "/undo", "/restore", "/requeue", "/setup", "/test", "/ok", "/cancel"}
     )
     for command in MUTATING_COMMANDS:
         assert router.is_mutating(parse_update(message_update(1, f"{command} x")))
