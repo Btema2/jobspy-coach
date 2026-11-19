@@ -10,10 +10,12 @@ are never logged here.
 """
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Annotated, Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, get_args
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -26,7 +28,7 @@ from pydantic import (
 
 from src.bot.chat_llm import ChatLLM
 from src.bot.commands import USER_RULE_REASON, market_from_match
-from src.bot.countries import resolve_country
+from src.bot.countries import CountryMatch, resolve_country
 from src.bot.privacy import mask_personal_data
 from src.bot.render import chunk_html, esc
 from src.bot.updates import OutgoingMessage
@@ -68,9 +70,28 @@ _RULES_LISTED = 200
 _NOTHING = "that would change nothing"
 _BUILT_IN_RULES = "built-in rules cannot be changed from chat"
 
+# Control characters, zero-width and bidi controls (the set ``sanitize_profile_text`` removes, tabs and newlines
+# included: here they are first turned into single spaces).
+_INVISIBLE_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069]")
+
+
+def _words(value: str) -> str:
+    """Whitespace collapsed to single spaces, then control, zero-width and bidi characters removed (as the
+    commands collapse whitespace), so a name from the model cannot reorder or hide what the user confirms."""
+    value = " ".join(value.split())
+    return " ".join(_INVISIBLE_RE.sub("", value).split())
+
+
+def _clean_name(value: str) -> str:
+    cleaned = _words(value)
+    if not cleaned:
+        raise ValueError("must not be empty")
+    return cleaned
+
+
 _STRICT = ConfigDict(extra="forbid", str_strip_whitespace=True)
-Name = Annotated[str, StringConstraints(min_length=1, max_length=MAX_NAME_CHARS)]
-Term = Annotated[str, StringConstraints(min_length=1, max_length=MAX_TERM_CHARS)]
+Name = Annotated[str, StringConstraints(min_length=1, max_length=MAX_NAME_CHARS), AfterValidator(_clean_name)]
+Term = Annotated[str, StringConstraints(min_length=1, max_length=MAX_TERM_CHARS), AfterValidator(_clean_name)]
 LanguageCode = Annotated[
     str,
     BeforeValidator(lambda v: v.strip().lower() if isinstance(v, str) else v),
@@ -318,15 +339,22 @@ def _rule_ops(op: Union[RemoveRuleOp, ModifyRuleOp], work: ProfileSnapshot, prob
     return [RemoveRule(rule.kind, rule.term), AddRule(new)]
 
 
+def _match_of(market: Any) -> CountryMatch:
+    """The ``CountryMatch`` ``market_from_match`` would have been given for ``market``."""
+    return CountryMatch(market.countries[0] if market.countries else None, market.location, tuple(market.languages))
+
+
 def _modify_market_ops(op: ModifyMarketOp, work: ProfileSnapshot, problems: List[str]) -> List[Operation]:
     market = next((m for m in work.markets if _same(m.name, op.name)), None)
     if market is None:
         problems.append(f"no market named '{_line(op.name, 60)}'")
         return []
-    return [
-        RemoveMarket(market.name),
-        AddMarket(replace(market, remote=op.remote or op.remote_only, remote_only=op.remote_only)),
-    ]
+    updated = replace(market, remote=op.remote or op.remote_only, remote_only=op.remote_only)
+    # A market named the way ``/add_market`` names it follows its remote_only flag; a name the user chose stays.
+    standard = {market_from_match(_match_of(market), False, flag).name.casefold() for flag in (False, True)}
+    if market.name.strip().casefold() in standard:
+        updated = replace(updated, name=market_from_match(_match_of(market), updated.remote, updated.remote_only).name)
+    return [RemoveMarket(market.name), AddMarket(updated)]
 
 
 def _convert(op: Any, work: ProfileSnapshot, problems: List[str]) -> List[Operation]:
@@ -493,14 +521,24 @@ ONBOARDING_ADDENDUM = """
 
 This is the first setup: the profile is nearly empty and the user describes the search in their own words. Draft a starter profile with kind "proposal": the roles with synonyms in the languages of the chosen markets (tag each synonym with its language), the markets (countries and remote preference), a persona (a short factual description of the candidate and what they look for), a core_role_definition (what a role must mainly consist of to be a perfect match), dealbreakers (what to avoid), a target level when the user gives one, and a few starter "block" rules for obvious unwanted topics the user names. Use only what the user wrote; do not invent facts about them. Ask one question (kind "clarify") only when no role or no market can be derived at all."""
 
-_TAG_RE = re.compile(r"<\s*(/?)\s*(current_profile|user_message)\s*>", re.IGNORECASE)
+_NAMES = "current_profile|user_message"
+_OPEN = r"(?:<|&lt;|&#0*60;|&#x0*3c;)"
+_CLOSE = r"(?:>|&gt;|&#0*62;|&#x0*3e;)"
+# A tag form of a block name: any opener, optional slash, the name, anything up to a closer (attributes, a
+# trailing slash). Matched on NFKC-folded text, so fullwidth and small-form angle brackets are caught too.
+_TAG_RE = re.compile(rf"{_OPEN}\s*(/?)\s*({_NAMES})(?![A-Za-z0-9_])[^<>&]{{0,100}}{_CLOSE}", re.IGNORECASE)
+_BARE_NAME_RE = re.compile(rf"(?<![\[/])({_NAMES})(?![\]A-Za-z0-9_])", re.IGNORECASE)
 
 
 def _clean(text: Any, limit: int = _SHORT_LIMIT) -> str:
-    """Text made safe to embed: control characters removed, length capped, and a ``current_profile`` or
-    ``user_message`` tag (like a ``profile_data`` tag) neutralised so it cannot open or close a block."""
-    cleaned = sanitize_profile_text(str(text), limit)
-    return _TAG_RE.sub(lambda m: f"[{m.group(1)}{m.group(2).lower()}]", cleaned)
+    """Text made safe to embed: NFKC-folded, control characters removed, length capped, and every form of a
+    ``current_profile`` or ``user_message`` tag (ASCII, fullwidth, entity, with attributes or spaces)
+    neutralised like ``sanitize_profile_text`` does for ``profile_data``, so it cannot open or close a block.
+    A name left bare is hyphenated, so no tag-like form of it survives."""
+    folded = unicodedata.normalize("NFKC", str(text))
+    cleaned = sanitize_profile_text(folded, limit)
+    cleaned = _TAG_RE.sub(lambda m: f"[{m.group(1)}{m.group(2).lower()}]", cleaned)
+    return _BARE_NAME_RE.sub(lambda m: m.group(1).lower().replace("_", "-"), cleaned)
 
 
 def _capped(lines: List[str], limit: int) -> List[str]:
@@ -604,6 +642,8 @@ class Translator:
 
 # --- rendering ----------------------------------------------------------------------------------------
 
+_CHANGE_ID_RE = re.compile(r"[0-9a-f]{8}")
+MAX_CALLBACK_BYTES = 64
 FOOTER = "Confirm with the button or /ok, discard with Cancel or /cancel. Expires in 24 hours."
 
 
@@ -616,6 +656,8 @@ def render_proposal(
 ) -> List[OutgoingMessage]:
     """The proposal as messages: code-rendered diff, full text of any persona or definition change, buttons on
     the last message only. Every chunk stays within Telegram's limit; no tag spans lines."""
+    if not _CHANGE_ID_RE.fullmatch(change_id):
+        raise ValueError("change_id must be 8 lower-case hex digits")
     lines = ["<b>Proposed change</b> (nothing is applied until you confirm)"]
     lines.extend(esc(line) for line in proposal.diff)
     for field, text in proposal.text_changes:
@@ -626,11 +668,9 @@ def render_proposal(
     lines.append(FOOTER)
     version = proposal.base.version if proposal.base is not None else 0
     label = "Apply persona change" if proposal.text_changes else "Confirm"
-    markup = {
-        "inline_keyboard": [
-            [{"text": label, "callback_data": f"pc:{change_id}:{version}:a"}],
-            [{"text": "Cancel", "callback_data": f"pc:{change_id}:{version}:c"}],
-        ]
-    }
+    accept, cancel = f"pc:{change_id}:{version}:a", f"pc:{change_id}:{version}:c"
+    if max(len(accept.encode()), len(cancel.encode())) > MAX_CALLBACK_BYTES:
+        raise ValueError("callback data exceeds Telegram's 64 bytes")
+    markup = {"inline_keyboard": [[{"text": label, "callback_data": accept}], [{"text": "Cancel", "callback_data": cancel}]]}
     chunks = chunk_html("\n".join(lines))
     return [OutgoingMessage(chunk, markup if index == len(chunks) - 1 else None) for index, chunk in enumerate(chunks)]
