@@ -343,6 +343,15 @@ class Database:
             )
             return [self._row_to_job(r) for r in cursor.fetchall()]
 
+    def count_unprocessed_jobs(self) -> int:
+        """All rows ``get_unprocessed_jobs`` would return without a limit (same WHERE)."""
+        with self._get_connection() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE eval_status = 'unprocessed' AND pre_filtered = 0"
+                ).fetchone()[0]
+            )
+
     def update_evaluation(
         self,
         job_id: int,
@@ -450,6 +459,21 @@ class Database:
             LIMIT ?
             """, (min_score, limit))
             return [self._row_to_job(r) for r in cursor.fetchall()]
+
+    def count_pending_digest_jobs(self, min_score: float) -> int:
+        """All rows ``get_pending_digest_jobs`` would return without a limit (same WHERE)."""
+        with self._get_connection() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM jobs
+                    WHERE eval_status = 'evaluated'
+                      AND notification_status = 'pending'
+                      AND eval_score >= ?
+                    """,
+                    (min_score,),
+                ).fetchone()[0]
+            )
 
     def mark_instant_sent(self, job_id: int) -> None:
         now_str = datetime.now(timezone.utc).isoformat()

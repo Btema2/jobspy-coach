@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from src.scheduler.daemon import DaemonService
+from src.scheduler.daemon import DaemonService, EvalSummary
 from src.scraper.jobspy_scraper import JobSpyScraper
 from src.scraper.query_catalog import SearchQuery
 
@@ -144,7 +144,7 @@ def test_progress_lines_appear_on_the_daemon_path(tmp_path, monkeypatch, sleeps,
     _patch_scrape(monkeypatch, {"linkedin": pd.DataFrame([_row(1), _row(2)])})
     scraper = _scraper()
     daemon = DaemonService(db_path=tmp_path / "p.db", scraper=scraper, evaluator=MagicMock(), notifier=MagicMock())
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     queries = [
         _query(query_id="Q-A", site_names=["linkedin", "indeed"], country_code=None),  # indeed skipped
         _query(query_id="Q-B", site_names=["linkedin"]),
@@ -165,7 +165,7 @@ def test_daemon_does_not_sleep_jitter_for_skipped_boards(tmp_path, monkeypatch, 
     _patch_scrape(monkeypatch, {})
     scraper = _scraper(jitter_min=2.0, jitter_max=3.0)
     daemon = DaemonService(db_path=tmp_path / "j.db", scraper=scraper, evaluator=MagicMock(), notifier=MagicMock())
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     queries = [_query(site_names=["indeed", "linkedin", "glassdoor"], country_code=None)]
     daemon.run_pipeline_cycle(queries=queries)
     # Only linkedin is requested: no inter-call jitter at all.
@@ -239,7 +239,7 @@ def test_skipped_empty_linkedin_job_is_not_persisted_and_is_retried(tmp_path, mo
     frames = {"linkedin": pd.DataFrame([_row(1, desc=None)])}
     _patch_scrape(monkeypatch, frames)
     daemon = DaemonService(db_path=tmp_path / "r.db", scraper=_scraper(), evaluator=MagicMock(), notifier=MagicMock())
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     q = _query()
     assert daemon.run_pipeline_cycle(queries=[q])[0] == 0
     with daemon.db._get_connection() as conn:
@@ -278,7 +278,7 @@ def test_non_google_board_errors_logged_once_per_board_and_message(monkeypatch, 
 
 def _daemon(tmp_path, scraper):
     daemon = DaemonService(db_path=tmp_path / "s.db", scraper=scraper, evaluator=MagicMock(), notifier=MagicMock())
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     return daemon
 
 
@@ -320,3 +320,113 @@ def test_scrape_all_queries_warns_country_less_once_not_twice(monkeypatch, sleep
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         _scraper().scrape_all_queries([_query(site_names=["indeed"], country_code=None)])
     assert len([r for r in caplog.records if "country_code" in r.getMessage()]) == 1
+
+
+# ------------------------------------------------ cycle counters for the run report
+
+
+def test_end_cycle_returns_the_number_of_skipped_board_calls(monkeypatch, sleeps):
+    _patch_scrape(monkeypatch, {})
+    scraper = _scraper(enabled_boards=["linkedin", "indeed", "glassdoor"])
+    assert scraper.end_cycle() == 0  # no cycle in progress
+    scraper.begin_cycle(
+        [
+            _query(query_id="Q-A", site_names=["linkedin", "indeed", "google"], country_code=None),  # google disabled
+            _query(query_id="Q-B", site_names=["indeed", "glassdoor"], country_code=None),
+            _query(query_id="Q-C", site_names=["indeed"], country_code="testland"),
+        ]
+    )
+    assert scraper.end_cycle() == 3  # indeed x2 + glassdoor x1 (missing country); disabled boards are deliberate
+    assert scraper.end_cycle() == 0
+
+
+def test_scrape_stats_split_new_and_prefiltered_and_record_problems(tmp_path, monkeypatch, sleeps):
+    from src.scheduler.daemon import REASON_BLOCKED_429, REASON_DETAIL_PAGES, REASON_NO_DATA
+
+    secret_error = "proxy http://user:hunter2@proxy.example:8080 refused the connection " + "x" * 100
+
+    def fake(**kwargs):
+        site, location = kwargs["site_name"][0], kwargs["location"]
+        if (site, location) == ("linkedin", "A"):
+            return pd.DataFrame([_row(1), _row(2, desc="short stub"), _row(3, desc=None)])
+        if site == "google":
+            return _df_with_errors({"google": "no job data returned"})
+        if (site, location) == ("indeed", "A"):
+            return pd.DataFrame([_row(4)])
+        if (site, location) == ("linkedin", "B"):
+            return _df_with_errors({"linkedin": "HTTP 429 Too Many Requests"})
+        if (site, location) == ("indeed", "B"):
+            raise RuntimeError(secret_error)
+        return pd.DataFrame()
+
+    monkeypatch.setattr("src.scraper.jobspy_scraper.scrape_jobs", MagicMock(side_effect=fake))
+    daemon = _daemon(tmp_path, _scraper())
+    queries = [
+        _query(query_id="Q-A", location="A", site_names=["linkedin", "google", "indeed"]),
+        _query(query_id="Q-B", location="B", site_names=["linkedin", "indeed"]),
+        _query(query_id="Q-C", location="C", site_names=["linkedin"]),
+        _query(query_id="Q-D", location="D", site_names=["indeed"], country_code=None),  # skipped: no country
+    ]
+
+    stats = daemon._scrape_queries(queries, dry_run=False)
+
+    assert (stats.ok, stats.empty, stats.failed) == (2, 1, 3)
+    assert stats.skipped_boards == 1
+    assert (stats.new_to_evaluate, stats.prefiltered) == (2, 1)
+    assert stats.total_new_saved == 3
+    problems = stats.problem_list()
+    assert ("linkedin", REASON_DETAIL_PAGES, 1) in problems
+    assert ("google", REASON_NO_DATA, 1) in problems
+    assert ("linkedin", REASON_BLOCKED_429, 1) in problems
+    (indeed,) = [p for p in problems if p[0] == "indeed"]
+    assert indeed[2] == 1
+    assert len(indeed[1]) <= 60 and "hunter2" not in indeed[1] and indeed[1].startswith("proxy")
+    assert len(problems) == 4
+    assert ("Q-B", "linkedin", REASON_BLOCKED_429) in stats.problem_details
+
+    # A second run of the same queries: everything is known now, nothing new is counted.
+    again = daemon._scrape_queries(queries, dry_run=False)
+    assert (again.new_to_evaluate, again.prefiltered, again.total_new_saved) == (0, 0, 0)
+
+
+def test_scrape_stats_aggregate_problems_per_board_and_reason():
+    from src.scheduler.daemon import REASON_BLOCKED_429, ScrapeStats
+    from src.scraper.outcome import STATUS_FAILED, STATUS_OK, ScrapeOutcome
+
+    stats = ScrapeStats()
+    blocked = ScrapeOutcome(postings=[], rows=0, status=STATUS_FAILED, error="HTTP 429")
+    stats.record("Q-A", "linkedin", blocked)
+    stats.record("Q-B", "linkedin", blocked)
+    stats.record("Q-C", "indeed", ScrapeOutcome(postings=[], rows=0, status=STATUS_FAILED, error="HTTP 429"))
+    stats.record("Q-D", "indeed", ScrapeOutcome(postings=[], rows=3, status=STATUS_OK))
+    stats.record_exception("Q-E", "google", RuntimeError("boom"))
+
+    assert stats.problem_list() == [
+        ("linkedin", REASON_BLOCKED_429, 2),
+        ("indeed", "HTTP 429", 1),  # only LinkedIn's 429 is classified; other boards keep their text
+        ("google", "boom", 1),
+    ]
+    assert (stats.ok, stats.empty, stats.failed) == (1, 0, 4)
+
+
+def test_classify_scrape_problems():
+    from src.scheduler.daemon import (
+        REASON_BLOCKED_429,
+        REASON_DETAIL_PAGES,
+        REASON_NO_DATA,
+        classify_scrape_problems,
+    )
+    from src.scraper.outcome import STATUS_EMPTY, STATUS_FAILED, STATUS_OK, ScrapeOutcome
+
+    def failed(error):
+        return ScrapeOutcome(postings=[], rows=0, status=STATUS_FAILED, error=error)
+
+    assert classify_scrape_problems("linkedin", failed("HTTP 429 Too Many Requests")) == [REASON_BLOCKED_429]
+    assert classify_scrape_problems("google", failed("Google: No job data returned")) == [REASON_NO_DATA]
+    assert classify_scrape_problems("indeed", failed("y" * 200)) == ["y" * 60]
+    assert classify_scrape_problems("indeed", failed(None)) == ["unknown error"]
+    assert classify_scrape_problems("linkedin", ScrapeOutcome(postings=[], rows=4, status=STATUS_OK, skipped_empty=2)) == [
+        REASON_DETAIL_PAGES
+    ]
+    assert classify_scrape_problems("linkedin", ScrapeOutcome(postings=[], rows=0, status=STATUS_EMPTY)) == []
+    assert classify_scrape_problems("indeed", ScrapeOutcome(postings=[], rows=5, status=STATUS_OK)) == []

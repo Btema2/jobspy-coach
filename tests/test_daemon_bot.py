@@ -12,7 +12,7 @@ from src.bot.commands import TRIGGER_BUSY, TRIGGER_NOT_READY, TRIGGER_STARTED
 from src.bot.state import BotStateStore, Pairing
 from src.bot.updates import parse_update
 from src.config import Settings
-from src.scheduler.daemon import DaemonService
+from src.scheduler.daemon import DaemonService, EvalSummary
 from src.scraper.query_catalog import SearchQuery
 from src.storage.db import Database
 from tests.fake_telegram import message_update
@@ -195,7 +195,7 @@ class SlowScraper:
 def test_scheduled_cycle_skipped_while_one_runs(tmp_path, caplog):
     scraper = SlowScraper()
     daemon = _daemon(tmp_path, scraper=scraper)
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     queries = [SearchQuery("Q1", "term", "loc", ["google"])]
     results = []
     first = threading.Thread(target=lambda: results.append(daemon.run_pipeline_cycle(queries=queries)))

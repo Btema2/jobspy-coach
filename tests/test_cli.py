@@ -3,6 +3,7 @@ import pytest
 from typer.testing import CliRunner
 from unittest.mock import MagicMock
 from src.cli import app
+from src.scheduler.daemon import EvalSummary
 
 
 runner = CliRunner()
@@ -97,7 +98,7 @@ def test_cli_test_telegram_command_failure(monkeypatch):
 
 
 def test_cli_evaluate_command(monkeypatch):
-    mock_eval = MagicMock(return_value=(5, 1))
+    mock_eval = MagicMock(return_value=EvalSummary(5, 1, 0, 0, None))
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.evaluate_unprocessed", mock_eval)
 
     result = runner.invoke(app, ["evaluate", "--limit", "10"])
@@ -112,7 +113,7 @@ def test_cli_evaluate_default_limit_comes_from_settings(monkeypatch):
     from src.config import get_settings
 
     get_settings.cache_clear()
-    mock_eval = MagicMock(return_value=(0, 0))
+    mock_eval = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.evaluate_unprocessed", mock_eval)
 
     result = runner.invoke(app, ["evaluate"])

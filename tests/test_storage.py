@@ -810,3 +810,51 @@ def test_stale_pending_days_default():
     from src.storage.db import STALE_PENDING_DAYS
 
     assert STALE_PENDING_DAYS == 7
+
+
+# ----- counts for the run report (no LIMIT) -----
+
+
+def _evaluated(db: Database, name: str, score: float, status=None) -> int:
+    job_id, _ = db.save_job(_mk_job(name))
+    db.update_evaluation(
+        job_id,
+        eval_result=JobEvaluationResult(score=score, is_wow=False, summary="s", reasoning="r"),
+        notification_status=status,
+    )
+    return job_id
+
+
+def test_count_pending_digest_jobs_counts_only_pending_rows_at_or_above_threshold(tmp_path: Path):
+    db = Database(tmp_path / "count_digest.db")
+    db.init_db()
+    _evaluated(db, "a", 6.5)  # at the threshold: counted
+    _evaluated(db, "b", 9.0)  # above: counted
+    _evaluated(db, "c", 6.4)  # below: not counted
+    _evaluated(db, "d", 8.0, status="dismissed")
+    sent = _evaluated(db, "e", 8.0)
+    db.mark_digest_sent([sent])
+    instant = _evaluated(db, "f", 9.5)
+    db.mark_instant_sent(instant)
+    db.save_job(_mk_job("g"))  # unprocessed, pending notification: not evaluated, not counted
+    for n in range(12):  # more rows than the digest's default limit: the count is not capped
+        _evaluated(db, f"many{n}", 7.0)
+
+    assert db.count_pending_digest_jobs(min_score=6.5) == 14
+    assert db.count_pending_digest_jobs(min_score=9.0) == 1
+    assert db.count_pending_digest_jobs(min_score=6.5) == len(db.get_pending_digest_jobs(min_score=6.5, limit=100))
+
+
+def test_count_unprocessed_jobs_matches_get_unprocessed_jobs_without_limit(tmp_path: Path):
+    db = Database(tmp_path / "count_unprocessed.db")
+    db.init_db()
+    assert db.count_unprocessed_jobs() == 0
+    for n in range(60):  # above get_unprocessed_jobs' default limit of 50
+        db.save_job(_mk_job(f"u{n}"))
+    db.save_job(_mk_job("pre", pre_filtered=True, notification_status="dismissed"))
+    _evaluated(db, "done", 7.0)
+    failed_id, _ = db.save_job(_mk_job("failed"))
+    db.update_eval_failure(failed_id, "boom")
+
+    assert db.count_unprocessed_jobs() == 60
+    assert db.count_unprocessed_jobs() == len(db.get_unprocessed_jobs(limit=1000))

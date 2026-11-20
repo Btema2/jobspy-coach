@@ -125,7 +125,7 @@ def test_max_simultaneous_never_exceeds_workers(tmp_path):
     daemon = make_daemon(tmp_path, FakeEvaluator(behaviour), EVAL_MAX_WORKERS=3)
     seed(daemon, 6)
 
-    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10).as_tuple()
 
     assert evaluated == 6
     assert wow == 0
@@ -169,7 +169,7 @@ def test_only_caller_thread_touches_db_and_telegram(tmp_path):
     t.join(WAIT)
     assert not t.is_alive()
 
-    assert caller["result"] == (4, 4)
+    assert caller["result"].as_tuple() == (4, 4)
     assert len(touched) == 12  # 4 x (update, alert, mark)
     assert set(touched) == {caller["id"]}
     assert caller["id"] not in set(fake.threads)  # workers are different threads
@@ -198,7 +198,7 @@ def test_results_handled_as_completed_not_submission_order(tmp_path):
 
     daemon.db.update_evaluation = update
 
-    assert daemon.evaluate_unprocessed(limit=10) == (2, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (2, 0)
     assert order == [ids[1], ids[0]]
 
 
@@ -224,7 +224,7 @@ def test_providers_unavailable_stops_batch_and_keeps_jobs_unprocessed(tmp_path):
     daemon = make_daemon(tmp_path, fake, EVAL_MAX_WORKERS=2)
     ids = seed(daemon, 4)
 
-    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10).as_tuple()
 
     assert (evaluated, wow) == (0, 0)
     assert fake.stop_calls >= 1
@@ -248,11 +248,11 @@ def test_next_batch_works_after_providers_unavailable_stop(tmp_path):
     daemon = make_daemon(tmp_path, fake, EVAL_MAX_WORKERS=1)
     seed(daemon, 2)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     assert fake.stop_event.is_set()
 
     mode["down"] = False
-    assert daemon.evaluate_unprocessed(limit=10) == (2, 0)  # stop event re-armed for the next cycle
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (2, 0)  # stop event re-armed for the next cycle
     assert not fake.stop_event.is_set()
 
 
@@ -263,16 +263,16 @@ def test_evaluation_rejected_increments_attempts_until_failed(tmp_path):
     daemon = make_daemon(tmp_path, FakeEvaluator(behaviour), EVAL_MAX_ATTEMPTS=2)
     (job_id,) = seed(daemon, 1)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     job = daemon.db.get_job_by_id(job_id)
     assert (job.eval_status, job.eval_attempts) == ("unprocessed", 1)
     assert "invalid for this job" in (job.eval_error or "")
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     job = daemon.db.get_job_by_id(job_id)
     assert (job.eval_status, job.eval_attempts) == ("failed", 2)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)  # failed jobs are no longer fetched
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)  # failed jobs are no longer fetched
 
 
 def test_stop_requested_is_ignored(tmp_path):
@@ -282,7 +282,7 @@ def test_stop_requested_is_ignored(tmp_path):
     daemon = make_daemon(tmp_path, FakeEvaluator(behaviour))
     (job_id,) = seed(daemon, 1)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     job = daemon.db.get_job_by_id(job_id)
     assert (job.eval_status, job.eval_attempts, job.eval_error) == ("unprocessed", 0, None)
 
@@ -310,7 +310,7 @@ def test_threshold_decisions(tmp_path, score, extra, expect_wow, expect_status):
     daemon = make_daemon(tmp_path, fake, notifier=notifier)
     (job_id,) = seed(daemon, 1)
 
-    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10).as_tuple()
 
     assert evaluated == 1
     assert wow == (1 if expect_wow else 0)
@@ -328,7 +328,7 @@ def test_thresholds_come_from_settings(tmp_path):
     fake = FakeEvaluator(lambda job: make_result(7.0))
     daemon = make_daemon(tmp_path, fake, notifier=notifier, WOW_SCORE_THRESHOLD=7.0, DIGEST_SCORE_THRESHOLD=7.5)
     seed(daemon, 1)
-    assert daemon.evaluate_unprocessed(limit=10) == (1, 1)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (1, 1)
 
 
 def test_wow_alert_failure_leaves_job_pending(tmp_path):
@@ -337,7 +337,7 @@ def test_wow_alert_failure_leaves_job_pending(tmp_path):
     daemon = make_daemon(tmp_path, FakeEvaluator(lambda job: make_result(9.0)), notifier=notifier)
     (job_id,) = seed(daemon, 1)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (1, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (1, 0)
     job = daemon.db.get_job_by_id(job_id)
     assert job.eval_status == "evaluated"
     assert job.notification_status == "pending"
@@ -350,7 +350,7 @@ def test_dry_run_same_flow_without_writes_or_alerts(tmp_path):
     daemon = make_daemon(tmp_path, fake, notifier=notifier)
     ids = seed(daemon, 3)
 
-    evaluated, wow = daemon.evaluate_unprocessed(limit=10, dry_run=True)
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10, dry_run=True).as_tuple()
 
     assert (evaluated, wow) == (3, 1)
     notifier.send_wow_alert.assert_not_called()
@@ -368,7 +368,7 @@ def test_dry_run_failures_do_not_touch_db(tmp_path):
 
     daemon = make_daemon(tmp_path, FakeEvaluator(behaviour), EVAL_MAX_WORKERS=1)
     ids = seed(daemon, 2)
-    assert daemon.evaluate_unprocessed(limit=10, dry_run=True) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10, dry_run=True).as_tuple() == (0, 0)
     for job_id in ids:
         job = daemon.db.get_job_by_id(job_id)
         assert (job.eval_status, job.eval_attempts) == ("unprocessed", 0)
@@ -386,7 +386,7 @@ def test_other_exceptions_keep_existing_semantics(tmp_path):
     daemon = make_daemon(tmp_path, FakeEvaluator(behaviour))
     transient_id, permanent_id = seed(daemon, 2)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     assert daemon.db.get_job_by_id(transient_id).eval_status == "unprocessed"
     permanent = daemon.db.get_job_by_id(permanent_id)
     assert permanent.eval_status == "failed"
@@ -397,7 +397,7 @@ def test_default_limit_comes_from_settings(tmp_path):
     fake = FakeEvaluator(lambda job: make_result(7.0))
     daemon = make_daemon(tmp_path, fake, EVAL_BATCH_LIMIT=2)
     seed(daemon, 5)
-    assert daemon.evaluate_unprocessed() == (2, 0)
+    assert daemon.evaluate_unprocessed().as_tuple() == (2, 0)
 
 
 # ----- logging -----
@@ -500,8 +500,8 @@ def test_evaluate_builds_chain_lazily_once_and_surfaces_config_error(tmp_path, m
     fake = FakeEvaluator(lambda job: make_result(7.0))
     builder.side_effect = None
     builder.return_value = fake
-    assert daemon.evaluate_unprocessed(limit=10) == (1, 0)
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (1, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     assert builder.call_count == 2  # failed attempt + one successful build, then reused
     assert builder.call_args.kwargs["stop_event"] is daemon._stop_event
 
@@ -510,7 +510,7 @@ def test_no_unprocessed_jobs_does_not_need_a_chain(tmp_path, monkeypatch):
     builder = MagicMock(side_effect=ConfigurationError("no provider"))
     monkeypatch.setattr("src.scheduler.daemon.build_chain_from_settings", builder)
     daemon = DaemonService(db_path=tmp_path / "lazy3.db", notifier=MagicMock())
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     builder.assert_not_called()
 
 
@@ -575,7 +575,7 @@ def test_stop_releases_workers_blocked_in_rate_limiter(tmp_path):
 
     assert not t.is_alive()
     assert time.monotonic() - started < 2.0
-    assert result["value"] == (0, 0)
+    assert result["value"].as_tuple() == (0, 0)
     for job in daemon.db.get_unprocessed_jobs(limit=10):
         assert job.eval_attempts == 0
 
@@ -612,7 +612,7 @@ def test_sigterm_handler_stops_chain_and_cancels_queued_futures(monkeypatch, tmp
     assert chain.stop_event.is_set()
     assert not t.is_alive()
     assert time.monotonic() - started < 2.0
-    assert result["value"] == (0, 0)
+    assert result["value"].as_tuple() == (0, 0)
     # the handler must never touch the executor's shutdown lock: only the batch thread shuts it down
     assert shutdown_threads and set(shutdown_threads) == {t.ident}
     mock_scheduler.shutdown.assert_called()
@@ -653,7 +653,7 @@ def test_shutdown_requested_during_job_fetch_is_not_undone(tmp_path):
 
     daemon.db.get_unprocessed_jobs = fetch
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     assert fake.calls == []
     assert daemon._stop_event.is_set() and fake.stop_event.is_set()
     for job_id in ids:
@@ -682,7 +682,7 @@ def test_shutdown_requested_while_submitting_cancels_the_batch(tmp_path, monkeyp
     holder["daemon"] = daemon
     ids = seed(daemon, 3)
 
-    assert daemon.evaluate_unprocessed(limit=10) == (0, 0)
+    assert daemon.evaluate_unprocessed(limit=10).as_tuple() == (0, 0)
     assert "Career Coach 3" not in fake.calls
     for job_id in ids:
         assert daemon.db.get_job_by_id(job_id).eval_status == "unprocessed"
@@ -798,7 +798,7 @@ def test_non_direct_coaching_job_never_triggers_wow(tmp_path, direct, expect_wow
     daemon = make_daemon(tmp_path, chain, notifier=notifier)
     (job_id,) = seed(daemon, 1)
 
-    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10).as_tuple()
 
     assert (evaluated, wow) == (1, 1 if expect_wow else 0)
     assert notifier.send_wow_alert.called == expect_wow
@@ -819,7 +819,7 @@ def test_wow_needs_direct_coaching_even_when_threshold_is_below_the_digest_cap(t
     other_id = daemon.db.save_job(make_job(1, title="Programme Trainer"))[0]
     direct_id = daemon.db.save_job(make_job(2, title="Direct Coach"))[0]
 
-    evaluated, wow = daemon.evaluate_unprocessed(limit=10)
+    evaluated, wow = daemon.evaluate_unprocessed(limit=10).as_tuple()
 
     assert (evaluated, wow) == (2, 1)
     other = daemon.db.get_job_by_id(other_id)
@@ -827,3 +827,107 @@ def test_wow_needs_direct_coaching_even_when_threshold_is_below_the_digest_cap(t
     direct = daemon.db.get_job_by_id(direct_id)
     assert direct.eval_is_wow and direct.notification_status == "instant_sent"
     assert notifier.send_wow_alert.call_count == 1
+
+
+# ----- structured summary (EvalSummary) -----
+
+
+def test_eval_summary_tuple_view_and_frozen():
+    from dataclasses import FrozenInstanceError
+
+    from src.scheduler.daemon import EvalSummary
+
+    summary = EvalSummary(evaluated=3, wow_sent=1, not_scored_in_batch=2, beyond_limit=4, stopped_reason=None)
+    assert summary.as_tuple() == (3, 1)
+    with pytest.raises(FrozenInstanceError):
+        summary.evaluated = 5  # type: ignore[misc]
+
+
+def test_eval_summary_counts_the_backlog_beyond_the_batch_limit(tmp_path):
+    from src.scheduler.daemon import EvalSummary
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(lambda job: make_result(7.0)))
+    seed(daemon, 5)
+
+    summary = daemon.evaluate_unprocessed(limit=2)
+
+    assert summary == EvalSummary(
+        evaluated=2, wow_sent=0, not_scored_in_batch=0, beyond_limit=3, stopped_reason=None
+    )
+
+
+def test_eval_summary_beyond_limit_is_never_negative_and_empty_queue_is_all_zero(tmp_path):
+    from src.scheduler.daemon import EvalSummary
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(lambda job: make_result(9.0)))
+    assert daemon.evaluate_unprocessed(limit=10) == EvalSummary(0, 0, 0, 0, None)
+    seed(daemon, 2)
+    summary = daemon.evaluate_unprocessed(limit=10)
+    assert summary == EvalSummary(evaluated=2, wow_sent=2, not_scored_in_batch=0, beyond_limit=0, stopped_reason=None)
+
+
+def test_eval_summary_reports_a_provider_outage(tmp_path):
+    from src.scheduler.daemon import STOPPED_PROVIDERS_UNAVAILABLE
+
+    def behaviour(job):
+        if job.title == "Career Coach 1":
+            raise ProvidersUnavailable("all down")
+        assert fake.stop_event.wait(WAIT)
+        raise StopRequested("stop")
+
+    fake = FakeEvaluator(behaviour)
+    daemon = make_daemon(tmp_path, fake, EVAL_MAX_WORKERS=2)
+    seed(daemon, 5)
+
+    summary = daemon.evaluate_unprocessed(limit=4)
+
+    assert summary.as_tuple() == (0, 0)
+    assert summary.not_scored_in_batch == 4  # every job of this batch stays unprocessed
+    assert summary.beyond_limit == 1
+    assert summary.stopped_reason == STOPPED_PROVIDERS_UNAVAILABLE
+
+
+def test_eval_summary_reports_a_batch_aborted_by_shutdown(tmp_path):
+    from src.scheduler.daemon import STOPPED_SHUTDOWN
+
+    def behaviour(job):
+        if job.title == "Career Coach 1":
+            daemon.request_shutdown()  # a signal lands while the first job is evaluated
+            return make_result(7.0)
+        raise AssertionError("queued jobs must be cancelled")
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(behaviour), EVAL_MAX_WORKERS=1)
+    seed(daemon, 3)
+
+    summary = daemon.evaluate_unprocessed(limit=10)
+
+    assert summary.evaluated == 1
+    assert summary.not_scored_in_batch == 2
+    assert summary.stopped_reason == STOPPED_SHUTDOWN
+
+
+def test_eval_summary_failures_are_not_counted_as_unscored(tmp_path):
+    def behaviour(job):
+        raise EvaluationRejected("bad job")
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(behaviour))
+    seed(daemon, 2)
+
+    summary = daemon.evaluate_unprocessed(limit=10)
+
+    assert summary.as_tuple() == (0, 0)
+    assert summary.not_scored_in_batch == 0  # handled (attempt recorded), not left behind by an abort
+    assert summary.stopped_reason is None
+
+
+def test_eval_summary_when_shutdown_was_requested_before_the_batch(tmp_path):
+    from src.scheduler.daemon import STOPPED_SHUTDOWN
+
+    daemon = make_daemon(tmp_path, FakeEvaluator(lambda job: make_result(7.0)))
+    seed(daemon, 2)
+    daemon.request_shutdown()
+
+    summary = daemon.evaluate_unprocessed(limit=10)
+
+    assert summary.as_tuple() == (0, 0)
+    assert summary.stopped_reason == STOPPED_SHUTDOWN

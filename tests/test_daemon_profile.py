@@ -17,7 +17,7 @@ from src.profile.importer import build_imported_snapshot, parse_queries_json
 from src.profile.errors import ProfileCompileError
 from src.profile.ops import AddPinnedQuery, ReplaceProfile, SetField, apply_changes
 from src.profile.snapshot import PinnedQuery, ProfileFields, ProfileSnapshot
-from src.scheduler.daemon import DaemonService
+from src.scheduler.daemon import DaemonService, EvalSummary
 from src.scraper import query_catalog
 from src.scraper.jobspy_scraper import JobSpyScraper
 from src.scraper.outcome import STATUS_EMPTY, ScrapeOutcome
@@ -286,7 +286,7 @@ def test_paused_profile_skips_scraping_but_evaluates(tmp_path):
     scraper = FakeScraper()
     daemon = _make(tmp_path, scraper)
     _import_fixture(daemon, paused=True)
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
 
     daemon.run_pipeline_cycle()
 
@@ -298,7 +298,7 @@ def test_paused_profile_skips_scraping_but_evaluates(tmp_path):
 
 def test_dry_run_cycle_sends_no_alert_and_does_not_evaluate(tmp_path):
     daemon = _make(tmp_path)
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
 
     assert daemon.run_pipeline_cycle(dry_run=True) == (0, 0)
 
@@ -488,7 +488,7 @@ def test_evaluation_without_profile_calls_legacy_signature(tmp_path):
     daemon = _make(tmp_path, FakeScraper(), chain)
     _seed_job(daemon)
 
-    evaluated, _ = daemon.evaluate_unprocessed()
+    evaluated, _ = daemon.evaluate_unprocessed().as_tuple()
 
     assert evaluated == 1
     assert chain.jobs == ["Career Coach 1"]
@@ -568,7 +568,7 @@ def test_profile_thresholds_drive_wow_and_dismissal(tmp_path):
     _profile(daemon, wow_threshold=8.0, digest_threshold=6.0, core_role_definition="<CORE>")
     ids = [_save(daemon, n, t) for n, t in enumerate(["Core A", "Core B", "Core C"], 1)]
 
-    evaluated, wow = daemon.evaluate_unprocessed()
+    evaluated, wow = daemon.evaluate_unprocessed().as_tuple()
 
     assert (evaluated, wow) == (3, 1)
     a, b, c = (daemon.db.get_job_by_id(i) for i in ids)
@@ -584,7 +584,7 @@ def test_non_core_never_wow_with_lowered_threshold(tmp_path):
     _profile(daemon, wow_threshold=7.0, digest_threshold=6.0, core_role_definition="<CORE>")
     job_id = _save(daemon, 1, "Trainer")
 
-    evaluated, wow = daemon.evaluate_unprocessed()
+    evaluated, wow = daemon.evaluate_unprocessed().as_tuple()
 
     assert (evaluated, wow) == (1, 0)
     job = daemon.db.get_job_by_id(job_id)
@@ -883,7 +883,7 @@ def test_db_busy_without_a_last_good_profile_skips_evaluation(tmp_path, monkeypa
     _store_raises(daemon, monkeypatch, sqlite3.OperationalError("database is locked"))
 
     assert daemon.run_pipeline_cycle() == (0, 0)
-    assert daemon.evaluate_unprocessed() == (0, 0)  # the UNSET default resolves the profile itself
+    assert daemon.evaluate_unprocessed().as_tuple() == (0, 0)  # the UNSET default resolves the profile itself
 
     assert chain.calls == 0
     assert [j.eval_status for j in daemon.db.get_unprocessed_jobs()] == ["unprocessed"]
@@ -925,7 +925,7 @@ def test_legacy_profile_behaves_as_today_at_8_5_and_6_5(tmp_path):
     _import_fixture(daemon)
     ids = {title: _save(daemon, n, title) for n, title in enumerate(answers, 1)}
 
-    evaluated, wow = daemon.evaluate_unprocessed()
+    evaluated, wow = daemon.evaluate_unprocessed().as_tuple()
 
     assert (evaluated, wow) == (3, 1)
     wow_job, low, trainer = (daemon.db.get_job_by_id(ids[t]) for t in ("Core WOW", "Core Low", "Trainer"))

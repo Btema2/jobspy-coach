@@ -386,7 +386,7 @@ def evaluate(
     console.print(f"[bold blue]Evaluating up to {limit} unprocessed vacancies (dry_run={dry_run})...[/bold blue]")
     daemon = DaemonService()
     try:
-        evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run)
+        evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run).as_tuple()
     except ConfigurationError as e:
         raise _exit_on_missing_provider(e) from None
     console.print(f"[bold green]Evaluation completed. Evaluated: {evaluated}, Instant WOW alerts: {wow_sent}[/bold green]")

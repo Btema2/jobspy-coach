@@ -285,11 +285,15 @@ class JobSpyScraper:
             site_name, n_queries, "y" if n_queries == 1 else "ies", query.query_id, query.location, site_name,
         )
 
-    def end_cycle(self) -> None:
-        """Logs per-board totals for the cycle and stops progress tracking."""
+    def end_cycle(self) -> int:
+        """Logs per-board totals for the cycle and stops progress tracking.
+
+        Returns how many (query, board) calls the cycle skipped for a missing country (0 without a cycle);
+        disabled boards are deliberate and not counted.
+        """
         cycle, self._cycle = self._cycle, None
         if cycle is None:
-            return
+            return 0
         parts = []
         for board, t in cycle.totals.items():
             part = f"{board}: {t.calls} calls, {t.rows} rows, {t.kept} kept, {t.prefiltered} pre-filtered"
@@ -304,6 +308,7 @@ class JobSpyScraper:
                 f"{board} (no country_code) x{n}" for (board, _), n in cycle.skipped.items()
             )
         logger.info("Scrape summary (%d calls, %.0fs): %s", cycle.total, time.time() - cycle.started, summary)
+        return sum(cycle.skipped.values())
 
     def _call_prefix(self) -> str:
         c = self._cycle

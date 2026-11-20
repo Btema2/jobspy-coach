@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock
-from src.scheduler.daemon import DaemonService
+from src.scheduler.daemon import DaemonService, EvalSummary
 from src.storage.models import JobPosting
 from src.scraper.query_catalog import SearchQuery
 
@@ -88,7 +88,7 @@ def test_daemon_evaluate_transient_error_leaves_unprocessed(tmp_path):
     job_id, _ = daemon.db.save_job(job)
 
     # Evaluate unprocessed
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10).as_tuple()
     assert evaluated_count == 0
     assert wow_sent == 0
 
@@ -147,7 +147,7 @@ def test_daemon_evaluate_permanent_failure_marks_failed(tmp_path):
     )
     daemon.db.save_job(job)
 
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10).as_tuple()
     assert evaluated_count == 0
     assert wow_sent == 0
 
@@ -286,7 +286,7 @@ def test_daemon_evaluate_unprocessed_dry_run(tmp_path):
     )
     daemon.db.save_job(job)
 
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10, dry_run=True)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10, dry_run=True).as_tuple()
     assert evaluated_count == 1
     assert wow_sent == 1
     assert not mock_notifier.send_wow_alert.called
@@ -448,7 +448,7 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     daemon.db.save_job(job_low)
     daemon.db.save_job(job_high)
 
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10).as_tuple()
     assert evaluated_count == 2
     assert wow_sent == 0
 
@@ -618,7 +618,7 @@ def _query(query_id="Q-OUT", site="indeed"):
 def _daemon(tmp_path, scraper):
     """Daemon whose evaluation step is stubbed out: these tests only exercise scrape recording."""
     daemon = DaemonService(db_path=tmp_path / "d.db", scraper=scraper, evaluator=MagicMock())
-    daemon.evaluate_unprocessed = MagicMock(return_value=(0, 0))
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     return daemon
 
 

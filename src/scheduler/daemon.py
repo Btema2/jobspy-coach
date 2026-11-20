@@ -3,6 +3,7 @@ import inspect
 import logging
 import math
 import random
+import re
 import signal
 import sqlite3
 import sys
@@ -10,7 +11,7 @@ import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,6 +93,109 @@ def latency_stats(latencies: List[float]) -> LatencyStats:
     ordered = sorted(latencies)
     rank = max(1, math.ceil(0.95 * len(ordered)))
     return LatencyStats(sum(ordered) / len(ordered), ordered[rank - 1], ordered[-1])
+
+
+STOPPED_PROVIDERS_UNAVAILABLE = "providers_unavailable"
+STOPPED_SHUTDOWN = "shutdown"
+STOPPED_PROFILE_BUSY = "profile_db_busy"
+
+
+@dataclass(frozen=True)
+class EvalSummary:
+    """Result of one ``evaluate_unprocessed`` batch.
+
+    ``not_scored_in_batch``: jobs of this batch the batch never handled (provider outage, shutdown, cancelled):
+    they stay ``unprocessed`` with attempts unchanged. Job-specific failures are handled, not counted here.
+    ``beyond_limit``: unprocessed jobs that did not fit into the batch (count read before the batch, >= 0).
+    ``stopped_reason``: ``None`` or one of the ``STOPPED_*`` constants.
+    """
+
+    evaluated: int
+    wow_sent: int
+    not_scored_in_batch: int
+    beyond_limit: int
+    stopped_reason: Optional[str]
+
+    def as_tuple(self) -> Tuple[int, int]:
+        return self.evaluated, self.wow_sent
+
+
+_EMPTY_SUMMARY = EvalSummary(0, 0, 0, 0, None)
+
+REASON_BLOCKED_429 = "blocked (429)"
+REASON_DETAIL_PAGES = "detail pages blocked"
+REASON_NO_DATA = "no data returned"
+_MAX_REASON_CHARS = 60
+_RE_429 = re.compile(r"(?<!\d)429(?!\d)")
+
+
+def _error_reason(board: str, error: Optional[str]) -> str:
+    """Short, redacted reason for a failed (query, board) call."""
+    text = error or ""
+    if board == "linkedin" and _RE_429.search(text):
+        return REASON_BLOCKED_429
+    if board == "google" and "no job data returned" in text.lower():
+        return REASON_NO_DATA
+    return redact_secrets(text)[:_MAX_REASON_CHARS] or "unknown error"
+
+
+def classify_scrape_problems(board: str, outcome: ScrapeOutcome) -> List[str]:
+    """The problem reasons of one scrape outcome (empty when the call went fine)."""
+    board = board.lower()
+    reasons: List[str] = []
+    if outcome.status == STATUS_FAILED:
+        reasons.append(_error_reason(board, outcome.error))
+    if outcome.skipped_empty:
+        reasons.append(REASON_DETAIL_PAGES)
+    return reasons
+
+
+@dataclass
+class ScrapeStats:
+    """Counters of one scrape cycle (for the run report); ``problem_details`` is for logs only (query ids)."""
+
+    ok: int = 0
+    empty: int = 0
+    failed: int = 0
+    skipped_boards: int = 0
+    new_to_evaluate: int = 0
+    prefiltered: int = 0
+    problems: Counter = field(default_factory=Counter)
+    problem_details: List[Tuple[str, str, str]] = field(default_factory=list)
+
+    @property
+    def total_new_saved(self) -> int:
+        return self.new_to_evaluate + self.prefiltered
+
+    def _add_problem(self, query_id: str, board: str, reason: str) -> None:
+        self.problems[(board, reason)] += 1
+        self.problem_details.append((query_id, board, reason))
+
+    def record(self, query_id: str, board: str, outcome: ScrapeOutcome) -> None:
+        board = board.lower()
+        if outcome.status == STATUS_OK:
+            self.ok += 1
+        elif outcome.status == STATUS_EMPTY:
+            self.empty += 1
+        elif outcome.status == STATUS_FAILED:
+            self.failed += 1
+        for reason in classify_scrape_problems(board, outcome):
+            self._add_problem(query_id, board, reason)
+
+    def record_exception(self, query_id: str, board: str, exc: BaseException) -> None:
+        board = board.lower()
+        self.failed += 1
+        self._add_problem(query_id, board, _error_reason(board, str(exc) or type(exc).__name__))
+
+    def record_new(self, posting: JobPosting) -> None:
+        if posting.pre_filtered:
+            self.prefiltered += 1
+        else:
+            self.new_to_evaluate += 1
+
+    def problem_list(self) -> List[Tuple[str, str, int]]:
+        """Distinct ``(board, reason, count)`` in first-seen order."""
+        return [(board, reason, n) for (board, reason), n in self.problems.items()]
 
 
 def _iter_completed(futures: Dict[Future, Any], poll_seconds: float = 0.2) -> Iterator[Future]:
@@ -325,8 +429,8 @@ class DaemonService:
 
     def evaluate_unprocessed(
         self, limit: Optional[int] = None, dry_run: bool = False, profile: Any = UNSET
-    ) -> Tuple[int, int]:
-        """Evaluate queued jobs concurrently; return ``(evaluated_count, wow_sent)``.
+    ) -> EvalSummary:
+        """Evaluate queued jobs concurrently; return an ``EvalSummary`` (``.as_tuple()`` = ``(evaluated, wow_sent)``).
 
         ``profile`` is the cycle's compiled profile; only the ``UNSET`` default resolves it here, an explicit
         ``None`` means no profile. One policy is taken at the start and used for the whole batch.
@@ -339,24 +443,26 @@ class DaemonService:
         retried next cycle.
         """
         if self._shutdown_requested.is_set():
-            return 0, 0
+            return EvalSummary(0, 0, 0, 0, STOPPED_SHUTDOWN)
         if limit is None:
             limit = self.settings.eval_batch_limit
+        backlog = self.db.count_unprocessed_jobs()
         jobs = [j for j in self.db.get_unprocessed_jobs(limit=limit) if j.id is not None]
         if not jobs:
-            return 0, 0
+            return _EMPTY_SUMMARY
+        beyond_limit = max(0, backlog - len(jobs))
 
         if profile is UNSET:
             profile, problem = self.current_profile(alert=not dry_run)
             if problem == "db_busy" and profile is None:
                 self._skip_evaluation_without_profile()
-                return 0, 0
+                return EvalSummary(0, 0, len(jobs), beyond_limit, STOPPED_PROFILE_BUSY)
         policy = self._policy(profile)
         has_profile = profile is not None
 
         chain = self._get_evaluator()
         if not self._rearm_stop_event(chain) or self._shutdown_requested.is_set():
-            return 0, 0
+            return EvalSummary(0, 0, len(jobs), beyond_limit, STOPPED_SHUTDOWN)
         total = len(jobs)
         settings = self.settings
         logger.info(
@@ -503,7 +609,14 @@ class DaemonService:
             lat.mean, lat.p95, lat.max, peak,
             " (batch aborted: providers unavailable)" if batch_stopped else "",
         )
-        return evaluated_count, wow_sent
+        not_scored = total - done
+        if batch_stopped:
+            stopped_reason: Optional[str] = STOPPED_PROVIDERS_UNAVAILABLE
+        elif not_scored and self._shutdown_requested.is_set():
+            stopped_reason = STOPPED_SHUTDOWN
+        else:
+            stopped_reason = None
+        return EvalSummary(evaluated_count, wow_sent, not_scored, beyond_limit, stopped_reason)
 
     def _handle_legacy_failure(self, job: JobPosting, e: Exception, dry_run: bool) -> None:
         """Pre-existing mapping: transient errors leave the job unprocessed, others fail it."""
@@ -646,7 +759,8 @@ class DaemonService:
             queries = self._profile_queries(profile, problem, dry_run)
 
         rules = profile.rules if profile is not None else None
-        total_new_saved = self._scrape_queries(queries, dry_run, rules) if queries else 0
+        scrape_stats = self._scrape_queries(queries, dry_run, rules) if queries else ScrapeStats()
+        total_new_saved = scrape_stats.total_new_saved
 
         if dry_run:
             return 0, 0
@@ -656,9 +770,10 @@ class DaemonService:
             return total_new_saved, 0
 
         # Process evaluations
-        _, wow_sent = self.evaluate_unprocessed(
+        summary = self.evaluate_unprocessed(
             limit=self.settings.eval_batch_limit, dry_run=False, profile=profile
         )
+        wow_sent = summary.wow_sent
         logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {wow_sent}")
         return total_new_saved, wow_sent
 
@@ -695,9 +810,9 @@ class DaemonService:
         active_queries: List[SearchQuery],
         dry_run: bool,
         rules: Optional[Sequence[CompiledRule]] = None,
-    ) -> int:
+    ) -> ScrapeStats:
         logger.info("Starting pipeline scrape cycle across queries...")
-        total_new_saved = 0
+        stats = ScrapeStats()
 
         # The scraper owns the progress lines ([i/N] before/after every call, per-board summary);
         # the call plan holds only the calls that will really be requested (enabled boards, country set).
@@ -712,8 +827,11 @@ class DaemonService:
                     time.sleep(random.uniform(min_val, jitter_max))
 
                 t0 = time.time()
+                recorded = False
                 try:
                     outcome = self._scrape_call(site, q, rules)
+                    stats.record(q.query_id, site, outcome)
+                    recorded = True
                     board_postings = outcome.postings
                     duration = time.time() - t0
                     board_new_saved = 0
@@ -731,7 +849,7 @@ class DaemonService:
                         self.db.record_job_hit(job_id, hit_key)
                         if is_new:
                             board_new_saved += 1
-                            total_new_saved += 1
+                            stats.record_new(posting)
 
                     if not dry_run:
                         logger.info(
@@ -754,6 +872,8 @@ class DaemonService:
                         )
                 except Exception as e:
                     duration = time.time() - t0
+                    if not recorded:  # a failure after the call (e.g. saving) is not a scrape problem
+                        stats.record_exception(q.query_id, site, e)
                     safe_error = sanitize_error_message(str(e))
                     logger.error(
                         f"Failed scrape cycle for board '{site}' query '{q.query_id}': {redact_secrets(str(e))}"
@@ -773,8 +893,11 @@ class DaemonService:
         finally:
             end_cycle = getattr(self.scraper, "end_cycle", None)
             if callable(end_cycle):
-                end_cycle()
-        return total_new_saved
+                skipped = end_cycle()
+                # A test double may return anything; only a real count is taken.
+                if isinstance(skipped, int) and not isinstance(skipped, bool):
+                    stats.skipped_boards = skipped
+        return stats
 
     def run_daily_digest_cycle(self, dry_run: bool = False) -> int:
         with self._digest_lock:
