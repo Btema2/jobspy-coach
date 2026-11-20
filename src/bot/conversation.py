@@ -13,6 +13,9 @@ validated operation list only. An interview (``/setup``, state ``awaiting_interv
 consent; its row is created by the worker (``begin``) and cleared on the poller only together with
 ``_drop_memory()`` and a nonce check; the poller learns "in an interview" from the ``_interview`` mirror.
 Its 24 hours count from the first stored answer (``context.created_at``; ``updated_at`` while that is null).
+A CV (a PDF, or a ``.txt`` / ``.md`` during an interview) is read by the worker into the ``_cv`` slot (memory
+only, masked, at most 24 hours) and previewed; nothing about it is stored or sent to a model before ``Send`` and
+consent, and only the masked extract facts (and the masked caption) are ever stored.
 Nothing here logs user text, masked text, questions or replies: only lengths,
 request ids and exception type names.
 """
@@ -27,13 +30,16 @@ from src.bot.chat_llm import ChatLLMError, ChatLLMLimited, ChatLLMNotConfigured,
 from src.bot.client import TelegramApiError, TelegramBotClient
 from src.bot.commands import BotContext, not_applied, trigger_note
 from src.bot.conversation_store import ConversationState, ConversationStore, PendingChange
+from src.bot.cv import MAX_CV_BYTES, CvError, CvText, build_preview, read_cv, read_text_file
+from src.bot.cv import TOO_LARGE_REPLY as CV_TOO_LARGE_REPLY
 from src.bot.interview import CANCEL as ANSWER_CANCEL
 from src.bot.interview import CANCEL_HINT as CANCEL_WORD_REPLY
 from src.bot.interview import EMPTY as ANSWER_EMPTY
-from src.bot.interview import QUESTIONS, SLOTS, TURN_UNCHECKED_NOTE
+from src.bot.interview import MAX_SLOT_FACTS_CHARS, QUESTIONS, SLOTS, TURN_UNCHECKED_NOTE
 from src.bot.interview import TOO_LONG as ANSWER_TOO_LONG
 from src.bot.interview import TOO_LONG_REPLY as TOO_LONG_ANSWER_REPLY
 from src.bot.interview import (
+    ExtractReply,
     InterviewLLM,
     InterviewState,
     Step,
@@ -85,13 +91,15 @@ MAX_QUEUED_REQUESTS = 5  # requests waiting behind the one in flight (an upload 
 BARE_CONFIRM_MAX_AGE_SECONDS = 900
 _IDLE_WAIT_SECONDS = 0.5  # the longest the worker sleeps: it must notice the stop event within a second
 _UPLOAD_SUFFIXES = (".txt", ".md")
+_PDF_SUFFIX = ".pdf"
+_PDF_MIME = "application/pdf"
 _BOM = b"\xef\xbb\xbf"
 
 BARE_CONFIRM = frozenset({"ok", "okay", "yes", "y", "yep", "sure", "confirm", "apply"})
 BARE_CANCEL = frozenset({"no", "n", "nope", "cancel"})
 
 TOO_LONG_REPLY = "That is too long; send it as a .txt or .md file (up to 20 KB)."
-ONLY_TEXT_FILES_REPLY = "Only .txt and .md files are read."
+ONLY_TEXT_FILES_REPLY = "Only .pdf, .txt and .md files are read."
 FILE_TOO_LARGE_REPLY = "That file is larger than 20 KB; send a shorter one."
 NOT_UTF8_REPLY = "The file must be UTF-8 text."
 EMPTY_FILE_REPLY = "The file is empty."
@@ -132,6 +140,12 @@ GUIDED_BUTTON = "Step-by-step questions instead"
 CANCEL_BUTTON = "Cancel"
 INTERVIEW_STALE_REPLY = "This choice is no longer active; send your answer again."
 CONSENT_DECLINED_SETUP_REPLY = "Nothing was sent. Continuing with step-by-step questions."
+CV_STALE_REPLY = "This choice is no longer active; send the file again."
+CV_SEND_BUTTON = "Send"
+CV_CANCEL_BUTTON = "Cancel"
+CV_KEPT_NOTE = "Your CV is kept; Retry reads it again. You can answer the questions meanwhile."
+CV_FACTS_NOTE = "From your CV I noted: {topics}."
+CV_NO_FACTS_NOTE = "Your CV did not answer any question; the questions follow."
 # TOO_LONG_ANSWER_REPLY, CANCEL_WORD_REPLY and TURN_UNCHECKED_NOTE come from ``src.bot.interview``.
 DRAFT_READY_REPLY = "The draft is ready; send changes after confirming."
 DRAFT_KEPT_NOTE = "Your answers are kept; Retry drafts again."
@@ -183,6 +197,30 @@ def _bare_word(text: str) -> Optional[str]:
     return None
 
 
+def _is_pdf(document: DocumentRef) -> bool:
+    return document.file_name.lower().endswith(_PDF_SUFFIX) or (document.mime_type or "").lower() == _PDF_MIME
+
+
+def _is_text_file(document: DocumentRef) -> bool:
+    return document.file_name.lower().endswith(_UPLOAD_SUFFIXES)
+
+
+@dataclass
+class _Cv:
+    """A read CV (masked text, header removed) waiting in memory (never the database) for ``Send``.
+
+    ``caption`` is the upload caption (raw, memory only; masked when it is stored after ``Send`` and consent).
+    ``failed`` marks a CV put back after a failed extract call, so ``iv:<nonce>:retry`` reads it again."""
+
+    nonce: str
+    chat_id: int
+    cv: CvText
+    caption: Optional[str]
+    created: float
+    message_id: Optional[int] = None  # the preview carrying the ``cv:`` buttons
+    failed: bool = False
+
+
 @dataclass
 class _Buffer:
     """One request while it waits for its debounce window to close (or an upload / released consent text)."""
@@ -205,6 +243,7 @@ class _Buffer:
     nonce: Optional[str] = None
     slot: Optional[str] = None
     ask_first: bool = True  # ``begin``: post the first question (False when started from a CV)
+    cv: Optional[_Cv] = None  # ``begin`` / ``cv``: the CV whose extract call runs in this worker action
 
     def due(self, now: float) -> bool:
         return self.immediate or now - self.last >= DEBOUNCE_SECONDS
@@ -223,6 +262,7 @@ class _Held:
     created: float
     message_id: Optional[int] = None  # the consent notice, so its buttons can be removed when it is replaced
     setup: bool = False  # ``/setup`` waits for consent: ``yes`` starts the interview, ``no`` the wizard
+    cv_nonce: Optional[str] = None  # a CV ``Send`` waits for consent: ``yes`` sends that CV, ``no`` drops it
 
 
 @dataclass
@@ -283,6 +323,7 @@ class ConversationService:
         self._swallow: Optional[List[Any]] = None
         self._held: Optional[_Held] = None
         self._retry: Optional[_Retry] = None
+        self._cv: Optional[_Cv] = None  # the single CV slot (memory only), separate from ``_held``
         # chat id -> (interview nonce, current slot): set by the worker before it posts each question, removed
         # when the interview ends; the poller reads only this to know "in an interview" (guarded by ``_cond``).
         self._interview: Dict[int, Tuple[str, Optional[str]]] = {}
@@ -310,6 +351,8 @@ class ConversationService:
             return None
         tag = self._interview_tag(update.chat_id)
         if tag is not None:  # an interview input: never the bare-word router, never the free-text translator
+            if update.document is not None:  # any upload during an interview is a CV
+                return self._add_cv_upload(update)
             return self._add_interview_input(update, tag)
         if update.document is None:
             kind = _bare_word(update.text)
@@ -323,6 +366,8 @@ class ConversationService:
         if llm is not None and not llm.available():
             return _reply(NOT_CONFIGURED_REPLY)
         if update.document is not None:
+            if _is_pdf(update.document) and not _is_text_file(update.document):
+                return self._add_cv_upload(update)
             return self._add_upload(update)
         return self._add_part(update.chat_id, update.text, self._clock())
 
@@ -356,19 +401,25 @@ class ConversationService:
             return "onboarding"
         return "update"
 
-    def _queue_begin(self, chat_id: int, *, ask_first: bool = True) -> None:
+    def _queue_begin(self, chat_id: int, *, ask_first: bool = True, cv: Optional[_Cv] = None) -> None:
         mode = self._starter_mode()
         begin = _Buffer(chat_id, [], 0, self._clock(), closed=True, immediate=True, interview=True,
-                        action="begin", mode=mode, ask_first=ask_first)
+                        action="begin", mode=mode, ask_first=ask_first, cv=cv)
         with self._cond:
             self._buffers.insert(0, begin)
             self._begin_queued[chat_id] = begin
             self._cond.notify_all()
 
-    def _hold_setup(self, chat_id: int, notes: List[OutgoingMessage]) -> None:
-        """``/setup`` without consent: the notice (after the discard notes); nothing is stored before the answer."""
-        held = _Held(secrets.token_hex(4), chat_id, [], self._clock(), setup=True)
+    def _hold_setup(
+        self, chat_id: int, notes: List[OutgoingMessage], *, cv_nonce: Optional[str] = None
+    ) -> None:
+        """``/setup`` (or a CV ``Send``) without consent: the notice (after the discard notes); nothing is stored
+        before the answer. A CV ``Send`` that replaces a ``/setup`` hold of the same chat keeps its ``setup`` mark
+        (``no`` then still starts the wizard)."""
+        held = _Held(secrets.token_hex(4), chat_id, [], self._clock(), setup=cv_nonce is None, cv_nonce=cv_nonce)
         with self._cond:
+            if cv_nonce is not None and self._held is not None and self._held.chat_id == chat_id:
+                held.setup = self._held.setup
             replaced, self._held = self._held, held
         if replaced is not None and replaced.message_id is not None:
             self._clear_buttons(replaced.chat_id, replaced.message_id)
@@ -422,20 +473,13 @@ class ConversationService:
     ) -> List[OutgoingMessage]:
         """Queue an interview answer (or upload) for the worker, in arrival order and without debounce."""
         nonce, slot = tag
-        document = update.document
-        if document is not None:
-            if not document.file_name.lower().endswith(_UPLOAD_SUFFIXES):
-                return _reply(ONLY_TEXT_FILES_REPLY)
-            if document.file_size is not None and document.file_size > MAX_UPLOAD_BYTES:
-                return _reply(FILE_TOO_LARGE_REPLY)
-        text = update.text if document is None else ""
+        text = update.text
         with self._cond:
             if len(self._buffers) >= MAX_QUEUED_REQUESTS:
                 return _reply(BUSY_REPLY)
             self._buffers.append(
                 _Buffer(update.chat_id, [text] if text else [], len(text), self._clock(), closed=True,
-                        immediate=True, doc=document, caption=update.text.strip() if document else "",
-                        interview=True, nonce=nonce, slot=slot)
+                        immediate=True, interview=True, nonce=nonce, slot=slot)
             )
             self._cond.notify_all()
         return []
@@ -495,11 +539,13 @@ class ConversationService:
     def _drop_memory(self) -> bool:
         with self._cond:
             self._generation += 1  # a request already taken by the worker loses its result
-            held, retry = self._held, self._retry
-            anything = bool(self._buffers) or held is not None or retry is not None or self._inflight
+            held, retry, cv = self._held, self._retry, self._cv
+            anything = bool(self._buffers) or held is not None or retry is not None or cv is not None \
+                or self._inflight
             self._buffers.clear()
             self._held = None
             self._retry = None
+            self._cv = None
             self._swallow = None
             self._interview.clear()  # the single paired chat: its interview mirror goes with the generation
             self._begin_queued.clear()
@@ -507,6 +553,8 @@ class ConversationService:
             self._clear_buttons(held.chat_id, held.message_id)
         if retry is not None and retry.message_id is not None:
             self._clear_buttons(retry.chat_id, retry.message_id)
+        if cv is not None and cv.message_id is not None:
+            self._clear_buttons(cv.chat_id, cv.message_id)
         return anything
 
     def on_callback(self, update: Update) -> List[OutgoingMessage]:
@@ -518,6 +566,8 @@ class ConversationService:
             return self._on_retry_button(update)
         if update.text.startswith("iv:"):
             return self._on_interview_button(update)
+        if update.text.startswith("cv:"):
+            return self._on_cv_button(update)
         return _reply(NO_LONGER_ACTIVE_REPLY)
 
     # --- poller thread: buffering ------------------------------------------------------------
@@ -585,6 +635,88 @@ class ConversationService:
             self._cond.notify_all()
         return []
 
+    # --- poller thread: CV uploads and their buttons -------------------------------------------
+
+    def _add_cv_upload(self, update: Update) -> List[OutgoingMessage]:
+        """A PDF anywhere, or a ``.txt`` / ``.md`` during an interview: queue the read for the worker.
+
+        Nothing changes at upload time (no state, no notices): the worker reads the file into a masked ``CvText``
+        and shows the preview with ``cv:`` buttons; the interview starts (or takes the CV) only at ``Send``."""
+        document = update.document
+        pdf = not _is_text_file(document) and _is_pdf(document)
+        if not pdf and not _is_text_file(document):
+            return _reply(ONLY_TEXT_FILES_REPLY)
+        limit = MAX_CV_BYTES if pdf else MAX_UPLOAD_BYTES
+        if document.file_size is not None and document.file_size > limit:
+            return _reply(CV_TOO_LARGE_REPLY if pdf else FILE_TOO_LARGE_REPLY)
+        with self._cond:
+            if len(self._buffers) >= MAX_QUEUED_REQUESTS:
+                return _reply(BUSY_REPLY)
+            self._buffers.append(
+                _Buffer(update.chat_id, [], 0, self._clock(), closed=True, immediate=True, doc=document,
+                        caption=update.text.strip(), action="cv_read")
+            )
+            self._cond.notify_all()
+        return []
+
+    def _take_cv(self, chat_id: Optional[int], nonce: str) -> Optional[_Cv]:
+        """Take the CV with this ``cv:`` nonce out of its slot (None: stale, foreign or expired)."""
+        with self._cond:
+            cv = self._cv
+            if cv is None or cv.nonce != nonce or cv.chat_id != chat_id:
+                return None
+            self._cv = None
+        if self._clock() - cv.created > CONTEXT_TTL_SECONDS:
+            return None
+        return cv
+
+    def _on_cv_button(self, update: Update) -> List[OutgoingMessage]:
+        """``cv:<nonce>:send|cancel`` (poller thread)."""
+        chat_id = update.chat_id
+        parts = update.text.split(":")
+        if chat_id is None or len(parts) != 3 or parts[2] not in ("send", "cancel"):
+            return _reply(CV_STALE_REPLY)
+        nonce, action = parts[1], parts[2]
+        if action == "cancel":
+            cv = self._take_cv(chat_id, nonce)
+            if cv is None:
+                return _reply(CV_STALE_REPLY)
+            self._clear_buttons(chat_id, update.message_id)
+            return _reply(CANCELLED_REPLY)
+        with self._cond:
+            cv = self._cv
+            current = cv is not None and cv.nonce == nonce and cv.chat_id == chat_id \
+                and self._clock() - cv.created <= CONTEXT_TTL_SECONDS
+        if not current:
+            return _reply(CV_STALE_REPLY)
+        self._clear_buttons(chat_id, update.message_id)
+        if not self._conv.has_consent(chat_id, CONSENT_VERSION):
+            self._hold_setup(chat_id, [], cv_nonce=nonce)  # the CV stays in its slot until the answer
+            return []
+        return self._send_cv(chat_id, nonce)
+
+    def _send_cv(self, chat_id: int, nonce: str) -> List[OutgoingMessage]:
+        """``Send`` with consent: take the CV out of its slot first (so the ``/setup`` reset cannot drop it), start
+        the interview when the chat is not in one (discard notices now, not at upload time), then queue one worker
+        action carrying the CV."""
+        cv = self._take_cv(chat_id, nonce)
+        if cv is None:
+            return _reply(CV_STALE_REPLY)
+        cv.message_id = None  # its buttons were removed at Send
+        tag = self._interview_tag(chat_id)
+        if tag is None:
+            notes = self._reset_for_setup(chat_id)
+            self._bot_state.set_wizard(None)
+            self._queue_begin(chat_id, ask_first=False, cv=cv)
+            return notes
+        with self._cond:
+            self._buffers.append(
+                _Buffer(chat_id, [], 0, self._clock(), closed=True, immediate=True, interview=True,
+                        action="cv", nonce=tag[0], slot=tag[1], cv=cv)
+            )
+            self._cond.notify_all()
+        return []
+
     # --- poller thread: consent button -------------------------------------------------------
 
     def _on_consent_button(self, update: Update) -> List[OutgoingMessage]:
@@ -601,10 +733,14 @@ class ConversationService:
             return _reply(CONSENT_STALE_REPLY)
         self._clear_buttons(update.chat_id, update.message_id)
         if parts[2] == "no":
+            if held.cv_nonce is not None:
+                self._take_cv(held.chat_id, held.cv_nonce)  # declined: the CV is dropped
             if held.setup:  # /setup without the language model: the step-by-step wizard takes over
                 return _reply(CONSENT_DECLINED_SETUP_REPLY) + self._wizard.start(update)
             return _reply(CONSENT_DECLINED_REPLY)
         self._conv.record_consent(update.chat_id, CONSENT_VERSION)  # the poller thread writes llm_consent
+        if held.cv_nonce is not None:
+            return self._send_cv(held.chat_id, held.cv_nonce)
         if held.setup:
             self._queue_begin(held.chat_id)
             return []
@@ -813,10 +949,17 @@ class ConversationService:
                 self._retry = None
             else:
                 retry = None
+            cv = self._cv
+            if cv is not None and now - cv.created > CONTEXT_TTL_SECONDS:
+                self._cv = None  # the CV text expires silently (its buttons just go away)
+            else:
+                cv = None
         if held is not None and held.message_id is not None:
             self._clear_buttons(held.chat_id, held.message_id)
         if retry is not None and retry.message_id is not None:
             self._clear_buttons(retry.chat_id, retry.message_id)
+        if cv is not None and cv.message_id is not None:
+            self._clear_buttons(cv.chat_id, cv.message_id)
 
     def _prune_mirror(self) -> None:
         """Drop every mirror entry whose row is no longer that interview (purged by either purge, or replaced),
@@ -883,7 +1026,10 @@ class ConversationService:
         buffer = work.buffer
         chat_id = buffer.chat_id
         if buffer.action == "begin":
-            self._begin(work)
+            self._begin(work, request_id)
+            return
+        if buffer.action == "cv_read":
+            self._read_cv_upload(work, request_id)
             return
         if buffer.interview:
             self._run_interview(work, request_id)
@@ -1102,18 +1248,21 @@ class ConversationService:
 
     # --- worker thread: the interview ----------------------------------------------------------------
 
-    def _begin(self, work: _Work) -> None:
+    def _begin(self, work: _Work, request_id: str) -> None:
         """Start an interview: write the row (``created_at`` null), set the mirror, post the intro with its
         buttons and the first question. Sends happen after the lock is released; a ``/cancel`` or ``/setup``
-        that lands meanwhile (a new generation) wins and the row is reset."""
+        that lands meanwhile (a new generation) wins and the row is reset. Started from a CV (``ask_first``
+        False) only the intro is posted, then the CV's extract call runs on the interview just written."""
         try:
-            self._begin_steps(work)
+            nonce = self._begin_steps(work)
         finally:
             with self._cond:
                 if self._begin_queued.get(work.buffer.chat_id) is work.buffer:
                     del self._begin_queued[work.buffer.chat_id]
+        if nonce is not None and work.buffer.cv is not None:
+            self._run_cv_extract(work, request_id, work.buffer.cv, nonce)
 
-    def _begin_steps(self, work: _Work) -> None:
+    def _begin_steps(self, work: _Work) -> Optional[str]:
         buffer = work.buffer
         chat_id = buffer.chat_id
         nonce = secrets.token_hex(4)
@@ -1122,17 +1271,17 @@ class ConversationService:
         now = self._clock()
         with self._state_lock:
             if self._stale(work):
-                return
+                return None
             self._wconv.set_state(chat_id, STATE_INTERVIEW, state.to_json(), now)
             if self._stale(work):  # dropped during the write: undo it unless something newer replaced it
                 current = self._wconv.get_state(chat_id)
                 if current.state == STATE_INTERVIEW and isinstance(current.context, dict) \
                         and current.context.get("nonce") == nonce:
                     self._wconv.set_state(chat_id, STATE_IDLE, None, now)
-                return
+                return None
         self._context_chats.add(chat_id)
         if not self._set_mirror(work, nonce, step.slot if step is not None else None):
-            return
+            return None
         markup = {
             "inline_keyboard": [
                 [{"text": DRAFT_BUTTON, "callback_data": f"iv:{nonce}:draft"}],
@@ -1143,6 +1292,7 @@ class ConversationService:
         self._send(chat_id, [OutgoingMessage(INTERVIEW_INTRO, markup)])
         if step is not None and step.kind != "draft":
             self._send(chat_id, _reply(esc(step.text)))
+        return nonce
 
     def _set_mirror(self, work: _Work, nonce: str, slot: Optional[str]) -> bool:
         """Record the current question in the mirror (before it is posted); False when the work is stale."""
@@ -1192,12 +1342,9 @@ class ConversationService:
         if buffer.action == "draft":
             self._run_draft(work, request_id)
             return
-        if buffer.doc is not None:  # uploads in an interview (the CV path) are a later step
-            with self._state_lock:
-                state = self._load_interview(work)
-            if state is not None:
-                self._ensure_mirror(work, state.nonce, state.current)
-            logger.debug("interview upload %s not handled yet", request_id)
+        if buffer.action == "cv":
+            if buffer.cv is not None:
+                self._run_cv_extract(work, request_id, buffer.cv, buffer.nonce)
             return
         chat_id = buffer.chat_id
         text = "\n".join(buffer.parts)
@@ -1292,8 +1439,19 @@ class ConversationService:
         return pending is not None and pending.mode in _INTERVIEW_PROPOSAL_MODES
 
     def _run_retry(self, work: _Work, request_id: str) -> None:
-        """``iv:<nonce>:retry``: run the failed step again. Only the draft offers Retry so far (its facts are in
-        the database); a later step with its own Retry is dispatched here."""
+        """``iv:<nonce>:retry``, the single dispatch point: the extract call again when the CV slot holds a CV of
+        this chat whose extract failed (it is taken out of the slot), otherwise the draft again (its facts are in
+        the database)."""
+        with self._cond:
+            cv = self._cv
+            if cv is not None and cv.chat_id == work.buffer.chat_id and cv.failed \
+                    and work.generation == self._generation:
+                self._cv = None
+            else:
+                cv = None
+        if cv is not None:
+            self._run_cv_extract(work, request_id, cv, work.buffer.nonce)
+            return
         self._run_draft(work, request_id)
 
     def _same_interview(self, work: _Work, nonce: str) -> Optional[InterviewState]:
@@ -1405,6 +1563,206 @@ class ConversationService:
         messages = [OutgoingMessage(text, {"inline_keyboard": rows})]
         if reask is not None:
             messages += _reply(esc(QUESTIONS[reask]))
+        self._send(chat_id, messages)
+
+    # --- worker thread: CV input -----------------------------------------------------------------------
+
+    def _read_cv_upload(self, work: _Work, request_id: str) -> None:
+        """Download and read an uploaded CV into the CV slot and show its preview. Nothing is stored in the
+        database and nothing is sent to a model here; the file name, caption and text are never logged."""
+        buffer = work.buffer
+        chat_id = buffer.chat_id
+        pdf = not _is_text_file(buffer.doc) and _is_pdf(buffer.doc)
+        too_large = CV_TOO_LARGE_REPLY if pdf else FILE_TOO_LARGE_REPLY
+        path = self._client.get_file_path(buffer.doc.file_id)
+        if path is None:
+            self._finish(work, _reply(DOWNLOAD_FAILED_REPLY), purge=False)
+            return
+        try:
+            data = self._client.download_file(path, MAX_CV_BYTES if pdf else MAX_UPLOAD_BYTES)
+        except TelegramApiError as exc:
+            self._finish(work, _reply(too_large if exc.status == 413 else DOWNLOAD_FAILED_REPLY), purge=False)
+            return
+        try:
+            if pdf:
+                cv_text = read_cv(data)
+            else:
+                if data.startswith(_BOM):
+                    data = data[len(_BOM):]
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    self._finish(work, _reply(NOT_UTF8_REPLY), purge=False)
+                    return
+                if not text.strip():
+                    self._finish(work, _reply(EMPTY_FILE_REPLY), purge=False)
+                    return
+                cv_text = read_text_file(text)
+        except CvError as exc:
+            logger.info("cv %s refused", request_id)
+            self._finish(work, _reply(exc.reply), purge=False)
+            return
+        del data
+        logger.info("cv %s read: %d pages, %d chars", request_id, cv_text.pages, len(cv_text.text))
+        cv = _Cv(secrets.token_hex(4), chat_id, cv_text, buffer.caption or None, self._clock())
+        with self._cond:
+            if work.generation != self._generation:
+                return  # /cancel or /setup arrived meanwhile: the CV is dropped
+            replaced, self._cv = self._cv, cv
+        if replaced is not None and replaced.message_id is not None:
+            self._clear_buttons(replaced.chat_id, replaced.message_id)
+        markup = {
+            "inline_keyboard": [[
+                {"text": CV_SEND_BUTTON, "callback_data": f"cv:{cv.nonce}:send"},
+                {"text": CV_CANCEL_BUTTON, "callback_data": f"cv:{cv.nonce}:cancel"},
+            ]]
+        }
+        message_id = self._send(chat_id, [OutgoingMessage(esc(build_preview(cv_text)), markup)])
+        with self._cond:
+            current = self._cv is cv
+            if current:
+                cv.message_id = message_id
+        if not current:  # sent, replaced or cancelled while the preview was being sent
+            self._clear_buttons(chat_id, message_id)
+
+    def _run_cv_extract(self, work: _Work, request_id: str, cv: _Cv, nonce: Optional[str]) -> None:
+        """The extract step (Locks and the worker rule): read the interview under ``_state_lock``, run the
+        extract call with no lock, then store the facts with a compare-and-set (same state, nonce, generation).
+        The CV is dropped on success; a failure puts it back (unless a newer CV or a reset came) for Retry."""
+        chat_id = work.buffer.chat_id
+        with self._state_lock:
+            if self._stale(work):
+                return
+            state = self._load_interview(work) if nonce is None else self._same_interview(work, nonce)
+        if state is None:
+            return  # the interview ended meanwhile: the CV goes with it
+        nonce = state.nonce
+        self._ensure_mirror(work, nonce, state.current)
+        if self._interview_llm is None:
+            self._cv_failed(work, nonce, cv, NOT_CONFIGURED_REPLY, retry=False)
+            return
+        self._send(chat_id, _reply(WORKING_REPLY))
+        timer = threading.Timer(PROGRESS_NOTE_SECONDS, self._progress_note, args=(work,))
+        timer.daemon = True
+        timer.start()
+        reply: Optional[ExtractReply] = None
+        reason: Optional[str] = None
+        retry = True
+        try:
+            reply = self._interview_llm.extract(cv.cv.text, request_id)
+        except StopRequested:
+            return
+        except ChatLLMNotConfigured:
+            reason, retry = NOT_CONFIGURED_REPLY, False
+        except ChatLLMError as exc:
+            logger.warning("interview extract %s failed: %s (%s)", request_id, type(exc).__name__, exc.failure.value)
+            daily = bool(getattr(exc, "daily", False)) if isinstance(exc, ChatLLMLimited) else False
+            reason = describe_failure(exc.failure, exc.retry_in, daily=daily)
+        except Exception as exc:  # the type name only, never the text
+            logger.error("interview extract %s failed: %s", request_id, type(exc).__name__)
+            reason = ERROR_REPLY
+        finally:
+            timer.cancel()
+            with self._note_lock:
+                work.done = True
+        if reply is None:
+            self._cv_failed(work, nonce, cv, reason or ERROR_REPLY, retry=retry)
+            return
+        step: Optional[Step] = None
+        with self._state_lock:
+            current = self._same_interview(work, nonce)
+            if current is None:
+                return  # cancelled or replaced while the model answered: dropped silently (the CV too)
+            filled, cut = self._store_cv_facts(current, reply, cv.caption)
+            open_question = current.current is not None and current.status.get(current.current) == "empty"
+            if open_question:  # the question asked before the CV is still unanswered: ask it again, uncounted
+                step = Step("question", current.current, QUESTIONS[current.current])
+            elif current.current is None or current.status.get(current.current) != "partial":
+                step = next_step(current)  # exactly once per step, under the lock
+            self._wconv.set_state(chat_id, STATE_INTERVIEW, current.to_json(), self._clock())
+            self._context_chats.add(chat_id)
+        logger.info("interview extract %s: %d topics, %d facts cut", request_id, len(filled), cut)
+        topics = ", ".join(slot for slot in SLOTS if slot in filled)
+        note = CV_FACTS_NOTE.format(topics=topics) if topics else CV_NO_FACTS_NOTE
+        if step is None:
+            if not self._stale(work):
+                self._send(chat_id, _reply(note))
+            return
+        self._post_step(work, nonce, step, [note], request_id)
+
+    def _store_cv_facts(
+        self, state: InterviewState, reply: ExtractReply, caption: Optional[str]
+    ) -> Tuple[List[str], int]:
+        """Under ``_state_lock``: append the masked extract facts (and the masked caption, as an extra answer to the
+        current question) like answers. A slot keeps its existing facts; a CV fact is cut to the room left under
+        ``MAX_SLOT_FACTS_CHARS``. Slots that now have facts and are ``empty`` become ``filled``. Returns the filled
+        slots and how many facts were cut."""
+        cut = 0
+        stored = False
+
+        def append(slot: str, text: str) -> None:
+            nonlocal cut, stored
+            text = mask_all(text).strip()
+            if not text:
+                return
+            existing = state.facts.get(slot, "")
+            room = MAX_SLOT_FACTS_CHARS - len(existing) - (1 if existing else 0)
+            if len(text) > room:
+                cut += 1
+                text = text[:max(0, room)].rstrip()
+            if not text:
+                return
+            state.facts[slot] = f"{existing}\n{text}" if existing else text
+            stored = True
+
+        caption_slot = state.current or peek_step(state).slot or SLOTS[0]
+        for slot in SLOTS:
+            if slot in reply.facts:
+                append(slot, reply.facts[slot])
+        if caption:
+            append(caption_slot, caption)
+        filled: List[str] = []
+        for slot in SLOTS:
+            if (slot in reply.facts or slot in reply.covers) and state.facts.get(slot) \
+                    and state.status[slot] == "empty":
+                state.status[slot] = "filled"
+                filled.append(slot)
+        if stored and state.created_at is None:
+            state.created_at = float(self._clock())
+        return filled, cut
+
+    def _cv_failed(self, work: _Work, nonce: str, cv: _Cv, reason: str, *, retry: bool) -> None:
+        """Keep the interview and (for Retry) the CV: the reason with ``Retry`` / ``Step-by-step questions
+        instead``; an interview started from this CV gets its first question now."""
+        chat_id = work.buffer.chat_id
+        step: Optional[Step] = None
+        with self._state_lock:
+            current = self._same_interview(work, nonce)
+            if current is None:
+                return  # cancelled or replaced meanwhile: dropped silently (the CV too)
+            if current.current is None:
+                step = next_step(current)
+                self._wconv.set_state(chat_id, STATE_INTERVIEW, current.to_json(), self._clock())
+        kept = False
+        if retry:
+            with self._cond:
+                if work.generation == self._generation and self._cv is None:
+                    cv.failed = True
+                    cv.message_id = None
+                    self._cv = cv
+                    kept = True
+        rows: List[List[Dict[str, str]]] = []
+        if kept:
+            rows.append([{"text": RETRY_BUTTON, "callback_data": f"iv:{nonce}:retry"}])
+        rows.append([{"text": GUIDED_BUTTON, "callback_data": f"iv:{nonce}:guided"}])
+        text = reason + ("\n" + CV_KEPT_NOTE if kept else "")
+        messages = [OutgoingMessage(text, {"inline_keyboard": rows})]
+        if step is not None and step.kind != "draft":
+            if not self._set_mirror(work, nonce, step.slot):
+                return
+            messages += _reply(esc(step.text))
+        elif self._stale(work):
+            return
         self._send(chat_id, messages)
 
     def _proposal_extras(self, proposal: Proposal) -> Tuple[List[str], List[str]]:

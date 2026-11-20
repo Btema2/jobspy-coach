@@ -27,7 +27,7 @@ from src.bot.client import TelegramBotClient
 from src.bot.commands import TRIGGER_STARTED, BotContext
 from src.bot.conversation import ConversationService
 from src.bot.conversation_store import ConversationStore
-from src.bot.interview import MAX_INTERVIEW_QUESTIONS, QUESTIONS, TURN_UNCHECKED_NOTE, TurnReply
+from src.bot.interview import MAX_INTERVIEW_QUESTIONS, MAX_SLOT_FACTS_CHARS, QUESTIONS, TURN_UNCHECKED_NOTE, ExtractReply, TurnReply
 from src.bot.privacy import CONSENT_NOTICE, CONSENT_VERSION
 from src.bot.state import BotStateStore
 from src.bot.translator import (
@@ -170,6 +170,22 @@ class FakeInterviewLLM:
         self.draft_calls: List[dict] = []
         self.draft_gate: Optional[threading.Event] = None
         self.draft_entered = threading.Event()
+        self.extracts: List[Any] = []
+        self.extract_calls: List[dict] = []
+        self.extract_hook: Optional[Any] = None  # called inside ``extract`` (e.g. to look at what was sent so far)
+
+    def add_extract(self, *items: Any) -> "FakeInterviewLLM":
+        self.extracts.extend(items)
+        return self
+
+    def extract(self, cv_text, request_id):
+        self.extract_calls.append({"text": cv_text})
+        if self.extract_hook is not None:
+            self.extract_hook()
+        item = self.extracts.pop(0) if self.extracts else ExtractReply()
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def add(self, *items: Any) -> "FakeInterviewLLM":
         self.script.extend(items)
@@ -368,7 +384,7 @@ def test_upload_txt_md_up_to_20kb(svc, clock, translator, telegram, caplog):
     assert texts(reply) == conv.FILE_TOO_LARGE_REPLY  # known size: refused before any download
     assert len(telegram.calls("getFile")) == 3
 
-    reply = svc.on_text(parse_update(document_update(4, "f4", "cv.pdf")))
+    reply = svc.on_text(parse_update(document_update(4, "f4", "cv.docx", mime_type="application/msword")))
     assert texts(reply) == conv.ONLY_TEXT_FILES_REPLY
     assert svc.process_next(NOW + 100) is False
 
@@ -2031,3 +2047,362 @@ def test_no_answer_text_in_logs_through_the_draft(svc, clock, telegram, turns, c
         pass
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert MARKER not in log_text
+
+
+# --- CV and text-file input for the interview (Task 8) --------------------------------------------------------
+
+from src.bot import cv as cv_module  # noqa: E402
+from tests.test_cv import build_pdf, encrypted_pdf  # noqa: E402
+
+CV_BODY = "onboarding material"  # a phrase of the CV body (tests/test_cv.CV_LINES)
+CAPTION = "<CAPTION-MARK> mail me at caption.person@example.org"
+
+
+def upload(svc, telegram, data: bytes, name: str = "cv.pdf", *, caption: Optional[str] = None,
+           mime: Optional[str] = "application/pdf", file_size: Optional[int] = None):
+    file_id = f"cv{next(_ids)}"
+    telegram.serve_file(file_id, f"documents/{file_id}", data)
+    return svc.on_text(parse_update(document_update(next(_ids), file_id, name, caption=caption, mime_type=mime,
+                                                    file_size=file_size)))
+
+
+def cv_data(telegram: FakeTelegram, action: str) -> str:
+    for call in reversed(telegram.calls("sendMessage")):
+        for row in (call.get("reply_markup") or {}).get("inline_keyboard", []):
+            for button in row:
+                if button["callback_data"].startswith("cv:") and button["callback_data"].endswith(":" + action):
+                    return button["callback_data"]
+    raise AssertionError("no CV buttons sent")
+
+
+def db_bytes(path: Path) -> str:
+    """The database dump plus the raw bytes of the file and its WAL (deleted rows can linger there)."""
+    raw = b""
+    for suffix in ("", "-wal"):
+        try:
+            raw += Path(str(path) + suffix).read_bytes()
+        except FileNotFoundError:
+            pass
+    return dump_db(path) + raw.decode("latin-1")
+
+
+def drain(svc, clock) -> None:
+    while svc.process_next(clock.value):
+        pass
+
+
+def preview_cv(svc, clock, telegram, data: Optional[bytes] = None, **kw) -> str:
+    """Upload a CV, let the worker read it, return the ``Send`` callback data."""
+    assert upload(svc, telegram, build_pdf() if data is None else data, **kw) == []
+    drain(svc, clock)
+    return cv_data(telegram, "send")
+
+
+def no_consent(db: Database) -> None:
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute("DELETE FROM llm_consent")
+
+
+def test_pdf_upload_shows_a_masked_preview_and_stores_or_sends_nothing(svc, clock, telegram, turns, translator,
+                                                                       conv_store, db, caplog):
+    caplog.set_level(logging.DEBUG)
+    for name in ("httpx", "httpcore"):
+        caplog.set_level(logging.WARNING, logger=name)
+    send = preview_cv(svc, clock, telegram, caption=CAPTION, name="Private-Name-CV.pdf")
+    preview = [c for c in telegram.calls("sendMessage") if c.get("reply_markup")][-1]
+    assert preview["text"].startswith("Read 1 page, ")
+    for leaked in ("sample.person", "example.com", "555", "Sample Person", "<CAPTION-MARK>"):
+        assert leaked not in preview["text"]
+    nonce = send.split(":")[1]
+    assert button_data(preview["reply_markup"]) == [f"cv:{nonce}:send", f"cv:{nonce}:cancel"]
+    assert all(len(d.encode()) <= 64 for d in button_data(preview["reply_markup"]))
+    assert turns.extract_calls == [] and translator.calls == [] and turns.calls == []
+    assert conv_store.get_state(111).state == "idle"
+    stored = db_bytes(db.db_path)
+    assert CV_BODY not in stored and "<CAPTION-MARK>" not in stored
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    for leaked in (CV_BODY, "<CAPTION-MARK>", "Private-Name", "documents/"):
+        assert leaked not in log_text
+
+
+def test_pdf_by_mime_type_alone_takes_the_cv_path(svc, clock, telegram):
+    assert upload(svc, telegram, build_pdf(), name="resume", mime="application/pdf") == []
+    drain(svc, clock)
+    assert cv_data(telegram, "send")
+
+
+def test_pdf_over_5_mb_is_refused_from_file_size_before_download(svc, clock, telegram):
+    reply = upload(svc, telegram, b"", file_size=cv_module.MAX_CV_BYTES + 1)
+    assert texts(reply) == cv_module.TOO_LARGE_REPLY
+    assert telegram.calls("getFile") == [] and svc._buffers == []
+
+
+def test_pdf_larger_than_announced_is_refused_by_the_download_limit(svc, clock, telegram, monkeypatch):
+    monkeypatch.setattr(conv, "MAX_CV_BYTES", 1000)
+    assert upload(svc, telegram, build_pdf() + b"%" * 1000) == []
+    drain(svc, clock)
+    assert sent(telegram)[-1] == cv_module.TOO_LARGE_REPLY
+    assert svc._cv is None
+
+
+@pytest.mark.parametrize(
+    "make, reply",
+    [
+        (lambda: encrypted_pdf("secret", "owner"), cv_module.PASSWORD_REPLY),
+        (lambda: build_pdf(lines=[]), cv_module.NO_TEXT_REPLY),
+        (lambda: build_pdf(pages=11), cv_module.TOO_MANY_PAGES_REPLY),
+        (lambda: b"this is not a pdf at all", cv_module.UNREADABLE_REPLY),
+    ],
+    ids=["encrypted", "scanned", "eleven-pages", "not-a-pdf"],
+)
+def test_unusable_pdfs_get_the_exact_spec_reply(svc, clock, telegram, turns, make, reply):
+    assert upload(svc, telegram, make()) == []
+    drain(svc, clock)
+    assert sent(telegram)[-1] == reply
+    assert svc._cv is None and turns.extract_calls == []
+
+
+def test_send_without_consent_holds_then_yes_completes_with_caption_stored_masked(
+    svc, clock, telegram, turns, conv_store, db
+):
+    no_consent(db)
+    send = preview_cv(svc, clock, telegram, caption=CAPTION)
+    assert svc.on_callback(callback(send, message_id=41)) == []
+    assert sent(telegram)[-1] == CONSENT_NOTICE
+    assert {"chat_id": 111, "message_id": 41} in telegram.calls("editMessageReplyMarkup")
+    drain(svc, clock)
+    assert turns.extract_calls == []
+    assert conv_store.get_state(111).state == "idle"
+    stored = db_bytes(db.db_path)
+    assert CV_BODY not in stored and "<CAPTION-MARK>" not in stored
+    yes = [d for d in button_data(last_markup(telegram)) if d.endswith(":yes")][0]
+    turns.add_extract(ExtractReply(covers=["roles"], facts={"roles": "Team lead"}))
+    svc.on_callback(callback(yes))
+    assert conv_store.has_consent(111, CONSENT_VERSION)
+    drain(svc, clock)
+    assert len(turns.extract_calls) == 1 and CV_BODY in turns.extract_calls[0]["text"]
+    context = iv_context(conv_store)
+    facts = "\n".join(context["facts"].values())
+    assert "Team lead" in facts and "<CAPTION-MARK>" in facts
+    assert "caption.person@example.org" not in facts and "[email]" in facts
+    assert svc._cv is None
+    assert CV_BODY not in db_bytes(db.db_path)
+
+
+def test_send_then_consent_no_drops_the_cv(svc, clock, telegram, turns, conv_store, db):
+    no_consent(db)
+    send = preview_cv(svc, clock, telegram)
+    svc.on_callback(callback(send))
+    no = [d for d in button_data(last_markup(telegram)) if d.endswith(":no")][0]
+    assert texts(svc.on_callback(callback(no))) == conv.CONSENT_DECLINED_REPLY
+    assert svc._cv is None and turns.extract_calls == []
+    assert texts(svc.on_callback(callback(send))) == conv.CV_STALE_REPLY
+    assert conv_store.get_state(111).state == "idle"
+
+
+def test_cv_send_after_setup_hold_declined_starts_the_wizard(svc, clock, telegram, turns, db):
+    no_consent(db)
+    assert svc.start_setup(text_update("/setup")) == []
+    send = preview_cv(svc, clock, telegram)
+    svc.on_callback(callback(send))
+    no = [d for d in button_data(last_markup(telegram)) if d.endswith(":no")][0]
+    reply = texts(svc.on_callback(callback(no)))
+    assert reply.startswith(conv.CONSENT_DECLINED_SETUP_REPLY)
+    assert svc._cv is None and turns.extract_calls == []
+
+
+def test_send_in_an_idle_chat_starts_the_update_interview_with_notices_only_at_send(
+    svc, clock, telegram, turns, translator, conv_store
+):
+    propose(svc, clock, translator, telegram, add_role("<ROLE2>"))
+    assert conv_store.get_pending(111) is not None
+    send = preview_cv(svc, clock, telegram)
+    # nothing changed at upload time
+    assert conv_store.get_pending(111) is not None and conv_store.get_state(111).state == "awaiting_confirm"
+    assert conv.PROPOSAL_DISCARDED_REPLY not in sent(telegram)
+    questions_at_extract: List[bool] = []
+    question_texts = {conv.esc(q) for q in QUESTIONS.values()}
+    turns.extract_hook = lambda: questions_at_extract.append(any(t in question_texts for t in sent(telegram)))
+    turns.add_extract(ExtractReply(covers=["roles"], facts={"roles": "Team lead"}))
+    reply = svc.on_callback(callback(send))
+    assert conv.PROPOSAL_DISCARDED_REPLY in texts(reply)
+    assert conv_store.get_pending(111) is None
+    drain(svc, clock)
+    assert questions_at_extract == [False]  # the first question is never asked before extract
+    context = iv_context(conv_store)
+    assert context["mode"] == "update"
+    assert context["status"]["roles"] == "filled" and context["current"] == "markets"
+    shown = sent(telegram)
+    assert shown.index(conv.INTERVIEW_INTRO) < shown.index(conv.esc(QUESTIONS["markets"]))
+    assert conv.esc(QUESTIONS["roles"]) not in shown
+    assert svc._interview[111] == (context["nonce"], "markets")
+
+
+def test_extract_success_fills_covered_slots_drops_the_cv_and_asks_only_gaps(svc, clock, telegram, turns, conv_store):
+    send = preview_cv(svc, clock, telegram)
+    turns.add_extract(ExtractReply(
+        covers=["roles", "markets", "languages"],
+        facts={"roles": "Coach, write to a.person@example.org", "markets": "Germany", "languages": "English"},
+    ))
+    svc.on_callback(callback(send))
+    drain(svc, clock)
+    context = iv_context(conv_store)
+    assert context["facts"]["roles"] == "Coach, write to [email]"
+    assert [context["status"][s] for s in ("roles", "markets", "languages", "level")] == [
+        "filled", "filled", "filled", "empty"]
+    assert context["created_at"] == clock.value
+    assert context["current"] == "level" and context["asked_count"] == 1
+    assert sent(telegram)[-1] == conv.esc(QUESTIONS["level"])
+    assert svc._cv is None
+    # the interview goes on with the gaps
+    answer(svc, clock, "Senior")
+    assert sent(telegram)[-1] == conv.esc(QUESTIONS["avoid"])
+
+
+def test_extract_facts_are_cut_to_the_room_left_in_a_full_slot(svc, clock, telegram, turns, conv_store, caplog):
+    start_interview(svc, clock, telegram)
+    existing = "x" * (MAX_SLOT_FACTS_CHARS - 10)
+    answer(svc, clock, existing)  # long answer: one turn call (default reply) then the next question
+    turns.add_extract(ExtractReply(covers=["roles"], facts={"roles": "CVFACT" * 10}))
+    upload(svc, telegram, b"Experience\n" + b"plain text CV body\n" * 30, name="cv.txt", mime="text/plain")
+    drain(svc, clock)
+    svc.on_callback(callback(cv_data(telegram, "send")))
+    caplog.set_level(logging.INFO)
+    drain(svc, clock)
+    roles = iv_context(conv_store)["facts"]["roles"]
+    assert roles.startswith(existing) and len(roles) == MAX_SLOT_FACTS_CHARS
+    assert "CVFACT" not in caplog.text
+
+
+def test_failed_extract_keeps_the_cv_and_retry_reads_it_again(svc, clock, telegram, turns, conv_store, db):
+    send = preview_cv(svc, clock, telegram)
+    turns.add_extract(failure_error(ChatFailure.TIMEOUT))
+    svc.on_callback(callback(send))
+    drain(svc, clock)
+    shown = sent(telegram)
+    problem = [t for t in shown if describe_failure(ChatFailure.TIMEOUT) in t]
+    assert problem and conv.CV_KEPT_NOTE in problem[0]
+    context = iv_context(conv_store)
+    nonce = context["nonce"]
+    assert f"iv:{nonce}:retry" in [d for c in telegram.calls("sendMessage")
+                                   for d in button_data(c.get("reply_markup") or {"inline_keyboard": []})]
+    # the interview goes on: the first question follows the Retry note
+    assert shown[-1] == conv.esc(QUESTIONS["roles"]) and context["current"] == "roles"
+    assert svc._cv is not None and svc._cv.failed
+    assert CV_BODY not in db_bytes(db.db_path)
+    turns.add_extract(ExtractReply(covers=["markets"], facts={"markets": "Germany"}))
+    assert svc.on_callback(callback(f"iv:{nonce}:retry")) == []
+    drain(svc, clock)
+    assert len(turns.extract_calls) == 2 and turns.extract_calls[1]["text"] == turns.extract_calls[0]["text"]
+    context = iv_context(conv_store)
+    assert context["facts"]["markets"] == "Germany" and context["status"]["markets"] == "filled"
+    assert context["current"] == "roles" and context["asked_count"] == 1  # still the open first question
+    assert svc._cv is None and turns.draft_calls == []
+    # with the CV gone, Retry drafts again (the single dispatch point)
+    assert svc.on_callback(callback(f"iv:{nonce}:retry")) == []
+    drain(svc, clock)
+    assert len(turns.extract_calls) == 2 and len(turns.draft_calls) == 1
+
+
+def test_txt_during_the_interview_takes_the_cv_path(svc, clock, telegram, turns, translator, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    assert upload(svc, telegram, b"Some Name\nExperience\nTrained people. Mail me at x.y@example.org", name="notes.md",
+                  mime="text/markdown") == []
+    drain(svc, clock)
+    preview = [c for c in telegram.calls("sendMessage") if c.get("reply_markup")][-1]
+    assert preview["text"].startswith("Read ") and "pages" not in preview["text"]
+    assert "example.org" not in preview["text"]
+    assert translator.calls == [] and turns.extract_calls == []
+    assert iv_context(conv_store)["facts"] == {}
+    turns.add_extract(ExtractReply(covers=["markets"], facts={"markets": "Germany"}))
+    svc.on_callback(callback(cv_data(telegram, "send")))
+    drain(svc, clock)
+    assert "[email]" in turns.extract_calls[0]["text"]
+    context = iv_context(conv_store)
+    assert context["nonce"] == nonce and context["facts"] == {"markets": "Germany"}
+    assert context["current"] == "roles" and context["asked_count"] == 1
+    assert translator.calls == []
+
+
+def test_txt_over_20_kb_during_the_interview_is_refused(svc, clock, telegram):
+    start_interview(svc, clock, telegram)
+    reply = upload(svc, telegram, b"", name="cv.txt", mime="text/plain", file_size=conv.MAX_UPLOAD_BYTES + 1)
+    assert texts(reply) == conv.FILE_TOO_LARGE_REPLY
+
+
+def test_txt_in_an_idle_chat_keeps_the_free_text_path(svc, clock, telegram, translator):
+    assert upload(svc, telegram, b"add a role", name="a.txt", mime="text/plain") == []
+    drain(svc, clock)
+    assert translator.calls[0]["parts"] == ["add a role"]
+    assert svc._cv is None
+
+
+def test_a_new_cv_replaces_the_old_one(svc, clock, telegram):
+    first = preview_cv(svc, clock, telegram)
+    first_preview_id = 100 + len(telegram.calls("sendMessage"))
+    second = preview_cv(svc, clock, telegram, data=build_pdf(lines=["Some Name", "Experience", "Other text " * 40]))
+    assert first != second
+    assert {"chat_id": 111, "message_id": first_preview_id} in telegram.calls("editMessageReplyMarkup")
+    assert texts(svc.on_callback(callback(first))) == conv.CV_STALE_REPLY
+    assert svc._cv is not None and svc._cv.nonce == second.split(":")[1]
+
+
+@pytest.mark.parametrize("how", ["button", "command", "pairing", "expiry"])
+def test_cancel_and_expiry_drop_the_cv(svc, clock, telegram, turns, how):
+    send = preview_cv(svc, clock, telegram)
+    nonce = send.split(":")[1]
+    if how == "button":
+        assert texts(svc.on_callback(callback(f"cv:{nonce}:cancel"))) == conv.CANCELLED_REPLY
+    elif how == "command":
+        assert texts(svc.on_cancel(text_update("/cancel"))) == conv.CANCELLED_REPLY
+    elif how == "pairing":
+        svc.reset_memory()
+    else:
+        svc.sweep(clock.value + conv.CONTEXT_TTL_SECONDS - 1)
+        assert svc._cv is not None
+        svc.sweep(clock.value + conv.CONTEXT_TTL_SECONDS + 1)
+    assert svc._cv is None
+    assert texts(svc.on_callback(callback(send))) == conv.CV_STALE_REPLY
+    assert turns.extract_calls == []
+
+
+def test_expired_cv_button_is_stale_before_the_sweep(svc, clock, telegram):
+    send = preview_cv(svc, clock, telegram)
+    clock.value += conv.CONTEXT_TTL_SECONDS + 1
+    assert texts(svc.on_callback(callback(send))) == conv.CV_STALE_REPLY
+
+
+def test_a_restart_loses_the_cv_and_its_button_is_stale(svc, clock, telegram, db, store, tmp_path):
+    send = preview_cv(svc, clock, telegram)
+    ctx = BotContext(
+        db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
+        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+    )
+    fresh = ConversationService(ctx, TelegramBotClient(TOKEN, transport=telegram.transport),
+                                SetupWizard(BotStateStore(db), store, clock=clock),
+                                translator=FakeTranslator(), interview_llm=FakeInterviewLLM(), clock=clock)
+    assert texts(fresh.on_callback(callback(send))) == conv.CV_STALE_REPLY
+    assert texts(fresh.on_callback(callback("cv:zz"))) == conv.CV_STALE_REPLY
+
+
+def test_cancel_while_the_extract_runs_drops_its_result_and_the_cv(svc, clock, telegram, turns, conv_store):
+    send = preview_cv(svc, clock, telegram)
+    gate, entered = threading.Event(), threading.Event()
+
+    def block():
+        entered.set()
+        assert gate.wait(10)
+
+    turns.extract_hook = block
+    turns.add_extract(failure_error(ChatFailure.TIMEOUT))
+    svc.on_callback(callback(send))
+    worker = threading.Thread(target=drain, args=(svc, clock), daemon=True)
+    worker.start()  # one worker action: begin (intro only), then the extract call
+    assert entered.wait(5)
+    assert texts(svc.on_cancel(text_update("/cancel"))) == conv.CANCELLED_REPLY
+    gate.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert svc._cv is None  # a failed extract after /cancel does not put the CV back
+    assert conv_store.get_state(111).state == "idle"
+    assert not any(describe_failure(ChatFailure.TIMEOUT) in t for t in sent(telegram))
