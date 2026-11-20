@@ -17,7 +17,7 @@ from src.profile.importer import build_imported_snapshot, parse_queries_json
 from src.profile.errors import ProfileCompileError
 from src.profile.ops import AddPinnedQuery, ReplaceProfile, SetField, apply_changes
 from src.profile.snapshot import PinnedQuery, ProfileFields, ProfileSnapshot
-from src.scheduler.daemon import DaemonService, EvalSummary
+from src.scheduler.daemon import STOPPED_PROFILE_BUSY, DaemonService, EvalSummary
 from src.scraper import query_catalog
 from src.scraper.jobspy_scraper import JobSpyScraper
 from src.scraper.outcome import STATUS_EMPTY, ScrapeOutcome
@@ -883,7 +883,10 @@ def test_db_busy_without_a_last_good_profile_skips_evaluation(tmp_path, monkeypa
     _store_raises(daemon, monkeypatch, sqlite3.OperationalError("database is locked"))
 
     assert daemon.run_pipeline_cycle() == (0, 0)
-    assert daemon.evaluate_unprocessed().as_tuple() == (0, 0)  # the UNSET default resolves the profile itself
+    summary = daemon.evaluate_unprocessed()  # the UNSET default resolves the profile itself
+    assert summary.as_tuple() == (0, 0)
+    assert (summary.not_scored_in_batch, summary.beyond_limit) == (1, 0)
+    assert summary.stopped_reason == STOPPED_PROFILE_BUSY
 
     assert chain.calls == 0
     assert [j.eval_status for j in daemon.db.get_unprocessed_jobs()] == ["unprocessed"]

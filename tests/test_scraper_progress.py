@@ -325,7 +325,7 @@ def test_scrape_all_queries_warns_country_less_once_not_twice(monkeypatch, sleep
 # ------------------------------------------------ cycle counters for the run report
 
 
-def test_end_cycle_returns_the_number_of_skipped_board_calls(monkeypatch, sleeps):
+def test_end_cycle_returns_the_number_of_distinct_skipped_boards(monkeypatch, sleeps, caplog):
     _patch_scrape(monkeypatch, {})
     scraper = _scraper(enabled_boards=["linkedin", "indeed", "glassdoor"])
     assert scraper.end_cycle() == 0  # no cycle in progress
@@ -336,7 +336,11 @@ def test_end_cycle_returns_the_number_of_skipped_board_calls(monkeypatch, sleeps
             _query(query_id="Q-C", site_names=["indeed"], country_code="testland"),
         ]
     )
-    assert scraper.end_cycle() == 3  # indeed x2 + glassdoor x1 (missing country); disabled boards are deliberate
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        # indeed (2 queries) + glassdoor (1 query) = 2 boards; disabled boards are deliberate and not counted
+        assert scraper.end_cycle() == 2
+    summary = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Scrape summary")]
+    assert "indeed (no country_code) x2" in summary[0]  # the per-call detail stays in the log
     assert scraper.end_cycle() == 0
 
 
@@ -429,4 +433,22 @@ def test_classify_scrape_problems():
         REASON_DETAIL_PAGES
     ]
     assert classify_scrape_problems("linkedin", ScrapeOutcome(postings=[], rows=0, status=STATUS_EMPTY)) == []
+    # 429 only as a standalone number, never inside another number or a word
+    assert classify_scrape_problems("linkedin", failed("read timed out after 0.429 s")) == ["read timed out after 0.429 s"]
+    assert classify_scrape_problems("linkedin", failed("abc429")) == ["abc429"]
+    assert classify_scrape_problems("linkedin", failed("Too Many Requests")) == [REASON_BLOCKED_429]
+    # whitespace and newlines collapse to single spaces (after redaction, before the cut)
+    assert classify_scrape_problems("indeed", failed("  line one\n\n  line\ttwo  ")) == ["line one line two"]
     assert classify_scrape_problems("indeed", ScrapeOutcome(postings=[], rows=5, status=STATUS_OK)) == []
+
+
+def test_scrape_problem_reason_redacts_before_the_cut():
+    from src.scheduler.daemon import classify_scrape_problems
+    from src.scraper.outcome import STATUS_FAILED, ScrapeOutcome
+
+    prefix = "z" * 45 + " "
+    error = prefix + "http://user:hunter2secretpw@proxy.example:8080 refused"
+    assert error.index("hunter2") < 60 < error.index("refused")  # the credential straddles character 60
+    (reason,) = classify_scrape_problems("indeed", ScrapeOutcome(postings=[], rows=0, status=STATUS_FAILED, error=error))
+    assert len(reason) <= 60
+    assert "hunter2" not in reason and "secretpw" not in reason and "hunt" not in reason

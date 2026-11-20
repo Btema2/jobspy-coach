@@ -126,7 +126,8 @@ REASON_BLOCKED_429 = "blocked (429)"
 REASON_DETAIL_PAGES = "detail pages blocked"
 REASON_NO_DATA = "no data returned"
 _MAX_REASON_CHARS = 60
-_RE_429 = re.compile(r"(?<!\d)429(?!\d)")
+# 429 as a standalone status number (never inside a word or a decimal such as 0.429), or its reason phrase.
+_RE_429 = re.compile(r"(?<![\w.])429(?!\w)(?!\.\d)|too many requests", re.IGNORECASE)
 
 
 def _error_reason(board: str, error: Optional[str]) -> str:
@@ -136,7 +137,8 @@ def _error_reason(board: str, error: Optional[str]) -> str:
         return REASON_BLOCKED_429
     if board == "google" and "no job data returned" in text.lower():
         return REASON_NO_DATA
-    return redact_secrets(text)[:_MAX_REASON_CHARS] or "unknown error"
+    # Redact first, then collapse whitespace, then cut: a secret is never split by the cut.
+    return " ".join(redact_secrets(text).split())[:_MAX_REASON_CHARS] or "unknown error"
 
 
 def classify_scrape_problems(board: str, outcome: ScrapeOutcome) -> List[str]:
@@ -157,7 +159,7 @@ class ScrapeStats:
     ok: int = 0
     empty: int = 0
     failed: int = 0
-    skipped_boards: int = 0
+    skipped_boards: int = 0  # distinct boards skipped for a missing country (scraper end_cycle)
     new_to_evaluate: int = 0
     prefiltered: int = 0
     problems: Counter = field(default_factory=Counter)
