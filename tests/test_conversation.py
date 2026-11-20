@@ -156,17 +156,38 @@ def translator() -> FakeTranslator:
 
 
 class FakeInterviewLLM:
-    """``InterviewLLM.turn`` scripted: each item is a ``TurnReply``, None (a failed call) or an exception."""
+    """``InterviewLLM.turn`` scripted: each item is a ``TurnReply``, None (a failed call) or an exception.
+
+    ``draft`` is scripted separately (``add_draft``): each item is a ``prop(...)`` maker or an exception; with
+    nothing queued it drafts one role ``<DRAFTED>``."""
 
     def __init__(self):
         self.script: List[Any] = []
         self.calls: List[dict] = []
         self.gate: Optional[threading.Event] = None
         self.entered = threading.Event()
+        self.drafts: List[Any] = []
+        self.draft_calls: List[dict] = []
+        self.draft_gate: Optional[threading.Event] = None
+        self.draft_entered = threading.Event()
 
     def add(self, *items: Any) -> "FakeInterviewLLM":
         self.script.extend(items)
         return self
+
+    def add_draft(self, *items: Any) -> "FakeInterviewLLM":
+        self.drafts.extend(items)
+        return self
+
+    def draft(self, state, snapshot, request_id):
+        self.draft_calls.append({"state": state.to_json(), "mode": state.mode, "snapshot": snapshot})
+        self.draft_entered.set()
+        if self.draft_gate is not None:
+            assert self.draft_gate.wait(10)
+        item = self.drafts.pop(0) if self.drafts else prop(add_role("<DRAFTED>"))
+        if isinstance(item, BaseException):
+            raise item
+        return item(snapshot, state.mode)
 
     def turn(self, state, slot, answer, request_id):
         self.calls.append({"slot": slot, "answer": answer})
@@ -1461,15 +1482,18 @@ def test_six_mixed_answers_reach_draft_and_short_answers_call_no_model(svc, cloc
     answer(svc, clock, "English, German")  # languages: short
     answer(svc, clock, "senior or lead level, never junior positions please")  # level: long
     answer(svc, clock, "sales")  # avoid: short
+    assert turns.draft_calls == []
     answer(svc, clock, "PMP")  # bonus: short -> no empty slot left: the draft starts on its own
     assert [c["slot"] for c in turns.calls] == ["roles", "level"]
-    context = iv_context(conv_store)
+    assert len(turns.draft_calls) == 1  # no button press needed
+    context = turns.draft_calls[0]["state"]
     assert set(context["status"].values()) == {"filled"}
     assert context["facts"]["roles"] == LONG and context["facts"]["bonus"] == "PMP"
     assert context["created_at"] == first  # set once, at the first stored answer
     questions = [t for t in sent(telegram) if t in {conv.esc(q) for q in QUESTIONS.values()}]
     assert questions == [conv.esc(QUESTIONS[s]) for s in ("roles", "markets", "languages", "level", "avoid", "bonus")]
-    assert sent(telegram)[-1] == conv.DRAFTING_REPLY
+    assert conv.WORKING_REPLY in sent(telegram)
+    assert conv_store.get_pending(111) is not None and conv_store.get_state(111).state == conv.STATE_CONFIRM
 
 
 def test_vague_long_answer_gets_one_followup_and_its_answer_no_turn_call(svc, clock, telegram, turns, conv_store):
@@ -1591,8 +1615,10 @@ def test_typing_then_draft_now_within_3s_keeps_the_answer(svc, clock, telegram, 
     assert svc.on_callback(callback(f"iv:{nonce}:draft")) == []
     while svc.process_next(clock.value):
         pass
-    assert iv_context(conv_store)["facts"] == {"roles": "Data analyst"}
-    assert sent(telegram)[-2:] == [conv.esc(QUESTIONS["markets"]), conv.DRAFTING_REPLY]
+    assert turns.draft_calls[0]["state"]["facts"] == {"roles": "Data analyst"}
+    shown = sent(telegram)
+    assert shown.index(conv.esc(QUESTIONS["markets"])) < shown.index(conv.WORKING_REPLY)
+    assert conv_store.get_pending(111) is not None
 
 
 def test_process_next_never_overtakes_an_earlier_waiting_buffer_of_the_same_chat(svc, clock, translator, telegram):
@@ -1626,9 +1652,10 @@ def test_eight_questions_then_the_draft_starts(svc, clock, telegram, turns, conv
     answer(svc, clock, "Senior")  # level: question 7
     assert sent(telegram)[-1] == conv.esc(QUESTIONS["avoid"])  # question 8
     answer(svc, clock, "Sales")
-    context = iv_context(conv_store)
+    assert len(turns.draft_calls) == 1  # the cap starts the draft by itself
+    context = turns.draft_calls[0]["state"]
     assert context["asked_count"] == MAX_INTERVIEW_QUESTIONS and context["status"]["bonus"] == "empty"
-    assert sent(telegram)[-1] == conv.DRAFTING_REPLY
+    assert conv.WORKING_REPLY in sent(telegram) and conv_store.get_pending(111) is not None
     assert conv.esc(QUESTIONS["bonus"]) not in sent(telegram)
 
 
@@ -1723,3 +1750,284 @@ def test_free_text_result_never_overwrites_an_interview_row(svc, clock, telegram
     run_request(svc, clock, "add another role")
     assert conv_store.get_pending(111) is None
     assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+
+
+# --- the interview draft step (Task 7) ---------------------------------------------------------------------
+
+SIX_SHORT = ("Data analyst", "Germany", "English", "Senior", "sales", "PMP")
+
+
+def make_starter(store: ProfileStore) -> None:
+    """No enabled role and no market: the interview drafts in onboarding mode."""
+    from src.profile.ops import RemoveMarket, SetEnabled
+
+    snapshot = store.read_snapshot()
+    apply_changes(
+        store,
+        [SetEnabled("role", snapshot.roles[0].name, False), RemoveMarket(snapshot.markets[0].name)],
+        label="empty",
+    )
+
+
+def draft_now(svc, clock, nonce: str) -> None:
+    assert svc.on_callback(callback(f"iv:{nonce}:draft")) == []
+    while svc.process_next(clock.value):
+        pass
+
+
+def iv_buttons(telegram: FakeTelegram) -> List[str]:
+    return [d.split(":")[2] for d in button_data(last_markup(telegram)) if d.startswith("iv:")]
+
+
+def accept_data(telegram: FakeTelegram) -> str:
+    return [d for d in button_data(last_markup(telegram)) if d.startswith("pc:") and d.endswith(":a")][0]
+
+
+@pytest.mark.parametrize("mode", ["onboarding", "update"])
+def test_draft_success_stores_a_proposal_in_the_interview_mode_and_drops_the_facts(
+    svc, clock, telegram, turns, conv_store, store, db, mode
+):
+    if mode == "onboarding":
+        make_starter(store)
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, "Data analyst <FACT-MARK>")
+    draft_now(svc, clock, nonce)
+    assert turns.draft_calls[0]["mode"] == mode
+    assert turns.draft_calls[0]["state"]["facts"] == {"roles": "Data analyst <FACT-MARK>"}
+    shown = sent(telegram)
+    assert conv.WORKING_REPLY in shown
+    assert any(d.startswith("pc:") for d in button_data(last_markup(telegram)))
+    pending = conv_store.get_pending(111)
+    assert pending is not None and pending.mode == mode
+    state = conv_store.get_state(111)
+    assert state.state == conv.STATE_CONFIRM and state.context is None  # the facts are gone
+    assert "FACT-MARK" not in dump_db(db.db_path)
+    assert 111 not in svc._interview
+
+
+@pytest.mark.parametrize("mode", ["onboarding", "update"])
+def test_apply_of_an_interview_proposal_labels_the_version(svc, clock, telegram, turns, conv_store, store, mode):
+    if mode == "onboarding":
+        make_starter(store)
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, "Data analyst")
+    draft_now(svc, clock, nonce)
+    before = version(store)
+    svc.on_callback(callback(accept_data(telegram)))
+    assert version(store) == before + 1
+    assert store.list_versions()[0].label == f"llm {mode}"
+    assert conv_store.get_state(111).state == "idle"
+
+
+def test_update_proposal_on_a_paused_profile_gets_the_resume_note(svc, clock, telegram, turns, store):
+    apply_changes(store, [SetField("paused", True)], label="pause")
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, "Data analyst")
+    draft_now(svc, clock, nonce)
+    reply = texts(svc.on_callback(callback(accept_data(telegram))))
+    assert store.list_versions()[0].label == "llm update" and conv.PAUSED_NOTE in reply
+
+
+@pytest.mark.parametrize("failure", list(ChatFailure))
+def test_each_chat_failure_keeps_the_interview_with_retry(svc, clock, telegram, turns, conv_store, failure):
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, "Data analyst")
+    turns.add_draft(failure_error(failure, retry_in=120.0))
+    draft_now(svc, clock, nonce)
+    problem = [t for t in sent(telegram) if describe_failure(failure, 120.0) in t]
+    assert problem, sent(telegram)
+    assert iv_buttons(telegram) == ["retry", "guided"]
+    retry = [b for row in last_markup(telegram)["inline_keyboard"] for b in row if b["callback_data"].endswith(":retry")]
+    assert retry[0]["text"] == "Retry" and retry[0]["callback_data"] == f"iv:{nonce}:retry"
+    context = iv_context(conv_store)
+    assert context["facts"] == {"roles": "Data analyst"} and context["nonce"] == nonce
+    assert conv_store.get_pending(111) is None and svc._interview[111][0] == nonce
+    # Retry runs the draft again from the stored facts
+    assert svc.on_callback(callback(f"iv:{nonce}:retry")) == []
+    while svc.process_next(clock.value):
+        pass
+    assert len(turns.draft_calls) == 2 and turns.draft_calls[1]["state"]["facts"] == {"roles": "Data analyst"}
+    assert conv_store.get_pending(111) is not None
+
+
+def test_not_configured_draft_offers_no_retry(svc, clock, telegram, turns, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    turns.add_draft(ChatLLMNotConfigured("no key"))
+    draft_now(svc, clock, nonce)
+    assert any(conv.NOT_CONFIGURED_REPLY in t for t in sent(telegram))
+    assert iv_buttons(telegram) == ["guided"]
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+
+
+def test_retry_after_a_restart_drafts_from_the_stored_facts(svc, db, store, clock, telegram, turns, conv_store, tmp_path):
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, "Data analyst")
+    turns.add_draft(failure_error(ChatFailure.TIMEOUT))
+    draft_now(svc, clock, nonce)
+    ctx = BotContext(
+        db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
+        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+    )
+    fresh_llm = FakeInterviewLLM()
+    fresh = ConversationService(ctx, TelegramBotClient(TOKEN, transport=telegram.transport),
+                                SetupWizard(BotStateStore(db), store, clock=clock),
+                                translator=FakeTranslator(), interview_llm=fresh_llm, clock=clock)
+    assert fresh.on_callback(callback(f"iv:{nonce}:retry")) == []
+    while fresh.process_next(clock.value):
+        pass
+    assert fresh_llm.draft_calls[0]["state"]["facts"] == {"roles": "Data analyst"}
+    assert conv_store.get_pending(111) is not None
+
+
+def run_blocked_draft(svc, clock, turns, nonce) -> threading.Thread:
+    turns.draft_gate = threading.Event()
+    assert svc.on_callback(callback(f"iv:{nonce}:draft")) == []
+    worker = threading.Thread(target=svc.process_next, args=(clock.value,), daemon=True)
+    worker.start()
+    assert turns.draft_entered.wait(5)
+    return worker
+
+
+@pytest.mark.parametrize("how", ["/cancel", "iv-cancel", "/setup"])
+def test_cancel_while_the_draft_runs_drops_the_late_result(svc, clock, telegram, turns, conv_store, how):
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, "Data analyst")
+    worker = run_blocked_draft(svc, clock, turns, nonce)
+    if how == "/cancel":
+        reply = svc.on_cancel(text_update("/cancel"))
+    elif how == "iv-cancel":
+        reply = svc.on_callback(callback(f"iv:{nonce}:cancel"))
+    else:
+        reply = svc.start_setup(text_update("/setup"))
+    assert worker.is_alive()  # the poller answered while the draft call is still blocked
+    if how != "/setup":
+        assert texts(reply) == conv.CANCELLED_REPLY
+    turns.draft_gate.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert conv_store.get_pending(111) is None
+    assert not any(d.startswith("pc:") for c in telegram.calls("sendMessage")
+                   for d in button_data(c.get("reply_markup") or {"inline_keyboard": []}))
+    if how != "/setup":
+        assert conv_store.get_state(111).state == "idle" and 111 not in svc._interview
+
+
+def test_a_replaced_interview_row_drops_the_draft_result(svc, clock, telegram, turns, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    worker = run_blocked_draft(svc, clock, turns, nonce)
+    context = dict(conv_store.get_state(111).context, nonce="0000ffff")
+    conv_store.set_state(111, conv.STATE_INTERVIEW, context, clock.value)  # no generation bump
+    turns.draft_gate.set()
+    worker.join(5)
+    assert conv_store.get_pending(111) is None
+    assert conv_store.get_state(111).context["nonce"] == "0000ffff"
+
+
+def test_store_proposal_guard_false_stores_nothing(svc, clock, telegram, conv_store, store):
+    work = conv._Work(conv._Buffer(111, [], 0, clock.value, closed=True, immediate=True), svc._generation)
+    proposal = prop(add_role("<ROLE2>"))(store.read_snapshot(), "chat")
+    calls = []
+    svc._store_proposal(work, proposal, "chat", guard=lambda: calls.append(1) or False)
+    assert calls == [1] and conv_store.get_pending(111) is None and sent(telegram) == []
+    svc._store_proposal(work, proposal, "chat", guard=lambda: True)
+    assert conv_store.get_pending(111) is not None
+
+
+def test_unknown_country_reasks_the_markets_question(svc, clock, telegram, turns, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    for text in SIX_SHORT[:-1]:
+        answer(svc, clock, text)
+    turns.add_draft(prop({"op": "add_market", "country": "Atlantis"}))
+    answer(svc, clock, SIX_SHORT[-1])  # the draft starts by itself and fails validation
+    shown = sent(telegram)
+    assert any(t.startswith("Not applied: Unknown country") for t in shown)
+    assert shown[-1] == conv.esc(QUESTIONS["markets"])
+    context = iv_context(conv_store)
+    assert context["status"]["markets"] == "empty" and context["current"] == "markets"
+    assert "markets" not in context["facts"]  # the new answer replaces the old one
+    assert svc._interview[111] == (nonce, "markets")
+    buttons = [d for c in telegram.calls("sendMessage") for d in button_data(c.get("reply_markup") or {"inline_keyboard": []})]
+    assert [b.split(":")[2] for b in buttons[-3:]] == ["retry", "draft", "guided"]
+    answer(svc, clock, "Germany and remote")  # no empty slot left: the draft runs again by itself
+    assert len(turns.draft_calls) == 2
+    assert turns.draft_calls[1]["state"]["facts"]["markets"] == "Germany and remote"
+    assert conv_store.get_pending(111) is not None
+
+
+def test_reask_after_the_question_cap_is_still_asked(svc, clock, telegram, turns, conv_store):
+    start_interview(svc, clock, telegram)
+    for slot in ("roles", "markets", "languages"):
+        turns.add(TurnReply(covers=[], followup=f"More about {slot}?"))
+        answer(svc, clock, LONG)
+        answer(svc, clock, "ok sure")
+    answer(svc, clock, "Senior")
+    turns.add_draft(prop({"op": "add_market", "country": "Atlantis"}))
+    answer(svc, clock, "Sales")  # question 8: the cap starts the draft
+    assert sent(telegram)[-1] == conv.esc(QUESTIONS["markets"])
+    assert iv_context(conv_store)["asked_count"] <= MAX_INTERVIEW_QUESTIONS
+    answer(svc, clock, "Germany")
+    assert len(turns.draft_calls) == 2 and conv_store.get_pending(111) is not None
+
+
+def test_validation_error_names_no_slot(svc, clock, telegram, turns, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    turns.add_draft(ProfileValidationError(["digest threshold must be below wow"]))
+    draft_now(svc, clock, nonce)
+    assert sent(telegram)[-1].startswith("Not applied: digest threshold")
+    assert iv_buttons(telegram) == ["retry", "guided"]
+    assert iv_context(conv_store)["current"] == "roles"
+
+
+def test_none_shows_nothing_to_propose(svc, clock, telegram, turns, conv_store):
+    from src.bot.translator import NOTHING_TO_PROPOSE
+
+    nonce = start_interview(svc, clock, telegram)
+    turns.add_draft(TranslationProblem([NOTHING_TO_PROPOSE]))
+    draft_now(svc, clock, nonce)
+    assert "nothing to propose" in sent(telegram)[-1]
+    assert iv_buttons(telegram) == ["retry", "guided"]
+    assert conv_store.get_state(111).state == conv.STATE_INTERVIEW
+
+
+def test_answer_after_the_proposal_is_stored_gets_one_line(svc, clock, telegram, turns, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    assert svc.on_callback(callback(f"iv:{nonce}:draft")) == []
+    assert say(svc, "one more thing <LATE>") == []  # queued (tagged) before the draft ran
+    while svc.process_next(clock.value):
+        pass
+    assert sent(telegram)[-1] == conv.DRAFT_READY_REPLY == "The draft is ready; send changes after confirming."
+    assert conv_store.get_state(111).state == conv.STATE_CONFIRM
+    assert conv_store.get_state(111).context is None and conv_store.get_pending(111) is not None
+
+
+def test_stale_base_version_rejects_an_interview_proposal(svc, clock, telegram, turns, conv_store, store):
+    nonce = start_interview(svc, clock, telegram)
+    draft_now(svc, clock, nonce)
+    accept = accept_data(telegram)
+    apply_changes(store, [SetField("paused", True)], label="elsewhere")
+    before = version(store)
+    assert texts(svc.on_callback(callback(accept))) == conv.CONFLICT_REPLY
+    assert version(store) == before
+
+
+def test_cancelling_the_draft_proposal_leaves_the_chat_idle(svc, clock, telegram, turns, translator, conv_store):
+    nonce = start_interview(svc, clock, telegram)
+    draft_now(svc, clock, nonce)
+    cancel = [d for d in button_data(last_markup(telegram)) if d.startswith("pc:") and d.endswith(":c")][0]
+    assert texts(svc.on_callback(callback(cancel))) == conv.CANCELLED_REPLY
+    state = conv_store.get_state(111)
+    assert state.state == "idle" and state.context is None and 111 not in svc._interview
+    _free_text_reaches_translator(svc, clock)
+
+
+def test_no_answer_text_in_logs_through_the_draft(svc, clock, telegram, turns, caplog):
+    caplog.set_level(logging.DEBUG)
+    nonce = start_interview(svc, clock, telegram)
+    answer(svc, clock, f"{MARKER} analyst")
+    turns.add_draft(failure_error(ChatFailure.BAD_ANSWER), prop({"op": "add_market", "country": MARKER}))
+    draft_now(svc, clock, nonce)
+    svc.on_callback(callback(f"iv:{nonce}:retry"))
+    while svc.process_next(clock.value):
+        pass
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert MARKER not in log_text

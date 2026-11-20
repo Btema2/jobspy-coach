@@ -30,7 +30,7 @@ from src.bot.conversation_store import ConversationState, ConversationStore, Pen
 from src.bot.interview import CANCEL as ANSWER_CANCEL
 from src.bot.interview import CANCEL_HINT as CANCEL_WORD_REPLY
 from src.bot.interview import EMPTY as ANSWER_EMPTY
-from src.bot.interview import SLOTS, TURN_UNCHECKED_NOTE
+from src.bot.interview import QUESTIONS, SLOTS, TURN_UNCHECKED_NOTE
 from src.bot.interview import TOO_LONG as ANSWER_TOO_LONG
 from src.bot.interview import TOO_LONG_REPLY as TOO_LONG_ANSWER_REPLY
 from src.bot.interview import (
@@ -133,7 +133,9 @@ CANCEL_BUTTON = "Cancel"
 INTERVIEW_STALE_REPLY = "This choice is no longer active; send your answer again."
 CONSENT_DECLINED_SETUP_REPLY = "Nothing was sent. Continuing with step-by-step questions."
 # TOO_LONG_ANSWER_REPLY, CANCEL_WORD_REPLY and TURN_UNCHECKED_NOTE come from ``src.bot.interview``.
-DRAFTING_REPLY = "Drafting your profile from your answers..."  # placeholder until the draft step exists
+DRAFT_READY_REPLY = "The draft is ready; send changes after confirming."
+DRAFT_KEPT_NOTE = "Your answers are kept; Retry drafts again."
+REASK_NOTE = "Please answer this question again; Draft now drafts without it."
 INTERVIEW_INTRO = (
     "Let's set up your search. I will ask 6 to 8 short questions; it takes a few minutes. "
     "You can send a CV (PDF), a .txt / .md file or pasted text at any point: one answer can cover several "
@@ -148,6 +150,14 @@ STATE_CLARIFICATION = "awaiting_clarification"
 STATE_CONFIRM = "awaiting_confirm"
 STATE_INTERVIEW = "awaiting_interview"
 _INTERVIEW_ACTIONS = ("draft", "cancel", "retry", "guided")
+_INTERVIEW_PROPOSAL_MODES = ("onboarding", "update")
+# The slot asked again when an operation of this kind could not be used (anything else names no slot).
+_SLOT_BY_OP = {
+    "add_market": "markets", "remove_market": "markets", "modify_market": "markets",
+    "add_role": "roles", "remove_role": "roles", "add_role_term": "roles", "remove_role_term": "roles",
+    "add_rule": "avoid", "remove_rule": "avoid", "modify_rule": "avoid",
+    "set_target_level": "level",
+}
 
 
 def _reply(text: str) -> List[OutgoingMessage]:
@@ -688,7 +698,10 @@ class ConversationService:
         snapshot = self._profiles.read_snapshot()
         if (snapshot.version if snapshot is not None else 0) != taken.base_version:
             return _reply(CONFLICT_REPLY)
-        label = "llm onboarding" if taken.mode == "onboarding" else f"chat change ({len(operations)} operations)"
+        if taken.mode in _INTERVIEW_PROPOSAL_MODES:
+            label = f"llm {taken.mode}"
+        else:
+            label = f"chat change ({len(operations)} operations)"
         try:
             profile_ops = to_operations(operations, snapshot)
             result = apply_changes(self._profiles, profile_ops, label=label, expected_version=taken.base_version)
@@ -702,7 +715,7 @@ class ConversationService:
         if result.old is not None and result.old.fields.paused and result.new is not None \
                 and not result.new.fields.paused:
             extra.append(self._trigger())
-        if taken.mode == "onboarding" and result.new is not None and result.new.fields.paused:
+        if taken.mode in _INTERVIEW_PROPOSAL_MODES and result.new is not None and result.new.fields.paused:
             extra.append(PAUSED_NOTE)
         return _reply(render_apply(result, extra))
 
@@ -1164,18 +1177,6 @@ class ConversationService:
             return None
         return state
 
-    def _rebuild_mirror(self, work: _Work) -> Optional[InterviewState]:
-        """After a restart the mirror is empty while the row says ``awaiting_interview``: rebuild it from the row."""
-        chat_id = work.buffer.chat_id
-        state = self._wconv.get_state(chat_id)
-        interview = InterviewState.from_json(state.context) if state.state == STATE_INTERVIEW else None
-        if interview is None:
-            return None
-        with self._cond:
-            if work.generation == self._generation and chat_id not in self._interview:
-                self._interview[chat_id] = (interview.nonce, interview.current)
-        return interview
-
     def _run_interview(self, work: _Work, request_id: str) -> None:
         """One interview input on the worker (Locks and the worker rule).
 
@@ -1185,7 +1186,10 @@ class ConversationService:
         writes its result only when the row is still the same interview (state, nonce, generation). Every send
         happens after the locks are released; the mirror is set before each question is posted."""
         buffer = work.buffer
-        if buffer.action in ("draft", "retry"):
+        if buffer.action == "retry":
+            self._run_retry(work, request_id)
+            return
+        if buffer.action == "draft":
             self._run_draft(work, request_id)
             return
         if buffer.doc is not None:  # uploads in an interview (the CV path) are a later step
@@ -1205,25 +1209,33 @@ class ConversationService:
             if self._stale(work):
                 return
             state = self._load_interview(work)
+            ready = False
             if state is None:
-                return  # the interview ended meanwhile: the answer is dropped silently
-            nonce = state.nonce
-            slot = buffer.slot if buffer.slot in SLOTS else state.current
-            if slot is None:  # no question asked yet (an interview started from a CV): the next one's slot
-                slot = peek_step(state).slot or SLOTS[0]
-            late = buffer.slot in SLOTS and buffer.slot != state.current
-            masked = mask_all(text)
-            wants_turn = not late and self._interview_llm is not None and needs_turn_call(state, slot, masked)
-            result = store_answer(state, slot, masked, now=now)
-            if result == ANSWER_CANCEL:
-                reply = CANCEL_WORD_REPLY
-            elif result == ANSWER_TOO_LONG:
-                reply = TOO_LONG_ANSWER_REPLY
-            elif result != ANSWER_EMPTY:
-                if not late and not wants_turn:
-                    step = next_step(state)  # exactly once per step, under the lock
-                self._wconv.set_state(chat_id, STATE_INTERVIEW, state.to_json(), now)
-                self._context_chats.add(chat_id)
+                # The draft proposal was stored after this answer was queued: it is not stored; else the
+                # interview ended meanwhile and the answer is dropped silently.
+                ready = self._draft_ready(chat_id)
+            else:
+                nonce = state.nonce
+                slot = buffer.slot if buffer.slot in SLOTS else state.current
+                if slot is None:  # no question asked yet (an interview started from a CV): the next one's slot
+                    slot = peek_step(state).slot or SLOTS[0]
+                late = buffer.slot in SLOTS and buffer.slot != state.current
+                masked = mask_all(text)
+                wants_turn = not late and self._interview_llm is not None and needs_turn_call(state, slot, masked)
+                result = store_answer(state, slot, masked, now=now)
+                if result == ANSWER_CANCEL:
+                    reply = CANCEL_WORD_REPLY
+                elif result == ANSWER_TOO_LONG:
+                    reply = TOO_LONG_ANSWER_REPLY
+                elif result != ANSWER_EMPTY:
+                    if not late and not wants_turn:
+                        step = next_step(state)  # exactly once per step, under the lock
+                    self._wconv.set_state(chat_id, STATE_INTERVIEW, state.to_json(), now)
+                    self._context_chats.add(chat_id)
+        if state is None:
+            if ready and not self._stale(work):
+                self._send(chat_id, _reply(DRAFT_READY_REPLY))
+            return
         logger.info(
             "interview answer %s: %d chars, %s%s", request_id, len(masked), result,
             " (earlier question)" if late else "",
@@ -1272,9 +1284,32 @@ class ConversationService:
             return
         self._send(chat_id, [OutgoingMessage(n) for n in notes] + _reply(esc(step.text)))
 
+    def _draft_ready(self, chat_id: int) -> bool:
+        """Under ``_state_lock``: the chat waits for the answer to an interview draft proposal."""
+        if self._wconv.get_state(chat_id).state != STATE_CONFIRM:
+            return False
+        pending = self._wconv.get_pending(chat_id)
+        return pending is not None and pending.mode in _INTERVIEW_PROPOSAL_MODES
+
+    def _run_retry(self, work: _Work, request_id: str) -> None:
+        """``iv:<nonce>:retry``: run the failed step again. Only the draft offers Retry so far (its facts are in
+        the database); a later step with its own Retry is dispatched here."""
+        self._run_draft(work, request_id)
+
+    def _same_interview(self, work: _Work, nonce: str) -> Optional[InterviewState]:
+        """Under ``_state_lock``: the stored interview when it is still ``nonce`` and the work is current."""
+        if self._stale(work):
+            return None
+        row = self._wconv.get_state(work.buffer.chat_id)
+        current = InterviewState.from_json(row.context) if row.state == STATE_INTERVIEW else None
+        return current if current is not None and current.nonce == nonce else None
+
     def _run_draft(self, work: _Work, request_id: str) -> None:
-        """PLACEHOLDER (the draft step replaces it): ``Draft now``, ``Retry`` and the end of the checklist only
-        post a short line; no model is called and the interview stays as it is."""
+        """The draft step (Locks and the worker rule): read the facts under ``_state_lock``, run the draft call
+        with no lock, then store the proposal through ``_store_proposal`` with a compare-and-set guard (same
+        state, nonce and generation), so a result that arrives after ``/cancel``, ``/setup`` or a replaced row is
+        dropped. Problems keep the interview (``_draft_problem``)."""
+        chat_id = work.buffer.chat_id
         with self._state_lock:
             if self._stale(work):
                 return
@@ -1282,9 +1317,95 @@ class ConversationService:
         if state is None:
             return
         self._ensure_mirror(work, state.nonce, state.current)
-        logger.debug("interview draft %s not implemented yet", request_id)
-        if not self._stale(work):
-            self._send(work.buffer.chat_id, _reply(DRAFTING_REPLY))
+        if self._interview_llm is None:
+            self._draft_problem(work, state.nonce, NOT_CONFIGURED_REPLY, None, retry=False)
+            return
+        snapshot = self._wprofiles.read_snapshot()
+        if self._stale(work):
+            return
+        logger.info("interview draft %s: %d chars of facts", request_id, sum(len(v) for v in state.facts.values()))
+        self._send(chat_id, _reply(WORKING_REPLY))
+        timer = threading.Timer(PROGRESS_NOTE_SECONDS, self._progress_note, args=(work,))
+        timer.daemon = True
+        timer.start()
+        proposal: Optional[Proposal] = None
+        reason: Optional[str] = None
+        slot: Optional[str] = None
+        retry = True
+        try:
+            proposal = self._interview_llm.draft(state, snapshot, request_id)
+        except StopRequested:
+            return
+        except ChatLLMNotConfigured:
+            reason, retry = NOT_CONFIGURED_REPLY, False
+        except ChatLLMError as exc:
+            logger.warning("interview draft %s failed: %s (%s)", request_id, type(exc).__name__, exc.failure.value)
+            daily = bool(getattr(exc, "daily", False)) if isinstance(exc, ChatLLMLimited) else False
+            reason = describe_failure(exc.failure, exc.retry_in, daily=daily)
+        except TranslationProblem as exc:
+            logger.info("interview draft %s: not usable (%s)", request_id, ",".join(exc.op_kinds) or "-")
+            reason = not_applied(exc.messages)
+            slot = next((_SLOT_BY_OP[k] for k in exc.op_kinds if k in _SLOT_BY_OP), None)
+        except ProfileValidationError as exc:
+            logger.info("interview draft %s: invalid profile", request_id)
+            reason = not_applied(exc.messages)
+        except Exception as exc:  # the type name only, never the text
+            logger.error("interview draft %s failed: %s", request_id, type(exc).__name__)
+            reason = ERROR_REPLY
+        finally:
+            timer.cancel()
+            with self._note_lock:
+                work.done = True
+        if proposal is None:
+            self._draft_problem(work, state.nonce, reason or ERROR_REPLY, slot, retry=retry)
+            return
+        nonce = state.nonce
+        self._store_proposal(
+            work, proposal, state.mode, guard=lambda: self._same_interview(work, nonce) is not None
+        )
+
+    def _draft_problem(
+        self, work: _Work, nonce: str, reason: str, slot: Optional[str], *, retry: bool
+    ) -> None:
+        """Keep the interview: the reason with ``Retry`` / ``Draft now`` (only when a slot is asked again) /
+        ``Step-by-step questions instead``; a slot named by the failing operation is set back to ``empty`` and
+        its question is asked again (its old facts are dropped: the new answer replaces them). The re-asked
+        question does not count against the question cap (``asked_count`` is unchanged), so it is asked even
+        after the cap and the interview still ends at the cap: after its answer the draft runs again when no
+        other question may be asked."""
+        chat_id = work.buffer.chat_id
+        reask: Optional[str] = None
+        with self._state_lock:
+            current = self._same_interview(work, nonce)
+            if current is None:
+                return  # cancelled or replaced while the model answered: dropped silently
+            if slot is not None:
+                current.status[slot] = "empty"
+                current.facts.pop(slot, None)
+                if slot in current.followed_up:
+                    current.followed_up.remove(slot)
+                if current.followup_slot is not None:
+                    current.followup_slot = current.followup_text = None
+                current.current = slot  # set directly (not ``next_step``): asked_count is not changed
+                self._wconv.set_state(chat_id, STATE_INTERVIEW, current.to_json(), self._clock())
+                reask = slot
+        rows: List[List[Dict[str, str]]] = []
+        if retry:
+            rows.append([{"text": RETRY_BUTTON, "callback_data": f"iv:{nonce}:retry"}])
+        if reask is not None:
+            rows.append([{"text": DRAFT_BUTTON, "callback_data": f"iv:{nonce}:draft"}])
+        rows.append([{"text": GUIDED_BUTTON, "callback_data": f"iv:{nonce}:guided"}])
+        note = REASK_NOTE if reask is not None else (DRAFT_KEPT_NOTE if retry else "")
+        text = reason + ("\n" + note if note else "")
+        if reask is not None:
+            if not self._set_mirror(work, nonce, reask):
+                return
+        elif self._stale(work):
+            return
+        messages = [OutgoingMessage(text, {"inline_keyboard": rows})]
+        if reask is not None:
+            messages += _reply(esc(QUESTIONS[reask]))
+        self._send(chat_id, messages)
 
     def _proposal_extras(self, proposal: Proposal) -> Tuple[List[str], List[str]]:
         """Compile warnings and a rule backtest for the proposal (best effort: never blocks the proposal)."""
@@ -1296,7 +1417,12 @@ class ConversationService:
             logger.debug("proposal extras skipped: %s", type(exc).__name__)
             return [], []
 
-    def _store_proposal(self, work: _Work, proposal: Proposal, mode: str) -> None:
+    def _store_proposal(
+        self, work: _Work, proposal: Proposal, mode: str, guard: Optional[Callable[[], bool]] = None
+    ) -> None:
+        """Store and send a proposal. ``guard`` (a compare-and-set) runs inside the ``_state_lock`` block before
+        anything is written; False stores nothing. Extras and sends stay outside the lock. Storing ends any
+        interview: the row's context (with its facts) is replaced by None."""
         chat_id = work.buffer.chat_id
         change_id = secrets.token_hex(4)
         warnings, backtest_lines = self._proposal_extras(proposal)
@@ -1314,6 +1440,8 @@ class ConversationService:
             return
         with self._state_lock:
             if self._interview_row_blocks(work):
+                return
+            if guard is not None and not guard():
                 return
             superseded = self._wconv.put_pending(pending)
             self._wconv.set_state(chat_id, STATE_CONFIRM, None, self._clock())
