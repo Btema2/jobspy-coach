@@ -165,7 +165,11 @@ def test_trigger_cycle_adds_immediate_job(tmp_path):
     daemon.scheduler = MagicMock()
     assert daemon.trigger_cycle() == TRIGGER_STARTED
     daemon.scheduler.add_job.assert_called_once_with(
-        daemon.run_pipeline_cycle_report, id="run_now", replace_existing=True, misfire_grace_time=None
+        daemon.run_pipeline_cycle_report,
+        kwargs={"run_now": True},
+        id="run_now",
+        replace_existing=True,
+        misfire_grace_time=None,
     )
 
 

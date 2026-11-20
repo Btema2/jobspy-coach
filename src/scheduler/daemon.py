@@ -248,10 +248,12 @@ def format_cycle_report(report: CycleReport) -> str:
         scrape = (
             f"Searches: {report.calls_ok} with results, {report.calls_empty} empty, {report.calls_failed} failed"
         )
+        if report.skipped_boards:
+            scrape += f"; {_plural(report.skipped_boards, 'board')} skipped (no country)"
+    elif report.skipped_boards:
+        scrape = f"Searches: none ran ({_plural(report.skipped_boards, 'board')} skipped: no country set)"
     else:
         scrape = "Searches: none ran (paused, no queries or no profile)"
-    if report.skipped_boards:
-        scrape += f"; {_plural(report.skipped_boards, 'board')} skipped (no country)"
     lines.append(scrape)
     lines.append(
         f"New jobs: {report.new_to_evaluate} to evaluate, {report.prefiltered} dropped by the title rules"
@@ -277,6 +279,11 @@ def format_cycle_report(report: CycleReport) -> str:
     if report.digest_waiting > 0:
         lines.append(f"{_plural(report.digest_waiting, 'job')} waiting for the digest. {DIGEST_HINT}")
     return "\n".join(lines)
+
+
+def _fallback_report(error: str) -> CycleReport:
+    """A report when building the real one failed: only the error is known."""
+    return CycleReport(0, 0, 0, 0, 0, 0, (), 0, 0, 0, 0, 0, error)
 
 
 @dataclass
@@ -337,7 +344,9 @@ class DaemonService:
         # Set by trigger_cycle(notify=True) when it answers "started"; read and cleared at the end of the next
         # cycle that runs (inside _cycle_lock), which then sends a run report.
         self._notify_requested = False
+        # Guards the flag and ``_guard_active``; cycle_guard takes/drops _cycle_lock under it (non-blocking only).
         self._notify_lock = threading.Lock()
+        self._guard_active = False  # cycle_guard (/requeue) holds _cycle_lock: no cycle runs, nobody reads the flag
         self._bot_poller: Optional[BotPoller] = None
         self._bot_thread: Optional[threading.Thread] = None
         self._bot_router: Optional[CommandRouter] = None
@@ -801,8 +810,17 @@ class DaemonService:
 
         Used by ``/requeue``: its writes must not interleave with a cycle or a digest, and a scheduled cycle that
         wants to start meanwhile is skipped (like any cycle that finds the lock held).
+
+        ``_cycle_lock`` is taken and released together with ``_guard_active`` under ``_notify_lock``, so a
+        ``run_now`` job that finds the lock held knows atomically whether a guard (not a cycle) holds it.
         """
-        if not self._cycle_lock.acquire(blocking=False):
+        with self._notify_lock:
+            if not self._cycle_lock.acquire(blocking=False):
+                acquired = False
+            else:
+                acquired = True
+                self._guard_active = True
+        if not acquired:
             yield False
             return
         try:
@@ -814,7 +832,9 @@ class DaemonService:
             finally:
                 self._digest_lock.release()
         finally:
-            self._cycle_lock.release()
+            with self._notify_lock:
+                self._guard_active = False
+                self._cycle_lock.release()
 
     def trigger_cycle(self, notify: bool = False) -> str:
         """Schedule an immediate cycle (``/run_now``, ``/resume``); the scheduler thread runs it.
@@ -832,7 +852,11 @@ class DaemonService:
             with self._notify_lock:
                 self._notify_requested = True
         self.scheduler.add_job(
-            self.run_pipeline_cycle_report, id="run_now", replace_existing=True, misfire_grace_time=None
+            self.run_pipeline_cycle_report,
+            kwargs={"run_now": True},
+            id="run_now",
+            replace_existing=True,
+            misfire_grace_time=None,
         )
         return TRIGGER_STARTED
 
@@ -854,16 +878,27 @@ class DaemonService:
         finally:
             self._cycle_lock.release()
 
-    def run_pipeline_cycle_report(self) -> Optional[CycleReport]:
+    def run_pipeline_cycle_report(self, run_now: bool = False) -> Optional[CycleReport]:
         """Every daemon cycle (startup, interval, ``run_now``): run it, then send a report when one was asked for.
 
-        ``None`` when another cycle holds the lock (nothing else is touched). The notify flag is read and
-        cleared in a ``finally`` inside ``_cycle_lock`` and the report is built there from this cycle's own
-        results; it is sent after the lock is released. An exception in a flagged cycle becomes the report's
-        error; in an unflagged cycle it propagates unchanged (APScheduler logs it; ``start()`` logs a
+        Returns the report that was sent, or ``None`` when no report was asked for or another holder had the
+        lock (then nothing else is touched). The notify flag is read and cleared in a ``finally`` inside
+        ``_cycle_lock`` and the report is built there from this cycle's own results; it is sent after the lock
+        is released. An exception is logged (type name only) and becomes the report's error in a flagged cycle;
+        in an unflagged cycle it propagates unchanged (APScheduler logs it; ``start()`` logs a
         ``ConfigurationError``).
+
+        ``run_now``: this is the job queued by ``trigger_cycle``. If it finds the lock held by ``cycle_guard``
+        (``/requeue``), the requested run is dropped and nobody would read the flag, so it is cleared here (a
+        later interval cycle must not send an unrequested report). If a cycle holds the lock, that cycle reads
+        the flag at its end and reports instead.
         """
-        if not self._cycle_lock.acquire(blocking=False):
+        with self._notify_lock:
+            acquired = self._cycle_lock.acquire(blocking=False)
+            if not acquired and run_now and self._guard_active and self._notify_requested:
+                self._notify_requested = False
+                logger.info("The requested run was skipped while /requeue ran; no report will be sent.")
+        if not acquired:
             logger.warning("A pipeline cycle is already running; this one is skipped.")
             return None
         notify = False
@@ -877,7 +912,14 @@ class DaemonService:
                 failure = exc
             finally:
                 notify = self._take_notify()
-            report = self._build_report(results, failure)
+            if notify:
+                if failure is not None:
+                    logger.error("Pipeline cycle failed: %s", type(failure).__name__)
+                try:
+                    report = self._build_report(results, failure)
+                except Exception as exc:  # the requested report is still sent, with what is known
+                    logger.error("Could not build the run report: %s", type(exc).__name__)
+                    report = _fallback_report(type(exc).__name__)
         finally:
             self._cycle_lock.release()
         if notify:
@@ -922,7 +964,11 @@ class DaemonService:
         )
 
     def _send_report(self, report: Optional[CycleReport]) -> None:
-        """Send the run report once; a failure is logged (type name only) and not retried."""
+        """Send the run report once; a failure is logged (type name only) and not retried.
+
+        One message, no chunking: the report is bounded by construction (<= 11 lines, problem reasons <= 60
+        characters, at most 3 problem lines), far below Telegram's 3,800-character chunk size.
+        """
         if report is None:
             return
         try:
@@ -938,7 +984,8 @@ class DaemonService:
         limit = self.settings.eval_batch_limit
         try:
             backlog = self.db.count_unprocessed_jobs()
-        except Exception:
+        except Exception as exc:  # the database is busy already; the cycle goes on without the count
+            logger.warning("Could not count the unprocessed jobs: %s", type(exc).__name__)
             backlog = 0
         in_batch = min(backlog, limit) if limit else backlog
         return EvalSummary(0, 0, in_batch, backlog - in_batch, STOPPED_PROFILE_BUSY)

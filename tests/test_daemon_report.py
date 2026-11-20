@@ -137,6 +137,7 @@ def test_report_fields_from_scrape_outcomes_and_eval_summary(tmp_path):
         tmp_path, FakeScraper(outcomes, skipped=1), queries, summary=EvalSummary(3, 1, 0, 7, None)
     )
     _pending_for_digest(daemon, [7.0, 9.0, 5.0])
+    daemon.trigger_cycle(notify=True)
 
     report = daemon.run_pipeline_cycle_report()
 
@@ -160,7 +161,14 @@ def test_report_fields_from_scrape_outcomes_and_eval_summary(tmp_path):
         digest_waiting=2,
         error=None,
     )
-    assert notifier.sent == []  # unflagged: no report sent
+    assert len(notifier.sent) == 1
+
+
+def test_unflagged_cycle_builds_no_report(tmp_path):
+    daemon, notifier = _make(tmp_path, summary=EvalSummary(1, 0, 0, 0, None))
+    daemon.db.count_pending_digest_jobs = MagicMock(side_effect=AssertionError("no count without a report"))
+    assert daemon.run_pipeline_cycle_report() is None
+    assert notifier.sent == []
 
 
 @pytest.mark.parametrize(
@@ -173,6 +181,7 @@ def test_report_fields_from_scrape_outcomes_and_eval_summary(tmp_path):
 )
 def test_unscored_split_batch_limit_vs_outage(tmp_path, summary, outage, phrase):
     daemon, _ = _make(tmp_path, summary=summary)
+    daemon.trigger_cycle(notify=True)
     report = daemon.run_pipeline_cycle_report()
     assert report.unscored_outage == outage
     assert report.unscored_batch_limit == summary.beyond_limit
@@ -184,6 +193,7 @@ def test_unscored_split_batch_limit_vs_outage(tmp_path, summary, outage, phrase)
 
 def test_no_stop_reason_means_no_outage(tmp_path):
     daemon, _ = _make(tmp_path, summary=EvalSummary(5, 0, 0, 12, None))
+    daemon.trigger_cycle(notify=True)
     report = daemon.run_pipeline_cycle_report()
     assert (report.unscored_outage, report.unscored_batch_limit) == (0, 12)
     text = format_cycle_report(report)
@@ -199,11 +209,11 @@ def test_run_now_flagged_cycle_sends_exactly_one_report(tmp_path):
     assert daemon.trigger_cycle(notify=True) == TRIGGER_STARTED
     ((func, kwargs),) = daemon.scheduler.jobs
     assert func == daemon.run_pipeline_cycle_report
-    assert kwargs == {"id": "run_now", "replace_existing": True, "misfire_grace_time": None}
-    func()
+    assert kwargs == {"kwargs": {"run_now": True}, "id": "run_now", "replace_existing": True, "misfire_grace_time": None}
+    func(**kwargs["kwargs"])
     assert len(notifier.sent) == 1
     assert "Evaluated: 2" in notifier.sent[0]
-    func()  # the flag was cleared: a later cycle reports nothing
+    func(**kwargs["kwargs"])  # the flag was cleared: a later cycle reports nothing
     assert len(notifier.sent) == 1
 
 
@@ -234,12 +244,12 @@ def test_scheduled_cycle_holding_the_lock_reports_and_skipped_run_now_sends_noth
     )
     # /run_now queued its job (flag set), but the interval cycle takes the lock first.
     assert daemon.trigger_cycle(notify=True) == TRIGGER_STARTED
-    ((run_now_job, _),) = daemon.scheduler.jobs
+    ((run_now_job, job_kwargs),) = daemon.scheduler.jobs
     results = {}
     scheduled = threading.Thread(target=lambda: results.setdefault("r", daemon.run_pipeline_cycle_report()))
     scheduled.start()
     assert scraper.entered.wait(WAIT)
-    assert run_now_job() is None  # lock held: skipped, touches nothing
+    assert run_now_job(**job_kwargs["kwargs"]) is None  # lock held by a cycle: skipped, the flag stays
     assert notifier.sent == []
     scraper.release.set()
     scheduled.join(WAIT)
@@ -275,12 +285,16 @@ def test_configuration_error_unflagged_only_raises(tmp_path):
     assert daemon.is_cycle_running() is False
 
 
-def test_exception_in_flagged_cycle_clears_flag_and_reports(tmp_path):
+def test_exception_in_flagged_cycle_clears_flag_and_reports(tmp_path, caplog):
     outcomes = {("Q1", "indeed"): ScrapeOutcome(postings=[_posting(1)], rows=1, status=STATUS_OK)}
     daemon, notifier = _make(tmp_path, FakeScraper(outcomes), [_q("Q1", ["indeed"])])
     daemon.evaluate_unprocessed = MagicMock(side_effect=RuntimeError("secret-detail"))
     daemon.trigger_cycle(notify=True)
-    report = daemon.run_pipeline_cycle_report()
+    with caplog.at_level(logging.ERROR, logger="src.scheduler.daemon"):
+        report = daemon.run_pipeline_cycle_report()
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == ["Pipeline cycle failed: RuntimeError"]
+    assert not any("secret-detail" in r.getMessage() for r in caplog.records)
     assert report.error == "RuntimeError"
     assert report.new_to_evaluate == 1  # what the cycle did before it stopped is kept
     assert len(notifier.sent) == 1
@@ -382,3 +396,76 @@ def test_format_without_digest_waiting_has_no_hint():
     text = format_cycle_report(_report(calls_ok=1, evaluated=1))
     assert "/digest" not in text
     assert len(text) < 1000
+
+
+# --- /requeue (cycle_guard) and a pending run_now job ----------------------------------------------
+
+
+def test_requeue_before_the_run_now_job_keeps_the_report(tmp_path):
+    """The guard ran and ended before the run_now job started: the job runs its own cycle and reports once."""
+    daemon, notifier = _make(tmp_path, summary=EvalSummary(1, 0, 0, 0, None))
+    assert daemon.trigger_cycle(notify=True) == TRIGGER_STARTED
+    ((job, kwargs),) = daemon.scheduler.jobs
+    with daemon.cycle_guard() as ok:
+        assert ok
+    assert daemon._notify_requested is True
+    assert job(**kwargs["kwargs"]) is not None
+    assert len(notifier.sent) == 1
+    daemon.run_pipeline_cycle_report()  # a later interval cycle
+    assert len(notifier.sent) == 1
+
+
+def test_run_now_job_skipped_by_the_guard_clears_the_flag(tmp_path):
+    """The run_now job finds /requeue holding the lock: the run is dropped, so is its report."""
+    daemon, notifier = _make(tmp_path, summary=EvalSummary(1, 0, 0, 0, None))
+    assert daemon.trigger_cycle(notify=True) == TRIGGER_STARTED
+    ((job, kwargs),) = daemon.scheduler.jobs
+    with daemon.cycle_guard() as ok:
+        assert ok
+        assert job(**kwargs["kwargs"]) is None
+        assert daemon.run_pipeline_cycle_report() is None  # an interval job skipped meanwhile changes nothing
+    assert daemon._notify_requested is False
+    assert daemon.is_cycle_running() is False
+    daemon.run_pipeline_cycle_report()  # the next interval cycle
+    assert notifier.sent == []
+
+
+def test_interval_job_skipped_by_the_guard_keeps_a_pending_run_now_report(tmp_path):
+    daemon, notifier = _make(tmp_path, summary=EvalSummary(1, 0, 0, 0, None))
+    assert daemon.trigger_cycle(notify=True) == TRIGGER_STARTED
+    ((job, kwargs),) = daemon.scheduler.jobs
+    with daemon.cycle_guard():
+        assert daemon.run_pipeline_cycle_report() is None  # the interval job, not the run_now job
+    assert job(**kwargs["kwargs"]) is not None
+    assert len(notifier.sent) == 1
+
+
+def test_build_failure_in_a_flagged_cycle_still_reports(tmp_path, caplog, monkeypatch):
+    daemon, notifier = _make(tmp_path)
+    daemon.evaluate_unprocessed = MagicMock(side_effect=RuntimeError("secret-detail"))
+    monkeypatch.setattr(daemon, "_build_report", MagicMock(side_effect=KeyError("x")))
+    daemon.trigger_cycle(notify=True)
+    with caplog.at_level(logging.ERROR, logger="src.scheduler.daemon"):
+        report = daemon.run_pipeline_cycle_report()
+    assert report.error == "KeyError"
+    assert len(notifier.sent) == 1 and "The cycle stopped: KeyError" in notifier.sent[0]
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Pipeline cycle failed: RuntimeError" in messages
+    assert "Could not build the run report: KeyError" in messages
+    assert daemon.is_cycle_running() is False
+
+
+def test_busy_summary_logs_a_count_failure(tmp_path, caplog):
+    daemon, _ = _make(tmp_path)
+    daemon.db.count_unprocessed_jobs = MagicMock(side_effect=RuntimeError("secret-detail"))
+    with caplog.at_level(logging.WARNING, logger="src.scheduler.daemon"):
+        summary = daemon._busy_summary()
+    assert summary == EvalSummary(0, 0, 0, 0, STOPPED_PROFILE_BUSY)
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+    assert not any("secret-detail" in r.getMessage() for r in caplog.records)
+
+
+def test_format_all_boards_skipped_names_the_cause():
+    text = format_cycle_report(_report(skipped_boards=2))
+    assert "Searches: none ran (2 boards skipped: no country set)" in text
+    assert "paused" not in text
