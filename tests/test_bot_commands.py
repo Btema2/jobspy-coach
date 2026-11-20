@@ -748,7 +748,6 @@ def test_digest_command_is_listed_and_mutating(router):
 
 
 def test_digest_command_returns_at_once_with_a_real_daemon(tmp_path, db, store):
-    import threading
     import time as time_module
 
     from src.scheduler.daemon import DaemonService

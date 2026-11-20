@@ -547,7 +547,7 @@ def test_trigger_digest_queues_exactly_one_job(tmp_path):
     assert daemon.trigger_digest() == TRIGGER_STARTED
     ((func, kwargs),) = daemon.scheduler.jobs
     assert func == daemon._digest_now_job
-    assert kwargs == {"id": "digest_now", "replace_existing": True, "misfire_grace_time": None}
+    assert kwargs == {"id": "digest_now", "replace_existing": True, "misfire_grace_time": None, "max_instances": 2}
 
 
 def test_trigger_digest_returns_at_once_while_another_thread_holds_the_lock(tmp_path):
@@ -696,3 +696,66 @@ def test_digest_now_failed_result_line_is_logged_by_type_name(tmp_path, monkeypa
     assert _status_counts(daemon) == {"digest_sent": 1}
     assert any("RuntimeError" in r.getMessage() for r in caplog.records)
     assert not any("<SECRET>" in r.getMessage() or "Role 1000" in r.getMessage() for r in caplog.records)
+
+
+def test_digest_now_right_after_a_job_that_is_still_sending_its_line(tmp_path, monkeypatch):
+    # The first job released the lock but still sends its result line: a new /digest is "started", and its
+    # job (a second instance, max_instances=2) runs and reports what is left instead of being skipped.
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, DIGEST_MAX_ITEMS=2)
+    _pending_for_digest(daemon, [7.0, 7.5, 8.0])
+    sending, release = threading.Event(), threading.Event()
+    original = notifier.send_message
+
+    def send_message(html_text, reply_markup=None):
+        if html_text.startswith("Sent 2 jobs") and not release.is_set():
+            sending.set()
+            assert release.wait(WAIT)
+        return original(html_text, reply_markup)
+
+    notifier.send_message = send_message
+    first = threading.Thread(target=daemon._digest_now_job, daemon=True)
+    first.start()
+    try:
+        assert sending.wait(WAIT)
+        assert not daemon._digest_lock.locked()
+        assert daemon.trigger_digest() == TRIGGER_STARTED
+        ((job, kwargs),) = daemon.scheduler.jobs
+        assert kwargs["max_instances"] == 2
+        job()
+        assert notifier.sent[-1] == "Sent 1 job"
+        job()
+        assert notifier.sent[-1] == "Nothing is waiting"
+    finally:
+        release.set()
+        first.join(WAIT)
+    assert "Sent 2 jobs\n1 more waiting, send /digest again" in notifier.sent
+
+
+def test_format_digest_result_nothing_sent_is_a_failure():
+    from src.scheduler.daemon import format_digest_result
+
+    assert format_digest_result(DigestSend(sent=0, total=0, jobs=2)) == "Sending failed; the jobs stay waiting"
+
+
+def test_digest_now_with_a_notifier_without_counts_and_nothing_sent(tmp_path, monkeypatch):
+    daemon, _ = _make(tmp_path)
+
+    class CountlessNotifier:
+        chat_id = "1"
+
+        def __init__(self):
+            self.sent: List[str] = []
+
+        def send_daily_digest(self, jobs, date_str, update_notice=None, lang=None):
+            return 0
+
+        def send_message(self, html_text, reply_markup=None):
+            self.sent.append(html_text)
+            return True
+
+    notifier = CountlessNotifier()
+    daemon.notifier = notifier
+    _pending_for_digest(daemon, [7.0])
+    daemon._digest_now_job()
+    assert notifier.sent == ["Sending failed; the jobs stay waiting"]
+    assert _status_counts(daemon) == {"pending": 1}

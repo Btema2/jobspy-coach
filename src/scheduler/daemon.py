@@ -308,12 +308,12 @@ def format_digest_result(result: Optional[DigestSend]) -> str:
     """The one result message of an on-demand digest (``/digest``), plain English."""
     if result is None or result.jobs == 0:
         return DIGEST_NOTHING_WAITING
-    if result.sent >= result.total:
-        line = f"Sent {_plural(result.jobs, 'job')}"
-    elif result.sent > 0:
-        line = f"Sent {result.sent} of {result.total} messages; some jobs may be missing"
-    else:
+    if result.sent <= 0:  # before the total check: a notifier double without counts has total == sent == 0
         line = "Sending failed; the jobs stay waiting"
+    elif result.sent >= result.total:
+        line = f"Sent {_plural(result.jobs, 'job')}"
+    else:
+        line = f"Sent {result.sent} of {result.total} messages; some jobs may be missing"
     if result.more > 0:
         line += f"\n{result.more} more waiting, send /digest again"
     return line
@@ -907,7 +907,15 @@ class DaemonService:
             return TRIGGER_NOT_READY
         if self._digest_lock.locked():
             return TRIGGER_BUSY
-        scheduler.add_job(self._digest_now_job, id="digest_now", replace_existing=True, misfire_grace_time=None)
+        # max_instances=2: a previous job may have released the lock but still be sending its result line;
+        # APScheduler would skip this one (default 1) after "started". The lock serialises the digest bodies.
+        scheduler.add_job(
+            self._digest_now_job,
+            id="digest_now",
+            replace_existing=True,
+            misfire_grace_time=None,
+            max_instances=2,
+        )
         return TRIGGER_STARTED
 
     def _digest_now_job(self) -> None:
