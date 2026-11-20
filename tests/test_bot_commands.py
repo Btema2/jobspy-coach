@@ -322,7 +322,7 @@ def test_resume_without_queries_is_refused_and_does_not_trigger(router, store, c
 
 
 def test_run_now_replies(router, control):
-    assert send(router, "/run_now") == "Cycle started."
+    assert send(router, "/run_now") == "Cycle started. I will send a short report when it ends."
     assert control.notify_flags == [True]  # /run_now asks for a run report
     control.trigger_result = TRIGGER_BUSY
     assert send(router, "/run_now") == "A cycle is already running; try again when it has finished."
@@ -335,8 +335,9 @@ def test_run_now_on_a_paused_profile_says_it_will_not_scrape(router, control, st
 
     text = send(router, "/run_now")
 
-    assert text != "Cycle started."
+    assert not text.startswith("Cycle started.")
     assert "paused" in text and "/resume" in text
+    assert text.endswith("I will send a short report when it ends.")
     assert control.trigger_calls == 1  # evaluation and digest still run
 
 
@@ -819,3 +820,15 @@ def test_stale_digest_command_is_ignored(tmp_path, db, store):
     assert len(texts) == 1 and "15 minutes" in texts[0] and "/digest" in texts[0]
     poller.process(message_update(2, "/digest", date=int(now) - 60))
     assert calls == [1]
+
+
+def test_setup_description_matches_the_interview():
+    description = dict(COMMANDS)["setup"]
+    assert "interview" in description and "/setup guided" in description
+    assert "Guided setup: role, synonyms, market" != description
+
+
+def test_resume_note_says_a_report_follows():
+    from src.bot.commands import TRIGGER_STARTED, trigger_note
+
+    assert trigger_note(TRIGGER_STARTED) == "A cycle starts now. I will send a short report when it ends."

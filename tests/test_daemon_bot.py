@@ -569,7 +569,9 @@ def test_on_paired_clears_conversation_tables(tmp_path, telegram):
     daemon._start_bot()
     try:
         calls = []
-        daemon._bot_router.conversation.reset_memory = lambda: calls.append(1)
+        conversation = daemon._bot_router.conversation
+        original = conversation.reset_for_pairing
+        conversation.reset_for_pairing = lambda clear: (calls.append(1), original(clear))
         fill()
         daemon._on_paired(777)
         assert calls == [1]

@@ -2409,3 +2409,72 @@ def test_cancel_while_the_extract_runs_drops_its_result_and_the_cv(svc, clock, t
     assert svc._cv is None  # a failed extract after /cancel does not put the CV back
     assert conv_store.get_state(111).state == "idle"
     assert not any(describe_failure(ChatFailure.TIMEOUT) in t for t in sent(telegram))
+
+
+
+# --- whole-branch review fixes (M1, M6) ---------------------------------------------------------------------
+
+
+def test_re_pairing_cannot_bring_back_a_row_read_before_the_clear(svc, clock, telegram, conv_store, monkeypatch):
+    """M1: the worker read the interview row and is about to write it back; a new pairing (memory reset plus
+    ``clear_all``) runs meanwhile. The clear waits for the worker's ``_state_lock`` section, so the old row and
+    its facts never come back."""
+    start_interview(svc, clock, telegram)
+    original = svc._wconv.set_state
+    pairing: List[threading.Thread] = []
+
+    def write_while_pairing(chat_id, state, context, now):
+        if state == conv.STATE_INTERVIEW and not pairing:
+            thread = threading.Thread(target=svc.reset_for_pairing, args=(conv_store.clear_all,), daemon=True)
+            pairing.append(thread)
+            thread.start()
+            thread.join(0.3)  # the clear cannot run inside the worker's locked section
+        return original(chat_id, state, context, now)
+
+    monkeypatch.setattr(svc._wconv, "set_state", write_while_pairing)
+    say(svc, "Data analyst")
+    svc.process_next(clock.value)
+    pairing[0].join(5)
+    assert not pairing[0].is_alive()
+    state = conv_store.get_state(111)
+    assert state.state == "idle" and state.context is None
+    assert not conv_store.has_consent(111, CONSENT_VERSION)
+    assert 111 not in svc._interview
+
+
+def test_interview_steps_need_current_consent(svc, clock, telegram, conv_store, db):
+    """M1 defense in depth: an interview row left behind for a chat without consent takes no answer."""
+    start_interview(svc, clock, telegram)
+    no_consent(db)
+    say(svc, "Data analyst")
+    drain(svc, clock)
+    assert conv_store.get_state(111).context["facts"] == {}
+
+
+def test_free_text_results_need_current_consent(svc, clock, translator, telegram, conv_store, monkeypatch):
+    """M1: a free-text proposal or question computed before consent was cleared is not stored."""
+    translator.add(prop(add_role("<ROLE2>")), Clarification("Which?"))
+    for _ in range(2):
+        say(svc, "add a role")
+        clock.value += conv.DEBOUNCE_SECONDS
+        translator.entered.clear()
+        monkeypatch.setattr(svc._wconv, "has_consent", lambda *a: not translator.entered.is_set())
+        assert svc.process_next(clock.value) is True
+        assert conv_store.get_pending(111) is None and conv_store.get_state(111).state == "idle"
+
+
+def test_cancel_before_the_extract_starts_sends_no_working_note(svc, clock, telegram, turns, monkeypatch):
+    """M6: a /cancel that lands after the extract step read the row must not be followed by "Working on it"."""
+    send = preview_cv(svc, clock, telegram)
+    original = svc._ensure_mirror
+
+    def cancel_then_mirror(work, nonce, slot):
+        original(work, nonce, slot)
+        svc.on_cancel(text_update("/cancel"))
+
+    monkeypatch.setattr(svc, "_ensure_mirror", cancel_then_mirror)
+    svc.on_callback(callback(send))
+    drain(svc, clock)
+    shown = sent(telegram)
+    assert conv.WORKING_REPLY not in shown
+    assert turns.extract_calls == []

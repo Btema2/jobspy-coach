@@ -110,10 +110,22 @@ _SOCIAL_RE = re.compile(
     re.IGNORECASE,
 )
 # A dotted host with a letters-only TLD followed by a path (``janedoe.io/work``). A bare ``name.tld`` stays
-# readable on purpose (``Vue.js``, ``ASP.NET``, ``node.js`` are not links).
+# readable on purpose (``Vue.js``, ``ASP.NET``, ``node.js`` are not links), and so does a tech name followed by
+# a slash (``Node.js/TypeScript``, ``ASP.NET/C#``): a ``.js`` ending, an upper-case ``.NET`` and the known
+# ``*.net`` frameworks are never treated as hosts.
 _PATH_LINK_RE = re.compile(
     r"(?<![\w@./-])(?:[A-Za-z0-9-]{1,63}\.){1,5}[A-Za-z]{2,24}/[^\s<>\"']*[^\s<>\"'.,;:!?)\]}]"
 )
+_DOTNET_HOSTS = frozenset({"asp.net", "vb.net", "ado.net"})
+
+
+def _path_link(match: "re.Match[str]") -> str:
+    token = match.group(0)
+    host = token.split("/", 1)[0]
+    tld = host.rsplit(".", 1)[-1]
+    if tld.lower() == "js" or tld == "NET" or host.lower() in _DOTNET_HOSTS:
+        return token  # a tech name such as Node.js/TypeScript, not a link
+    return "[link]"
 _HANDLE_RE = re.compile(r"(?<![\w@.])@\w{2,30}(?:\.\w{1,30}){0,3}")
 
 
@@ -121,7 +133,7 @@ def mask_links(text: str) -> str:
     """``text`` with URLs and social-media paths as ``[link]`` and ``@handles`` as ``[handle]``."""
     text = _URL_RE.sub("[link]", text)
     text = _SOCIAL_RE.sub("[link]", text)
-    text = _PATH_LINK_RE.sub("[link]", text)
+    text = _PATH_LINK_RE.sub(_path_link, text)
     return _HANDLE_RE.sub("[handle]", text)
 
 

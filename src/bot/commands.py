@@ -51,6 +51,7 @@ from src.storage.db import Database
 logger = logging.getLogger(__name__)
 
 TRIGGER_STARTED = "started"
+REPORT_NOTE = "I will send a short report when it ends."
 TRIGGER_BUSY = "running"
 TRIGGER_NOT_READY = "not_ready"
 
@@ -80,7 +81,7 @@ COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("resume", "Resume scraping and start a cycle"),
     ("run_now", "Start a scrape cycle now"),
     ("digest", "Send the jobs waiting for the digest now"),
-    ("setup", "Guided setup: role, synonyms, market"),
+    ("setup", "Set up the search: a short interview (or /setup guided)"),
     ("ok", "Apply the pending proposal"),
     ("cancel", "Discard the pending proposal"),
     ("undo", "Undo the last change (repeat to toggle)"),
@@ -166,7 +167,7 @@ def _paged(command: str, lines: Sequence[str], page: int, tail: Sequence[str] = 
 def trigger_note(outcome: str) -> str:
     """The sentence that tells the user what a requested cycle start did (shared by /resume and chat)."""
     if outcome == TRIGGER_STARTED:
-        return "A cycle starts now."
+        return "A cycle starts now. " + REPORT_NOTE
     if outcome == TRIGGER_BUSY:
         return "A cycle is already running; the next one will scrape."
     return "Scraping resumes at the next scheduled cycle."
@@ -542,9 +543,9 @@ class CommandRouter:
             if snapshot is not None and snapshot.fields.paused:
                 return _reply(
                     "Profile is paused: the cycle runs evaluation and digest only, no scraping. "
-                    "Send /resume to scrape."
+                    "Send /resume to scrape. " + REPORT_NOTE
                 )
-            return _reply("Cycle started.")
+            return _reply("Cycle started. " + REPORT_NOTE)
         if outcome == TRIGGER_BUSY:
             return _reply("A cycle is already running; try again when it has finished.")
         return _reply("The scheduler is not ready yet.")

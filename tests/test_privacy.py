@@ -303,3 +303,19 @@ def test_mask_all_email_does_not_swallow_a_following_scheme():
 
 def test_notice_does_not_overpromise_links():
     assert "http or www" in CONSENT_NOTICE and "with a path" in CONSENT_NOTICE and "profile sites" in CONSENT_NOTICE
+
+
+@pytest.mark.parametrize("text", [
+    "Node.js/TypeScript developer", "ASP.NET/C# engineer", "Next.js/React lead", "Vue.js/Nuxt developer",
+    "VB.NET/SQL analyst", "ADO.NET/EF developer", "Express.js/MongoDB backend",
+])
+def test_tech_names_with_a_slash_are_not_links(text):
+    assert mask_all(text) == text
+
+
+@pytest.mark.parametrize("link", [
+    "example.com/path", "linkedin.com/in/someone", "janedoe.io/work", "jane.example.net/cv", "site.org/a",
+    "someone.js.org/x",
+])
+def test_scheme_less_links_are_still_masked(link):
+    assert mask_all(f"see {link} now") == "see [link] now"

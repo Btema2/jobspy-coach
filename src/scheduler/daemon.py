@@ -1317,9 +1317,13 @@ class DaemonService:
         """
         self.notifier.chat_id = str(chat_id)
         try:
+            store = ConversationStore(self.db)
             if self._bot_router is not None:
-                self._bot_router.conversation.reset_memory()
-            ConversationStore(self.db).clear_all()
+                # memory first, then the tables under the worker's state lock: a worker step that read a row
+                # before the clear cannot write it back after it
+                self._bot_router.conversation.reset_for_pairing(store.clear_all)
+            else:
+                store.clear_all()
         except Exception as exc:  # pairing itself must go through
             logger.warning("could not clear the conversation state: %s", type(exc).__name__)
 

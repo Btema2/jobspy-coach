@@ -536,6 +536,14 @@ class ConversationService:
         self._drop_memory()
         self._context_chats.clear()
 
+    def reset_for_pairing(self, clear: Callable[[], None]) -> None:
+        """A new pairing: forget the memory state (a worker step loses its result), then run ``clear`` (the
+        tables' ``clear_all``) under ``_state_lock``, so a worker section that read a row before the clear cannot
+        write it back afterwards."""
+        self.reset_memory()
+        with self._state_lock:
+            clear()
+
     def _drop_memory(self) -> bool:
         with self._cond:
             self._generation += 1  # a request already taken by the worker loses its result
@@ -1311,16 +1319,22 @@ class ConversationService:
                 self._interview[work.buffer.chat_id] = (nonce, slot)
 
     def _interview_row_blocks(self, work: _Work) -> bool:
-        """Under ``_state_lock``: True when a free-text result would overwrite an interview row (dropped)."""
+        """Under ``_state_lock``: True when a result must not be stored (dropped): the chat has no consent for
+        ``CONSENT_VERSION`` (cleared by a re-pairing meanwhile), or a free-text result would overwrite an
+        interview row."""
+        if not self._wconv.has_consent(work.buffer.chat_id, CONSENT_VERSION):
+            logger.info("conversation result dropped: no consent for this chat")
+            return True
         if work.buffer.interview or self._wconv.get_state(work.buffer.chat_id).state != STATE_INTERVIEW:
             return False
         logger.info("free-text result dropped: the chat is in an interview")
         return True
 
     def _load_interview(self, work: _Work) -> Optional[InterviewState]:
-        """Under ``_state_lock``: the stored interview this input belongs to (its nonce, when tagged), else None."""
+        """Under ``_state_lock``: the stored interview this input belongs to (its nonce, when tagged), else None
+        (also when the chat has no consent for ``CONSENT_VERSION``: a row left by a re-pairing takes nothing)."""
         row = self._wconv.get_state(work.buffer.chat_id)
-        if row.state != STATE_INTERVIEW:
+        if row.state != STATE_INTERVIEW or not self._wconv.has_consent(work.buffer.chat_id, CONSENT_VERSION):
             return None
         state = InterviewState.from_json(row.context)
         if state is None or (work.buffer.nonce is not None and work.buffer.nonce != state.nonce):
@@ -1407,11 +1421,8 @@ class ConversationService:
         except StopRequested:
             return
         with self._state_lock:
-            if self._stale(work):
-                return
-            row = self._wconv.get_state(work.buffer.chat_id)
-            current = InterviewState.from_json(row.context) if row.state == STATE_INTERVIEW else None
-            if current is None or current.nonce != nonce:
+            current = self._same_interview(work, nonce)  # stale, replaced or without consent: None
+            if current is None:
                 return  # cancelled or replaced while the model answered: the result is dropped silently
             apply_turn(current, slot, turn)
             step = next_step(current)
@@ -1459,7 +1470,9 @@ class ConversationService:
         if self._stale(work):
             return None
         row = self._wconv.get_state(work.buffer.chat_id)
-        current = InterviewState.from_json(row.context) if row.state == STATE_INTERVIEW else None
+        if row.state != STATE_INTERVIEW or not self._wconv.has_consent(work.buffer.chat_id, CONSENT_VERSION):
+            return None
+        current = InterviewState.from_json(row.context)
         return current if current is not None and current.nonce == nonce else None
 
     def _run_draft(self, work: _Work, request_id: str) -> None:
@@ -1640,6 +1653,8 @@ class ConversationService:
         self._ensure_mirror(work, nonce, state.current)
         if self._interview_llm is None:
             self._cv_failed(work, nonce, cv, NOT_CONFIGURED_REPLY, retry=False)
+            return
+        if self._stale(work):  # a /cancel after the read: no "Working on it" may follow "Cancelled"
             return
         self._send(chat_id, _reply(WORKING_REPLY))
         timer = threading.Timer(PROGRESS_NOTE_SECONDS, self._progress_note, args=(work,))

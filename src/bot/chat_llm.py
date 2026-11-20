@@ -91,7 +91,7 @@ _DAILY_CAPPED_HEAD = "Too many model requests today"
 
 
 def describe_failure(failure: ChatFailure, retry_in: Optional[float] = None, daily: bool = False) -> str:
-    """Code-written reason text with a retry hint; callers add their own next-step sentence.
+    """Code-written reason text with a retry hint; callers add buttons (Retry) or a note, never more reason text.
 
     ``daily`` (only meaningful for ``CAPPED``) names the OpenRouter daily share instead of the hourly cap;
     waits of more than two hours are given in hours (the daily share frees up at UTC midnight).
