@@ -79,6 +79,7 @@ COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("pause", "Pause scraping"),
     ("resume", "Resume scraping and start a cycle"),
     ("run_now", "Start a scrape cycle now"),
+    ("digest", "Send the jobs waiting for the digest now"),
     ("setup", "Guided setup: role, synonyms, market"),
     ("ok", "Apply the pending proposal"),
     ("cancel", "Discard the pending proposal"),
@@ -92,7 +93,7 @@ COMMANDS: Tuple[Tuple[str, str], ...] = (
 
 MUTATING_COMMANDS = frozenset({
     "/add_role", "/remove_role", "/add_market", "/exclude", "/threshold", "/pause", "/resume", "/run_now",
-    "/undo", "/restore", "/requeue", "/setup", "/test", "/ok", "/cancel",
+    "/undo", "/restore", "/requeue", "/setup", "/test", "/ok", "/cancel", "/digest",
 })
 
 _KIND_ORDER = ("block", "soft", "seniority", "rescue")  # RULE_KINDS is a set: keep the listing stable
@@ -113,6 +114,8 @@ class BotContext:
     cycle_guard: Optional[Callable[[], ContextManager[bool]]] = None
     stop_event: Optional[threading.Event] = None  # set at shutdown; makes waits of worker threads abortable
     chat_llm: Optional[ChatLLM] = None  # the free-text path; None: plain text keeps the help hint
+    # /digest: queues a one-off digest job and answers at once (started / busy / not ready); None: not ready.
+    trigger_digest: Optional[Callable[[], str]] = None
 
 
 def market_from_match(match: CountryMatch, remote: bool, remote_only: bool) -> Market:
@@ -195,6 +198,7 @@ class CommandRouter:
             ("dropped", self._dropped), ("add_role", self._add_role), ("remove_role", self._remove_role),
             ("add_market", self._add_market), ("exclude", self._exclude), ("threshold", self._threshold),
             ("pause", self._pause), ("resume", self._resume), ("run_now", self._run_now),
+            ("digest", self._digest),
             ("undo", self._undo), ("history", self._history), ("restore", self._restore),
             ("requeue", self._requeue),
         ):
@@ -544,6 +548,23 @@ class CommandRouter:
         if outcome == TRIGGER_BUSY:
             return _reply("A cycle is already running; try again when it has finished.")
         return _reply("The scheduler is not ready yet.")
+
+    def _digest(self, update: Update) -> List[OutgoingMessage]:
+        """Queue the digest on the scheduler; never waits for (or takes) the digest lock on the poller thread."""
+        trigger = self._ctx.trigger_digest
+        if trigger is None:
+            outcome = TRIGGER_NOT_READY
+        else:
+            try:
+                outcome = trigger()
+            except Exception as exc:
+                logger.warning("trigger_digest failed: %s", type(exc).__name__)
+                outcome = TRIGGER_NOT_READY
+        if outcome == TRIGGER_STARTED:
+            return _reply("Starting the digest...")
+        if outcome == TRIGGER_BUSY:
+            return _reply("A digest is already running.")
+        return _reply("The daemon is not ready yet, try again in a minute.")
 
     # --- safety commands ----------------------------------------------------------------
 

@@ -24,6 +24,8 @@ class TelegramNotifier:
         self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         self._external_client = client is not None
         self._client = client or httpx.Client(timeout=self.timeout)
+        # Messages the last ``send_daily_digest`` planned (its chunks); the return value is the delivered count.
+        self.last_digest_total = 0
 
     @classmethod
     def from_settings(
@@ -119,10 +121,12 @@ class TelegramNotifier:
         update_notice: Optional[str] = None,
         lang: Optional[str] = None,
     ) -> int:
+        self.last_digest_total = 0
         if not jobs:
             return 0
 
         chunks = format_digest_chunks(jobs, date_str=date_str, update_notice=update_notice, lang=lang)
+        self.last_digest_total = len(chunks)
         sent_count = 0
         for chunk in chunks:
             if self.send_message(chunk):

@@ -286,6 +286,39 @@ def _fallback_report(error: str) -> CycleReport:
     return CycleReport(0, 0, 0, 0, 0, 0, (), 0, 0, 0, 0, 0, error)
 
 
+@dataclass(frozen=True)
+class DigestSend:
+    """What the last digest run sent: ``sent`` of ``total`` planned messages for ``jobs`` rows.
+
+    ``more``: qualifying rows left out because ``digest_max_items`` truncated the digest (0 otherwise).
+    Recorded by the digest body on ``_last_digest_send`` and read by ``_digest_now_job`` under ``_digest_lock``.
+    """
+
+    sent: int
+    total: int
+    jobs: int = 0
+    more: int = 0
+
+
+DIGEST_ALREADY_RUNNING = "A digest is already running"
+DIGEST_NOTHING_WAITING = "Nothing is waiting"
+
+
+def format_digest_result(result: Optional[DigestSend]) -> str:
+    """The one result message of an on-demand digest (``/digest``), plain English."""
+    if result is None or result.jobs == 0:
+        return DIGEST_NOTHING_WAITING
+    if result.sent >= result.total:
+        line = f"Sent {_plural(result.jobs, 'job')}"
+    elif result.sent > 0:
+        line = f"Sent {result.sent} of {result.total} messages; some jobs may be missing"
+    else:
+        line = "Sending failed; the jobs stay waiting"
+    if result.more > 0:
+        line += f"\n{result.more} more waiting, send /digest again"
+    return line
+
+
 @dataclass
 class _CycleResults:
     """Filled by ``_run_pipeline_cycle`` as it goes, so a cycle that raises still reports what it did."""
@@ -347,6 +380,8 @@ class DaemonService:
         # Guards the flag and ``_guard_active``; cycle_guard takes/drops _cycle_lock under it (non-blocking only).
         self._notify_lock = threading.Lock()
         self._guard_active = False  # cycle_guard (/requeue) holds _cycle_lock: no cycle runs, nobody reads the flag
+        # Written by the digest body (under _digest_lock); read by the /digest job under the same lock.
+        self._last_digest_send: Optional[DigestSend] = None
         self._bot_poller: Optional[BotPoller] = None
         self._bot_thread: Optional[threading.Thread] = None
         self._bot_router: Optional[CommandRouter] = None
@@ -860,6 +895,51 @@ class DaemonService:
         )
         return TRIGGER_STARTED
 
+    def trigger_digest(self) -> str:
+        """Schedule an immediate digest (``/digest``); an APScheduler executor thread runs it.
+
+        "not ready" until the scheduler runs (the startup cycle runs before ``scheduler.start()``, so a queued
+        job would wait for it), "busy" while a digest runs. A running scrape cycle does not refuse it (like
+        the cron digest). Never blocks: the lock is only inspected here, the job takes it non-blocking.
+        """
+        scheduler = self.scheduler
+        if self._shutdown_requested.is_set() or scheduler is None or not scheduler.running:
+            return TRIGGER_NOT_READY
+        if self._digest_lock.locked():
+            return TRIGGER_BUSY
+        scheduler.add_job(self._digest_now_job, id="digest_now", replace_existing=True, misfire_grace_time=None)
+        return TRIGGER_STARTED
+
+    def _digest_now_job(self) -> None:
+        """The ``/digest`` job: the shared digest body without the update notice, then one result message.
+
+        If the cron digest holds the lock, it says so and does nothing else. Rows are marked as the cron
+        marks them (sent when at least one message was delivered), which is why a partial send warns.
+        Failures are logged by exception type name only (no job titles or companies).
+        """
+        if not self._digest_lock.acquire(blocking=False):
+            self._send_digest_line(DIGEST_ALREADY_RUNNING)
+            return
+        try:
+            try:
+                self._run_daily_digest_cycle(False, send_update_notice=False)
+                text = format_digest_result(self._last_digest_send)
+            except Exception as exc:
+                logger.error("On-demand digest failed: %s", type(exc).__name__)
+                text = f"The digest stopped: {esc(type(exc).__name__)}"
+        finally:
+            self._digest_lock.release()
+        self._send_digest_line(text)
+
+    def _send_digest_line(self, text: str) -> None:
+        try:
+            delivered = bool(self.notifier.send_message(text))
+        except Exception as exc:
+            logger.warning("Could not send the digest result: %s", type(exc).__name__)
+            return
+        if not delivered:
+            logger.warning("Could not send the digest result.")
+
     def _take_notify(self) -> bool:
         with self._notify_lock:
             requested, self._notify_requested = self._notify_requested, False
@@ -1147,11 +1227,17 @@ class DaemonService:
                     stats.skipped_boards = skipped
         return stats
 
-    def run_daily_digest_cycle(self, dry_run: bool = False) -> int:
+    def run_daily_digest_cycle(self, dry_run: bool = False, *, send_update_notice: bool = True) -> int:
         with self._digest_lock:
-            return self._run_daily_digest_cycle(dry_run)
+            return self._run_daily_digest_cycle(dry_run, send_update_notice=send_update_notice)
 
-    def _run_daily_digest_cycle(self, dry_run: bool) -> int:
+    def _run_daily_digest_cycle(self, dry_run: bool, *, send_update_notice: bool = True) -> int:
+        """The digest body (caller holds ``_digest_lock``); returns the number of qualifying rows taken.
+
+        ``send_update_notice``: check PyPI for a python-jobspy update and append the notice (the cron digest;
+        ``/digest`` skips it). Records a ``DigestSend`` on ``_last_digest_send`` (not on a dry run).
+        """
+        self._last_digest_send = None
         if not dry_run:
             expired = self.db.expire_stale_pending_jobs(days=STALE_PENDING_DAYS)
             if expired > 0:
@@ -1170,6 +1256,8 @@ class DaemonService:
         )
         if not pending:
             logger.info("No pending qualifying jobs for daily digest.")
+            if not dry_run:
+                self._last_digest_send = DigestSend(sent=0, total=0)
             return 0
 
         date_str = datetime.now(ZoneInfo(self.settings.timezone)).strftime("%d.%m.%Y")
@@ -1178,19 +1266,37 @@ class DaemonService:
             return len(pending)
 
         update_notice = None
-        try:
-            version_info = check_jobspy_update()
-            if version_info and version_info.has_update:
-                update_notice = format_version_update_notice(version_info, lang=lang)
-        except Exception as e:
-            logger.debug("Failed checking JobSpy update for daily digest: %s", e)
+        if send_update_notice:
+            try:
+                version_info = check_jobspy_update()
+                if version_info and version_info.has_update:
+                    update_notice = format_version_update_notice(version_info, lang=lang)
+            except Exception as e:
+                logger.debug("Failed checking JobSpy update for daily digest: %s", e)
+
+        # Rows left out by ``digest_max_items`` (counted before marking; only when the limit was reached).
+        more = 0
+        if len(pending) >= self.settings.digest_max_items:
+            try:
+                more = max(0, self.db.count_pending_digest_jobs(digest_threshold) - len(pending))
+            except Exception as exc:  # the digest itself must still go out
+                logger.warning("Could not count the jobs left for the next digest: %s", type(exc).__name__)
 
         sent_count = self.notifier.send_daily_digest(
             pending, date_str=date_str, update_notice=update_notice, lang=lang
         )
         if sent_count > 0:
             self.db.mark_digest_sent([j.id for j in pending if j.id is not None])
+        self._last_digest_send = self._digest_send(sent_count, len(pending), more)
         return len(pending)
+
+    def _digest_send(self, sent_count: Any, jobs: int, more: int) -> DigestSend:
+        """The ``DigestSend`` of one digest; a notifier double without counts reads as fully delivered."""
+        sent = sent_count if isinstance(sent_count, int) and not isinstance(sent_count, bool) else 0
+        total = getattr(self.notifier, "last_digest_total", None)
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = sent
+        return DigestSend(sent=sent, total=total, jobs=jobs, more=more)
 
     # ----- bot -----
 
@@ -1235,6 +1341,7 @@ class DaemonService:
                 env_path=env_path,
                 settings=settings,
                 trigger_cycle=self.trigger_cycle,
+                trigger_digest=self.trigger_digest,
                 is_cycle_running=self.is_cycle_running,
                 scraper=self.scraper,
                 cycle_guard=self.cycle_guard,

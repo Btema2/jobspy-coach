@@ -469,3 +469,230 @@ def test_format_all_boards_skipped_names_the_cause():
     text = format_cycle_report(_report(skipped_boards=2))
     assert "Searches: none ran (2 boards skipped: no country set)" in text
     assert "paused" not in text
+
+
+# --- /digest: trigger_digest and the digest_now job ----------------------------------------------------
+
+from src.bot.commands import TRIGGER_NOT_READY  # noqa: E402
+from src.notifier.telegram_notifier import TelegramNotifier  # noqa: E402
+from src.scheduler.daemon import DigestSend  # noqa: E402
+
+
+class DigestNotifier(TelegramNotifier):
+    """The real ``send_daily_digest`` (chunking, counting) over scripted ``send_message`` results."""
+
+    def __init__(self, results=None):
+        super().__init__(token="<TOKEN>", chat_id="1", client=MagicMock())
+        self.results = list(results or [])
+        self.sent: List[str] = []
+
+    def send_message(self, html_text, reply_markup=None):
+        self.sent.append(html_text)
+        result = self.results.pop(0) if self.results else True
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def _digest_daemon(tmp_path, monkeypatch, results=None, **settings):
+    monkeypatch.setattr("src.notifier.telegram_notifier.time.sleep", lambda seconds: None)
+    daemon, _ = _make(tmp_path, **settings)
+    notifier = DigestNotifier(results)
+    daemon.notifier = notifier
+    return daemon, notifier
+
+
+def _pending_with_summaries(daemon: DaemonService, count: int, chars: int = 590) -> None:
+    _pending_for_digest(daemon, [7.0 + (i % 10) * 0.1 for i in range(count)])
+    with daemon.db._get_connection() as conn:
+        conn.execute("UPDATE jobs SET eval_summary_uk=?", ("s" * chars,))
+
+
+def _status_counts(daemon: DaemonService) -> Dict[str, int]:
+    with daemon.db._get_connection() as conn:
+        rows = conn.execute("SELECT notification_status, COUNT(*) FROM jobs GROUP BY notification_status").fetchall()
+    return {status: n for status, n in rows}
+
+
+def test_trigger_digest_not_ready_without_a_running_scheduler(tmp_path):
+    daemon, _ = _make(tmp_path)
+    daemon.scheduler = None
+    assert daemon.trigger_digest() == TRIGGER_NOT_READY
+    daemon.scheduler = StubScheduler(running=False)  # the startup cycle runs before scheduler.start()
+    assert daemon.trigger_digest() == TRIGGER_NOT_READY
+    assert daemon.scheduler.jobs == []
+
+
+def test_trigger_digest_busy_while_a_digest_runs(tmp_path):
+    daemon, _ = _make(tmp_path)
+    assert daemon._digest_lock.acquire(blocking=False)
+    try:
+        assert daemon.trigger_digest() == TRIGGER_BUSY
+    finally:
+        daemon._digest_lock.release()
+    assert daemon.scheduler.jobs == []
+
+
+def test_trigger_digest_is_not_refused_by_a_running_cycle(tmp_path):
+    daemon, _ = _make(tmp_path)
+    assert daemon._cycle_lock.acquire(blocking=False)
+    try:
+        assert daemon.trigger_digest() == TRIGGER_STARTED
+    finally:
+        daemon._cycle_lock.release()
+
+
+def test_trigger_digest_queues_exactly_one_job(tmp_path):
+    daemon, _ = _make(tmp_path)
+    assert daemon.trigger_digest() == TRIGGER_STARTED
+    ((func, kwargs),) = daemon.scheduler.jobs
+    assert func == daemon._digest_now_job
+    assert kwargs == {"id": "digest_now", "replace_existing": True, "misfire_grace_time": None}
+
+
+def test_trigger_digest_returns_at_once_while_another_thread_holds_the_lock(tmp_path):
+    daemon, _ = _make(tmp_path)
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with daemon._digest_lock:
+            held.set()
+            release.wait(WAIT)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert held.wait(WAIT)
+    try:
+        done: List[str] = []
+        caller = threading.Thread(target=lambda: done.append(daemon.trigger_digest()), daemon=True)
+        caller.start()
+        caller.join(1.0)
+        assert done == [TRIGGER_BUSY]
+    finally:
+        release.set()
+        thread.join(WAIT)
+
+
+def test_digest_now_sends_rows_once_and_they_leave_the_queue(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch)
+    _pending_for_digest(daemon, [7.0, 9.0])
+    daemon.trigger_digest()
+    ((job, _),) = daemon.scheduler.jobs
+    job()
+    assert len(notifier.sent) == 2  # one digest chunk, one result line
+    assert "Role 1000" in notifier.sent[0] and "Role 1001" in notifier.sent[0]
+    assert notifier.sent[-1] == "Sent 2 jobs"
+    assert daemon._last_digest_send == DigestSend(sent=1, total=1, jobs=2, more=0)
+    assert _status_counts(daemon) == {"digest_sent": 2}
+    job()
+    assert notifier.sent[-1] == "Nothing is waiting"
+    assert daemon.run_daily_digest_cycle() == 0  # the next (cron) digest has nothing left
+
+
+def test_digest_now_with_nothing_waiting(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch)
+    _pending_for_digest(daemon, [3.0])  # below the digest threshold
+    daemon._digest_now_job()
+    assert notifier.sent == ["Nothing is waiting"]
+
+
+def test_digest_now_partial_send_warns(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, results=[True, False, False, False])
+    _pending_with_summaries(daemon, 10)
+    daemon._digest_now_job()
+    total = notifier.last_digest_total
+    assert total >= 2
+    assert notifier.sent[-1] == f"Sent 1 of {total} messages; some jobs may be missing"
+    assert _status_counts(daemon) == {"digest_sent": 10}  # marking rule unchanged: one delivered message
+
+
+def test_digest_now_failed_send_keeps_rows_waiting(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, results=[False, False, False, False, False])
+    _pending_with_summaries(daemon, 10)
+    daemon._digest_now_job()
+    assert notifier.sent[-1] == "Sending failed; the jobs stay waiting"
+    assert _status_counts(daemon) == {"pending": 10}
+
+
+def test_digest_now_truncation_line(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, DIGEST_MAX_ITEMS=2)
+    _pending_for_digest(daemon, [7.0, 7.5, 8.0, 8.1, 6.9])
+    daemon._digest_now_job()
+    assert notifier.sent[-1] == "Sent 2 jobs\n3 more waiting, send /digest again"
+    daemon._digest_now_job()
+    assert notifier.sent[-1] == "Sent 2 jobs\n1 more waiting, send /digest again"
+    daemon._digest_now_job()
+    assert notifier.sent[-1] == "Sent 1 job"
+
+
+def test_digest_now_truncation_line_after_a_failed_send(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, results=[False], DIGEST_MAX_ITEMS=2)
+    _pending_for_digest(daemon, [7.0, 7.5, 8.0])
+    daemon._digest_now_job()
+    assert notifier.sent[-1] == "Sending failed; the jobs stay waiting\n1 more waiting, send /digest again"
+
+
+def test_digest_now_skips_the_update_notice_but_the_cron_does_not(tmp_path, monkeypatch):
+    check = MagicMock(return_value=None)
+    monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", check)
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch)
+    _pending_for_digest(daemon, [7.0])
+    daemon._digest_now_job()
+    assert check.call_count == 0
+    assert notifier.sent[-1] == "Sent 1 job"
+    with daemon.db._get_connection() as conn:  # make the row wait again for the cron digest
+        conn.execute("UPDATE jobs SET notification_status='pending'")
+    assert daemon.run_daily_digest_cycle() == 1
+    assert check.call_count == 1
+
+
+def test_digest_now_loses_the_race_with_the_cron_digest(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch)
+    _pending_for_digest(daemon, [7.0])
+    held, release = threading.Event(), threading.Event()
+
+    def cron():
+        with daemon._digest_lock:
+            held.set()
+            release.wait(WAIT)
+
+    thread = threading.Thread(target=cron, daemon=True)
+    thread.start()
+    assert held.wait(WAIT)
+    try:
+        daemon._digest_now_job()
+    finally:
+        release.set()
+        thread.join(WAIT)
+    assert notifier.sent == ["A digest is already running"]
+    assert _status_counts(daemon) == {"pending": 1}
+    assert not daemon._digest_lock.locked()
+
+
+def test_digest_now_uses_env_thresholds_without_a_profile(tmp_path, monkeypatch):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, DIGEST_SCORE_THRESHOLD=7.2)
+    _pending_for_digest(daemon, [7.0, 7.5])
+    daemon._digest_now_job()
+    assert notifier.sent[-1] == "Sent 1 job"
+    assert _status_counts(daemon) == {"pending": 1, "digest_sent": 1}
+
+
+def test_digest_now_error_is_reported_by_type_name_only(tmp_path, monkeypatch, caplog):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch)
+    daemon.db.get_pending_digest_jobs = MagicMock(side_effect=RuntimeError("<SECRET> title"))
+    with caplog.at_level(logging.DEBUG):
+        daemon._digest_now_job()
+    assert notifier.sent == ["The digest stopped: RuntimeError"]
+    assert not daemon._digest_lock.locked()
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+    assert not any("<SECRET>" in r.getMessage() for r in caplog.records)
+
+
+def test_digest_now_failed_result_line_is_logged_by_type_name(tmp_path, monkeypatch, caplog):
+    daemon, notifier = _digest_daemon(tmp_path, monkeypatch, results=[True, RuntimeError("<SECRET> Role")])
+    _pending_for_digest(daemon, [7.0])
+    with caplog.at_level(logging.DEBUG):
+        daemon._digest_now_job()
+    assert _status_counts(daemon) == {"digest_sent": 1}
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+    assert not any("<SECRET>" in r.getMessage() or "Role 1000" in r.getMessage() for r in caplog.records)

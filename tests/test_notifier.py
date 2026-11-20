@@ -618,3 +618,32 @@ def test_notifier_forwards_lang_to_wow_alert_and_digest(monkeypatch):
     assert "Score:" in sent[0] and "Оцінка" not in sent[0]
     assert "Morning Job Digest" in sent[1] and "Ранковий" not in sent[1]
     notifier.close()
+
+
+def test_send_daily_digest_records_the_planned_message_count(monkeypatch):
+    monkeypatch.setattr("time.sleep", MagicMock())
+    notifier = TelegramNotifier(token="<TOKEN>", chat_id="1", client=MagicMock())
+    assert notifier.last_digest_total == 0
+    jobs = [
+        JobPosting(
+            dedup_hash=f"hash_{i}",
+            site="indeed",
+            job_url=f"https://example.com/job/{i}",
+            title=f"Role {i}",
+            company=f"Company {i}",
+            location="Remote",
+            description="Long description",
+            eval_score=8.0,
+            eval_summary_uk="s" * 590,
+        )
+        for i in range(10)
+    ]
+    results = iter([True, False, False, False, False, False])
+    monkeypatch.setattr(notifier, "send_message", lambda text, reply_markup=None: next(results))
+    sent = notifier.send_daily_digest(jobs, "15.10.2026")
+    planned = len(format_digest_chunks(jobs, date_str="15.10.2026"))
+    assert planned >= 2
+    assert sent == 1  # the return value is still the delivered count
+    assert notifier.last_digest_total == planned
+    assert notifier.send_daily_digest([], "15.10.2026") == 0
+    assert notifier.last_digest_total == 0

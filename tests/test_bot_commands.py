@@ -1,5 +1,6 @@
 """CommandRouter: read, change and safety commands through ops (no network, no real .env)."""
 import re
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import List
@@ -680,7 +681,7 @@ def test_errors_are_translated(router, store, monkeypatch):
 def test_mutating_set_matches_spec(router):
     assert MUTATING_COMMANDS == frozenset(
         {"/add_role", "/remove_role", "/add_market", "/exclude", "/threshold", "/pause", "/resume",
-         "/run_now", "/undo", "/restore", "/requeue", "/setup", "/test", "/ok", "/cancel"}
+         "/run_now", "/undo", "/restore", "/requeue", "/setup", "/test", "/ok", "/cancel", "/digest"}
     )
     for command in MUTATING_COMMANDS:
         assert router.is_mutating(parse_update(message_update(1, f"{command} x")))
@@ -702,3 +703,120 @@ def test_market_from_match_is_what_add_market_stores():
     assert remote_only.name == "Germany (remote only)" and remote_only.remote and remote_only.remote_only
     region = market_from_match(resolve_country("Europe").match, True, False)
     assert region.countries == () and region.location == "Europe" and region.remote
+
+
+# --- /digest ------------------------------------------------------------------------------------
+
+
+def _digest_router(tmp_path, db, trigger_digest) -> CommandRouter:
+    ctx = BotContext(
+        db_path=db.db_path,
+        env_path=tmp_path / ".env",
+        settings=Settings(_env_file=None),
+        trigger_cycle=lambda notify=False: TRIGGER_STARTED,
+        is_cycle_running=lambda: False,
+        scraper=None,
+        trigger_digest=trigger_digest,
+    )
+    return CommandRouter(ctx, client=TelegramBotClient("<TOKEN>", transport=FakeTelegram().transport))
+
+
+@pytest.mark.parametrize(
+    "outcome, reply",
+    [
+        (TRIGGER_STARTED, "Starting the digest..."),
+        (TRIGGER_BUSY, "A digest is already running."),
+        (TRIGGER_NOT_READY, "The daemon is not ready yet, try again in a minute."),
+    ],
+)
+def test_digest_command_replies(tmp_path, db, store, outcome, reply):
+    calls: List[int] = []
+    router = _digest_router(tmp_path, db, lambda: calls.append(1) or outcome)
+    assert send(router, "/digest") == reply
+    assert calls == [1]
+
+
+def test_digest_command_without_a_trigger_is_not_ready(router):
+    assert send(router, "/digest") == "The daemon is not ready yet, try again in a minute."
+
+
+def test_digest_command_is_listed_and_mutating(router):
+    assert "digest" in [name for name, _ in COMMANDS]
+    assert "/digest - " in send(router, "/help")
+    assert "/digest" in MUTATING_COMMANDS
+    assert router.is_mutating(parse_update(message_update(1, "/digest")))
+
+
+def test_digest_command_returns_at_once_with_a_real_daemon(tmp_path, db, store):
+    import threading
+    import time as time_module
+
+    from src.scheduler.daemon import DaemonService
+
+    daemon = DaemonService(db_path=tmp_path / "digest.db", scraper=object(), notifier=object())
+
+    class Running:
+        running = True
+
+        def add_job(self, *a, **kw):
+            raise AssertionError("no job while a digest runs")
+
+    daemon.scheduler = Running()
+    router = _digest_router(tmp_path, db, daemon.trigger_digest)
+    held, release = threading.Event(), threading.Event()
+
+    def cron():
+        with daemon._digest_lock:
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=cron, daemon=True)
+    thread.start()
+    assert held.wait(5)
+    try:
+        start = time_module.monotonic()
+        assert send(router, "/digest") == "A digest is already running."
+        assert time_module.monotonic() - start < 1.0
+    finally:
+        release.set()
+        thread.join(5)
+
+
+def test_stale_digest_command_is_ignored(tmp_path, db, store):
+    from src.bot.auth import Authorizer
+    from src.bot.poller import BotPoller
+    from src.bot.state import BotStateStore
+
+    now = 1_700_000_000.0
+    calls: List[int] = []
+    telegram = FakeTelegram()
+    ctx = BotContext(
+        db_path=db.db_path,
+        env_path=tmp_path / ".env",
+        settings=Settings(_env_file=None),
+        trigger_cycle=lambda notify=False: TRIGGER_STARTED,
+        is_cycle_running=lambda: False,
+        scraper=None,
+        clock=lambda: now,
+        trigger_digest=lambda: calls.append(1) or TRIGGER_STARTED,
+    )
+    client = TelegramBotClient("<TOKEN>", transport=telegram.transport)
+    state = BotStateStore(db)
+    state.set_pairing(111, 111)
+    poller = BotPoller(
+        client,
+        state,
+        Authorizer(state, clock=lambda: now),
+        CommandRouter(ctx, client=client),
+        stop_event=threading.Event(),
+        env_path=tmp_path / ".env",
+        on_paired=lambda chat_id: None,
+        commands=(),
+        clock=lambda: now,
+    )
+    poller.process(message_update(1, "/digest", date=int(now) - 16 * 60))
+    assert calls == []
+    texts = [c["text"] for c in telegram.calls("sendMessage")]
+    assert len(texts) == 1 and "15 minutes" in texts[0] and "/digest" in texts[0]
+    poller.process(message_update(2, "/digest", date=int(now) - 60))
+    assert calls == [1]
