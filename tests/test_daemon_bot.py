@@ -87,7 +87,7 @@ def test_poller_started_before_startup_cycle(monkeypatch, tmp_path):
     daemon = _daemon(tmp_path)
     order: List[str] = []
     monkeypatch.setattr(daemon, "_start_bot", lambda: order.append("bot"))
-    monkeypatch.setattr(daemon, "run_pipeline_cycle", lambda *a, **k: order.append("cycle") or (0, 0))
+    monkeypatch.setattr(daemon, "run_pipeline_cycle_report", lambda *a, **k: order.append("cycle"))
     daemon.start()
     assert order == ["bot", "cycle"]
 
@@ -103,8 +103,8 @@ def test_bot_start_failure_does_not_stop_daemon(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
     monkeypatch.setattr("signal.signal", MagicMock())
     daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
-    cycle = MagicMock(return_value=(0, 0))
-    monkeypatch.setattr(daemon, "run_pipeline_cycle", cycle)
+    cycle = MagicMock(return_value=None)
+    monkeypatch.setattr(daemon, "run_pipeline_cycle_report", cycle)
     with caplog.at_level("WARNING"):
         daemon.start()
     cycle.assert_called_once()
@@ -165,7 +165,7 @@ def test_trigger_cycle_adds_immediate_job(tmp_path):
     daemon.scheduler = MagicMock()
     assert daemon.trigger_cycle() == TRIGGER_STARTED
     daemon.scheduler.add_job.assert_called_once_with(
-        daemon.run_pipeline_cycle, id="run_now", replace_existing=True, misfire_grace_time=None
+        daemon.run_pipeline_cycle_report, id="run_now", replace_existing=True, misfire_grace_time=None
     )
 
 
@@ -262,7 +262,7 @@ def test_shutdown_returns_at_once_while_a_long_poll_is_in_flight(monkeypatch, tm
     handlers = {}
     monkeypatch.setattr("signal.signal", lambda sig, handler: handlers.update({sig: handler}))
     daemon = _daemon(tmp_path, TELEGRAM_BOT_TOKEN="<TOKEN>")
-    monkeypatch.setattr(daemon, "run_pipeline_cycle", MagicMock(return_value=(0, 0)))
+    monkeypatch.setattr(daemon, "run_pipeline_cycle_report", MagicMock(return_value=None))
     daemon.start()
     thread = daemon._bot_thread
     deadline = time.monotonic() + 2

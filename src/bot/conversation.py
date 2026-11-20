@@ -857,7 +857,7 @@ class ConversationService:
 
     def _trigger(self) -> str:
         try:
-            outcome = self._ctx.trigger_cycle()
+            outcome = self._ctx.trigger_cycle(notify=True)
         except Exception as exc:  # the profile is already changed: the reply must still be sent
             logger.warning("trigger_cycle failed: %s", type(exc).__name__)
             outcome = ""

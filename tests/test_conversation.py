@@ -63,9 +63,11 @@ class Clock:
 class Control:
     def __init__(self):
         self.trigger_calls = 0
+        self.notify_flags = []
 
-    def trigger(self) -> str:
+    def trigger(self, notify: bool = False) -> str:
         self.trigger_calls += 1
+        self.notify_flags.append(notify)
         return TRIGGER_STARTED
 
     def is_running(self) -> bool:
@@ -603,6 +605,7 @@ def test_resume_via_chat_triggers_cycle(svc, clock, translator, telegram, contro
     assert control.trigger_calls == 0
     reply = texts(svc.on_callback(callback(data)))
     assert control.trigger_calls == 1
+    assert control.notify_flags == [True]  # the chat-proposal resume asks for a run report
     assert "A cycle starts now." in reply
     assert store.read_snapshot().fields.paused is False
 
@@ -1375,7 +1378,7 @@ def test_restart_keeps_row_and_rebuilds_mirror(svc, db, store, clock, telegram, 
     nonce = start_interview(svc, clock, telegram)
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
     )
     client = TelegramBotClient(TOKEN, transport=telegram.transport)
     fresh = ConversationService(ctx, client, SetupWizard(BotStateStore(db), store, clock=clock),
@@ -1882,7 +1885,7 @@ def test_retry_after_a_restart_drafts_from_the_stored_facts(svc, db, store, cloc
     draft_now(svc, clock, nonce)
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
     )
     fresh_llm = FakeInterviewLLM()
     fresh = ConversationService(ctx, TelegramBotClient(TOKEN, transport=telegram.transport),
@@ -2376,7 +2379,7 @@ def test_a_restart_loses_the_cv_and_its_button_is_stale(svc, clock, telegram, db
     send = preview_cv(svc, clock, telegram)
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
     )
     fresh = ConversationService(ctx, TelegramBotClient(TOKEN, transport=telegram.transport),
                                 SetupWizard(BotStateStore(db), store, clock=clock),

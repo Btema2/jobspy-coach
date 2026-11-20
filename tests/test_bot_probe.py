@@ -215,7 +215,7 @@ class Sink:
 def _runner(tmp_path, db, scraper, clock=time.time, sink=None, stop_event=None):
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=scraper, clock=clock,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=scraper, clock=clock,
         stop_event=stop_event,
     )
     sink = sink or Sink()
@@ -310,7 +310,7 @@ def test_probe_via_router_registers_command(tmp_path, db, store):
     scraper = DoubleScraper(per_call=1)
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=scraper,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=scraper,
     )
     fake = FakeTelegram()
     router = CommandRouter(ctx, client=TelegramBotClient("<TOKEN>", transport=fake.transport))

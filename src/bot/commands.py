@@ -105,7 +105,7 @@ class BotContext:
     db_path: Path
     env_path: Path
     settings: Settings
-    trigger_cycle: Callable[[], str]
+    trigger_cycle: Callable[..., str]  # trigger_cycle(notify=True): report what the cycle did when it ends
     is_cycle_running: Callable[[], bool]
     scraper: Any  # has scrape_board_outcome
     clock: Callable[[], float] = time.time
@@ -525,14 +525,14 @@ class CommandRouter:
             return _reply("Scraping is not paused. Send /run_now to start a cycle.")
         result = self._apply([SetField("paused", False)], "resume")
         try:
-            outcome = self._ctx.trigger_cycle()
+            outcome = self._ctx.trigger_cycle(notify=True)
         except Exception as exc:  # the profile is already changed: the reply must still be sent
             logger.warning("trigger_cycle failed: %s", type(exc).__name__)
             outcome = TRIGGER_NOT_READY
         return self._applied(result, [trigger_note(outcome)])
 
     def _run_now(self, update: Update) -> List[OutgoingMessage]:
-        outcome = self._ctx.trigger_cycle()
+        outcome = self._ctx.trigger_cycle(notify=True)
         if outcome == TRIGGER_STARTED:
             snapshot = self._snapshot()
             if snapshot is not None and snapshot.fields.paused:

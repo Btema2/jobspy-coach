@@ -36,6 +36,7 @@ from src.bot.commands import (
 )
 from src.bot.conversation_store import ConversationStore
 from src.bot.poller import BotPoller
+from src.bot.render import esc
 from src.bot.state import BotStateStore
 from src.config import get_settings
 from src.evaluator.chain import ProviderChainEvaluator, build_chain_from_settings
@@ -200,6 +201,93 @@ class ScrapeStats:
         return [(board, reason, n) for (board, reason), n in self.problems.items()]
 
 
+_STOP_TEXT = {
+    STOPPED_PROVIDERS_UNAVAILABLE: "no AI provider was available",
+    STOPPED_SHUTDOWN: "the daemon was stopping",
+    STOPPED_PROFILE_BUSY: "the profile was busy",
+}
+NO_LLM_KEY_ERROR = "no LLM key is configured"
+DIGEST_HINT = "Send /digest to receive them now."
+_MAX_REPORT_PROBLEMS = 3  # problem lines in a report (the last one says how many more there are)
+
+
+@dataclass(frozen=True)
+class CycleReport:
+    """What one cycle did, for the run report after ``/run_now`` / ``/resume`` (see ``format_cycle_report``).
+
+    ``unscored_batch_limit``: unprocessed jobs that did not fit into this cycle's batch; ``unscored_outage``: jobs
+    of the batch left unscored because the batch stopped (``stopped_reason``, one of the ``STOPPED_*`` values).
+    ``error``: set when the cycle stopped with an exception (exception class name or the no-LLM-key hint).
+    """
+
+    new_to_evaluate: int
+    prefiltered: int
+    calls_ok: int
+    calls_empty: int
+    calls_failed: int
+    skipped_boards: int
+    problems: Tuple[Tuple[str, str, int], ...]
+    evaluated: int
+    unscored_batch_limit: int
+    unscored_outage: int
+    wow_sent: int
+    digest_waiting: int
+    error: Optional[str]
+    stopped_reason: Optional[str] = None
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def format_cycle_report(report: CycleReport) -> str:
+    """The run report as one short Telegram HTML message (plain English, every value escaped, <= 12 lines)."""
+    lines = ["<b>Run stopped</b>" if report.error else "<b>Run finished</b>"]
+    calls = report.calls_ok + report.calls_empty + report.calls_failed
+    if calls:
+        scrape = (
+            f"Searches: {report.calls_ok} with results, {report.calls_empty} empty, {report.calls_failed} failed"
+        )
+    else:
+        scrape = "Searches: none ran (paused, no queries or no profile)"
+    if report.skipped_boards:
+        scrape += f"; {_plural(report.skipped_boards, 'board')} skipped (no country)"
+    lines.append(scrape)
+    lines.append(
+        f"New jobs: {report.new_to_evaluate} to evaluate, {report.prefiltered} dropped by the title rules"
+    )
+    problems = list(report.problems)
+    if len(problems) > _MAX_REPORT_PROBLEMS:
+        shown = problems[: _MAX_REPORT_PROBLEMS - 1]
+        rest = len(problems) - len(shown)
+    else:
+        shown, rest = problems, 0
+    for board, reason, count in shown:
+        lines.append(f"Problem: {esc(board)}: {esc(reason)} ({_plural(count, 'search')})")
+    if rest:
+        lines.append(f"... and {rest} more problems (see the log)")
+    lines.append(f"Evaluated: {report.evaluated}; WOW alerts sent: {report.wow_sent}")
+    if report.unscored_batch_limit:
+        lines.append(f"{report.unscored_batch_limit} left for the next cycle (batch limit)")
+    if report.unscored_outage:
+        why = _STOP_TEXT.get(report.stopped_reason or "", "the batch stopped")
+        lines.append(f"{report.unscored_outage} not scored ({esc(why)})")
+    if report.error:
+        lines.append(f"The cycle stopped: {esc(report.error)}")
+    if report.digest_waiting > 0:
+        lines.append(f"{_plural(report.digest_waiting, 'job')} waiting for the digest. {DIGEST_HINT}")
+    return "\n".join(lines)
+
+
+@dataclass
+class _CycleResults:
+    """Filled by ``_run_pipeline_cycle`` as it goes, so a cycle that raises still reports what it did."""
+
+    profile: Optional[CompiledProfile] = None
+    scrape: ScrapeStats = field(default_factory=ScrapeStats)
+    summary: EvalSummary = _EMPTY_SUMMARY
+
+
 def _iter_completed(futures: Dict[Future, Any], poll_seconds: float = 0.2) -> Iterator[Future]:
     """Yield futures as they finish, including ones cancelled by ``shutdown(cancel_futures=True)``.
 
@@ -246,6 +334,10 @@ class DaemonService:
         self._cycle_lock = threading.Lock()
         # Held while a digest runs: it reads and marks pending rows, so /requeue must wait for it as well.
         self._digest_lock = threading.Lock()
+        # Set by trigger_cycle(notify=True) when it answers "started"; read and cleared at the end of the next
+        # cycle that runs (inside _cycle_lock), which then sends a run report.
+        self._notify_requested = False
+        self._notify_lock = threading.Lock()
         self._bot_poller: Optional[BotPoller] = None
         self._bot_thread: Optional[threading.Thread] = None
         self._bot_router: Optional[CommandRouter] = None
@@ -724,60 +816,167 @@ class DaemonService:
         finally:
             self._cycle_lock.release()
 
-    def trigger_cycle(self) -> str:
+    def trigger_cycle(self, notify: bool = False) -> str:
         """Schedule an immediate cycle (``/run_now``, ``/resume``); the scheduler thread runs it.
 
         The answer is "started" when the job was queued while no cycle ran. If the interval job takes the lock
         first, the queued ``run_now`` cycle is skipped with a WARNING; a cycle is running either way, which is
-        what the caller wanted.
+        what the caller wanted. ``notify``: the next cycle that ends sends a run report (the flag is set only
+        on "started", before the job is added).
         """
         if self._shutdown_requested.is_set() or self.scheduler is None:
             return TRIGGER_NOT_READY
         if self._cycle_lock.locked():
             return TRIGGER_BUSY
+        if notify:
+            with self._notify_lock:
+                self._notify_requested = True
         self.scheduler.add_job(
-            self.run_pipeline_cycle, id="run_now", replace_existing=True, misfire_grace_time=None
+            self.run_pipeline_cycle_report, id="run_now", replace_existing=True, misfire_grace_time=None
         )
         return TRIGGER_STARTED
+
+    def _take_notify(self) -> bool:
+        with self._notify_lock:
+            requested, self._notify_requested = self._notify_requested, False
+        return requested
 
     def run_pipeline_cycle(
         self, queries: Optional[List[SearchQuery]] = None, dry_run: bool = False
     ) -> Tuple[int, int]:
+        """One cycle without a report (the CLI ``scrape``); returns ``(new jobs saved, WOW alerts sent)``."""
         if not self._cycle_lock.acquire(blocking=False):
             logger.warning("A pipeline cycle is already running; this one is skipped.")
             return 0, 0
         try:
-            return self._run_pipeline_cycle(queries, dry_run)
+            results = self._run_pipeline_cycle(queries, dry_run)
+            return results.scrape.total_new_saved, results.summary.wow_sent
         finally:
             self._cycle_lock.release()
 
+    def run_pipeline_cycle_report(self) -> Optional[CycleReport]:
+        """Every daemon cycle (startup, interval, ``run_now``): run it, then send a report when one was asked for.
+
+        ``None`` when another cycle holds the lock (nothing else is touched). The notify flag is read and
+        cleared in a ``finally`` inside ``_cycle_lock`` and the report is built there from this cycle's own
+        results; it is sent after the lock is released. An exception in a flagged cycle becomes the report's
+        error; in an unflagged cycle it propagates unchanged (APScheduler logs it; ``start()`` logs a
+        ``ConfigurationError``).
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            logger.warning("A pipeline cycle is already running; this one is skipped.")
+            return None
+        notify = False
+        failure: Optional[Exception] = None
+        report: Optional[CycleReport] = None
+        results = _CycleResults()
+        try:
+            try:
+                self._run_pipeline_cycle(None, False, results)
+            except Exception as exc:
+                failure = exc
+            finally:
+                notify = self._take_notify()
+            report = self._build_report(results, failure)
+        finally:
+            self._cycle_lock.release()
+        if notify:
+            self._send_report(report)
+        if failure is not None and not notify:
+            raise failure
+        return report
+
+    def _build_report(self, results: _CycleResults, failure: Optional[Exception]) -> CycleReport:
+        stats, summary = results.scrape, results.summary
+        if failure is None:
+            error = None
+        elif isinstance(failure, ConfigurationError):
+            error = NO_LLM_KEY_ERROR
+        else:
+            error = type(failure).__name__
+        threshold = (
+            results.profile.scoring.digest_threshold
+            if results.profile is not None
+            else self.settings.digest_score_threshold
+        )
+        try:
+            digest_waiting = self.db.count_pending_digest_jobs(threshold)
+        except Exception as exc:  # the report must not fail on a busy database
+            logger.warning("Could not count the jobs waiting for the digest: %s", type(exc).__name__)
+            digest_waiting = 0
+        return CycleReport(
+            new_to_evaluate=stats.new_to_evaluate,
+            prefiltered=stats.prefiltered,
+            calls_ok=stats.ok,
+            calls_empty=stats.empty,
+            calls_failed=stats.failed,
+            skipped_boards=stats.skipped_boards,
+            problems=tuple(stats.problem_list()),
+            evaluated=summary.evaluated,
+            unscored_batch_limit=summary.beyond_limit,
+            unscored_outage=summary.not_scored_in_batch if summary.stopped_reason else 0,
+            wow_sent=summary.wow_sent,
+            digest_waiting=digest_waiting,
+            error=error,
+            stopped_reason=summary.stopped_reason,
+        )
+
+    def _send_report(self, report: Optional[CycleReport]) -> None:
+        """Send the run report once; a failure is logged (type name only) and not retried."""
+        if report is None:
+            return
+        try:
+            delivered = bool(self.notifier.send_message(format_cycle_report(report)))
+        except Exception as exc:
+            logger.warning("Could not send the run report: %s", type(exc).__name__)
+            return
+        if not delivered:
+            logger.warning("The run report was not delivered; it is not retried.")
+
+    def _busy_summary(self) -> EvalSummary:
+        """Evaluation skipped because the profile database was busy: everything queued stays unscored."""
+        limit = self.settings.eval_batch_limit
+        try:
+            backlog = self.db.count_unprocessed_jobs()
+        except Exception:
+            backlog = 0
+        in_batch = min(backlog, limit) if limit else backlog
+        return EvalSummary(0, 0, in_batch, backlog - in_batch, STOPPED_PROFILE_BUSY)
+
     def _run_pipeline_cycle(
-        self, queries: Optional[List[SearchQuery]], dry_run: bool
-    ) -> Tuple[int, int]:
+        self,
+        queries: Optional[List[SearchQuery]],
+        dry_run: bool,
+        results: Optional[_CycleResults] = None,
+    ) -> _CycleResults:
+        results = results if results is not None else _CycleResults()
         # One snapshot per cycle: the profile is compiled once here and drives both scraping and
         # evaluation, so a change committed mid-cycle only takes effect in the next cycle.
         profile, problem = self.current_profile(alert=not dry_run)
+        results.profile = profile
         if queries is None:
             queries = self._profile_queries(profile, problem, dry_run)
 
         rules = profile.rules if profile is not None else None
-        scrape_stats = self._scrape_queries(queries, dry_run, rules) if queries else ScrapeStats()
-        total_new_saved = scrape_stats.total_new_saved
+        if queries:
+            results.scrape = self._scrape_queries(queries, dry_run, rules)
+        total_new_saved = results.scrape.total_new_saved
 
         if dry_run:
-            return 0, 0
+            results.scrape = ScrapeStats()  # a dry run reports (0, 0), as before
+            return results
 
         if problem == "db_busy" and profile is None:
             self._skip_evaluation_without_profile()
-            return total_new_saved, 0
+            results.summary = self._busy_summary()
+            return results
 
         # Process evaluations
-        summary = self.evaluate_unprocessed(
+        results.summary = self.evaluate_unprocessed(
             limit=self.settings.eval_batch_limit, dry_run=False, profile=profile
         )
-        wow_sent = summary.wow_sent
-        logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {wow_sent}")
-        return total_new_saved, wow_sent
+        logger.info(f"Pipeline cycle completed. New: {total_new_saved}, WOW alerts: {results.summary.wow_sent}")
+        return results
 
     def _profile_queries(
         self, profile: Optional[CompiledProfile], problem: Optional[str], dry_run: bool
@@ -1025,7 +1224,7 @@ class DaemonService:
 
         # Scrape interval
         self.scheduler.add_job(
-            self.run_pipeline_cycle,
+            self.run_pipeline_cycle_report,
             trigger=IntervalTrigger(hours=self.settings.scrape_interval_hours),
             id="scrape_pipeline",
             name="Scrape & Evaluate Pipeline",
@@ -1071,7 +1270,7 @@ class DaemonService:
 
         logger.info("Running initial startup scraping cycle...")
         try:
-            self.run_pipeline_cycle()
+            self.run_pipeline_cycle_report()
         except ConfigurationError as exc:
             logger.error(
                 "Startup cycle could not evaluate jobs: %s. Scraping continues on schedule; "

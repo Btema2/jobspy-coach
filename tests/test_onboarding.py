@@ -88,7 +88,7 @@ def conv_store(db) -> ConversationStore:
 def _ctx(tmp_path, db, clock, chat_llm):
     return BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
         chat_llm=chat_llm,
     )
 

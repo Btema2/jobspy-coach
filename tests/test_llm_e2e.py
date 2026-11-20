@@ -107,7 +107,7 @@ class Harness:
         )
         self.threads: List[threading.Thread] = []
 
-    def _trigger(self) -> str:
+    def _trigger(self, notify: bool = False) -> str:
         self.triggers += 1
         return TRIGGER_STARTED
 

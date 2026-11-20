@@ -338,8 +338,8 @@ def test_daemon_start_lifecycle_and_shutdown(monkeypatch, tmp_path):
     monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
 
     daemon = DaemonService(db_path=tmp_path / "daemon_start.db")
-    mock_run = MagicMock(return_value=(0, 0))
-    daemon.run_pipeline_cycle = mock_run
+    mock_run = MagicMock(return_value=None)
+    daemon.run_pipeline_cycle_report = mock_run
 
     handlers = {}
 
@@ -565,7 +565,7 @@ def test_daemon_start_logs_update_notice(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", mock_check)
 
     daemon = DaemonService(db_path=tmp_path / "daemon_start_log.db")
-    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+    daemon.run_pipeline_cycle_report = MagicMock(return_value=None)
 
     with caplog.at_level(logging.INFO):
         daemon.start()

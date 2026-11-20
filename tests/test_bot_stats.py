@@ -202,7 +202,7 @@ def router(tmp_path, db) -> CommandRouter:
     )
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None,
     )
     return CommandRouter(ctx, client=TelegramBotClient("<TOKEN>", transport=FakeTelegram().transport))
 
@@ -240,7 +240,7 @@ def test_stats_command_pinned_and_removed(router, db):
 def test_stats_command_usage_and_no_profile(tmp_path, db):
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None, DIGEST_SCORE_THRESHOLD=7.0),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None,
     )
     router = CommandRouter(ctx, client=TelegramBotClient("<TOKEN>", transport=FakeTelegram().transport))
     _run(db, _key("<ROLE>"))

@@ -601,7 +601,7 @@ def test_sigterm_handler_stops_chain_and_cancels_queued_futures(monkeypatch, tmp
     monkeypatch.setattr("src.scheduler.daemon.ThreadPoolExecutor", RecordingExecutor)
 
     daemon, chain, t, result = _blocked_batch(tmp_path)
-    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+    daemon.run_pipeline_cycle_report = MagicMock(return_value=None)
     daemon.start()
     mock_scheduler.running = True
 
@@ -631,7 +631,7 @@ def test_shutdown_handler_is_safe_without_chain_or_executor(monkeypatch, tmp_pat
     monkeypatch.setattr("sys.exit", exit_mock)
 
     daemon = DaemonService(db_path=tmp_path / "noeval.db", notifier=MagicMock())
-    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+    daemon.run_pipeline_cycle_report = MagicMock(return_value=None)
     daemon.start()
     assert daemon.evaluator is None and daemon._futures == []
 
@@ -697,7 +697,7 @@ def test_no_provider_configured_logs_warning_at_start_without_raising(monkeypatc
 
     daemon = DaemonService(db_path=tmp_path / "warn.db", notifier=MagicMock())
     daemon.settings = make_settings()  # no NVIDIA / OpenRouter keys
-    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+    daemon.run_pipeline_cycle_report = MagicMock(return_value=None)
 
     with caplog.at_level(logging.WARNING, logger="src.scheduler.daemon"):
         daemon.start()
@@ -736,7 +736,7 @@ def test_configured_provider_logs_no_warning_at_start(monkeypatch, tmp_path, cap
 
     daemon = DaemonService(db_path=tmp_path / "nowarn.db", notifier=MagicMock())
     daemon.settings = make_settings(NVIDIA_API_KEY="k")
-    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+    daemon.run_pipeline_cycle_report = MagicMock(return_value=None)
 
     with caplog.at_level(logging.WARNING, logger="src.scheduler.daemon"):
         daemon.start()

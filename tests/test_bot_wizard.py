@@ -50,7 +50,7 @@ def store(db) -> ProfileStore:
 def router(tmp_path, db, store, clock) -> CommandRouter:
     ctx = BotContext(
         db_path=db.db_path, env_path=tmp_path / ".env", settings=Settings(_env_file=None),
-        trigger_cycle=lambda: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
+        trigger_cycle=lambda **_: TRIGGER_STARTED, is_cycle_running=lambda: False, scraper=None, clock=clock,
     )
     return CommandRouter(ctx, client=TelegramBotClient("<TOKEN>", transport=FakeTelegram().transport))
 

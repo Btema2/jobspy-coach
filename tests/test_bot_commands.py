@@ -42,10 +42,12 @@ class Control:
     def __init__(self):
         self.trigger_result = TRIGGER_STARTED
         self.trigger_calls = 0
+        self.notify_flags = []
         self.running = False
 
-    def trigger(self) -> str:
+    def trigger(self, notify: bool = False) -> str:
         self.trigger_calls += 1
+        self.notify_flags.append(notify)
         return self.trigger_result
 
     def is_running(self) -> bool:
@@ -276,6 +278,7 @@ def test_pause_resume_triggers_cycle(router, store, control):
     reply = send(router, "/resume")
     assert "paused: True -&gt; False" in reply and "A cycle starts now." in reply
     assert control.trigger_calls == 1
+    assert control.notify_flags == [True]  # /resume asks for a run report
     assert send(router, "/resume") == "Scraping is not paused. Send /run_now to start a cycle."
     assert control.trigger_calls == 1
 
@@ -283,7 +286,7 @@ def test_pause_resume_triggers_cycle(router, store, control):
 def test_resume_keeps_the_reply_when_the_trigger_raises(router, store, control):
     send(router, "/pause")
 
-    def boom():
+    def boom(notify=False):
         raise RuntimeError("scheduler gone")
 
     control.trigger = boom  # type: ignore[assignment]
@@ -319,6 +322,7 @@ def test_resume_without_queries_is_refused_and_does_not_trigger(router, store, c
 
 def test_run_now_replies(router, control):
     assert send(router, "/run_now") == "Cycle started."
+    assert control.notify_flags == [True]  # /run_now asks for a run report
     control.trigger_result = TRIGGER_BUSY
     assert send(router, "/run_now") == "A cycle is already running; try again when it has finished."
     control.trigger_result = TRIGGER_NOT_READY
