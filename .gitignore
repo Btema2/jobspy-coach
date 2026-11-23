@@ -59,6 +59,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+uv.lock
 
 # Private user / candidate data (DO NOT COMMIT)
 .candidate_profile.md
