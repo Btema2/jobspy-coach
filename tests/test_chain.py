@@ -6,7 +6,7 @@ import time
 import pytest
 
 from src.evaluator import chain as chain_module
-from src.evaluator.chain import DIGEST_MAX_SCORE, ProviderChainEvaluator
+from src.evaluator.chain import DIGEST_MAX_SCORE, ProviderChainEvaluator, build_chain_from_settings
 from src.evaluator.circuit_breaker import CircuitBreaker
 from src.evaluator.errors import (
     AuthenticationFailed,
@@ -23,7 +23,9 @@ from src.evaluator.errors import (
     TransientProviderError,
     UnexpectedStatus,
 )
+from src.evaluator import prompts as prompts_module
 from src.evaluator.providers import CompletionResult
+from src.evaluator.scoring import ScoringPolicy
 from src.evaluator.schemas import JobEvaluationResult
 from src.storage.models import JobPosting
 
@@ -64,13 +66,13 @@ class FakeProvider:
 def payload(**overrides):
     data = {
         "score": 7.0,
-        "summary_uk": "Коротке резюме вакансії для кандидата.",
+        "summary": "Коротке резюме вакансії для кандидата.",
         "reasoning": "Reasonable fit.",
         "language_requirements": ["English"],
         "pros": ["remote"],
         "cons": [],
         "hard_reject": False,
-        "role_is_direct_coaching": False,
+        "is_core_role": False,
         "matches_bonus_criteria": False,
     }
     data.update(overrides)
@@ -127,16 +129,49 @@ def test_prompts_built_from_job_and_system_prompt_used_verbatim():
     assert "Wellbeing Coach" in call["user"] and "Globex" in call["user"]
 
 
-def test_system_prompt_built_once_at_construction(monkeypatch):
-    built = []
-    monkeypatch.setattr(chain_module, "build_system_prompt", lambda persona=None: built.append(persona) or "BUILT")
-    monkeypatch.setattr(chain_module, "load_candidate_persona", lambda: None)
+def test_chain_construction_never_reads_profile_file(monkeypatch):
+    def boom():
+        raise AssertionError("candidate profile must not be read at construction")
+
+    monkeypatch.setattr(prompts_module, "load_candidate_persona", boom)
     nim = FakeProvider("nim", [payload()])
-    chain = ProviderChainEvaluator([nim])
+    chain = ProviderChainEvaluator([nim])  # must not raise
+    assert nim.calls == []
+
+    built = []
+    monkeypatch.setattr(
+        chain_module, "build_system_prompt", lambda persona=None: built.append(persona) or "BUILT"
+    )
     chain.evaluate_job(make_job())
     chain.evaluate_job(make_job())
     assert len(built) == 1
-    assert nim.calls[0]["system"] == "BUILT"
+    assert [c["system"] for c in nim.calls] == ["BUILT", "BUILT"]
+
+
+def test_evaluate_job_uses_per_call_system_prompt():
+    nim = FakeProvider("nim", [payload()])
+    chain = make_chain(nim, system_prompt="FROZEN")
+    chain.evaluate_job(make_job(), system_prompt="X")
+    chain.evaluate_job(make_job())
+    assert nim.calls[0]["system"] == "X"
+    assert nim.calls[1]["system"] == "FROZEN"
+
+
+def test_per_call_prompt_does_not_change_chain_default():
+    nim = FakeProvider("nim", [payload()])
+    chain = make_chain(nim, system_prompt="FROZEN")
+    chain.evaluate_job(make_job(), system_prompt="OVERRIDE")
+    chain.evaluate_job(make_job())
+    assert nim.calls[-1]["system"] == "FROZEN"
+    assert chain._system_prompt == "FROZEN"
+
+
+def test_per_call_prompt_reaches_retry_and_fallback_provider():
+    nim = FakeProvider("nim", ["not json", "still not json"])
+    router = FakeProvider("openrouter", [payload()])
+    make_chain(nim, router, system_prompt="FROZEN").evaluate_job(make_job(), system_prompt="X")
+    assert [c["system"] for c in nim.calls] == ["X", "X"]
+    assert [c["system"] for c in router.calls] == ["X"]
 
 
 def test_requires_at_least_one_provider():
@@ -186,7 +221,7 @@ def test_invalid_json_retry_on_same_provider_can_recover():
 
 
 def test_schema_invalid_json_counts_as_invalid():
-    bad = payload(summary_uk="short")
+    bad = payload(summary="short")
     nim = FakeProvider("nim", [bad, payload(score=6.6)])
     assert make_chain(nim).evaluate_job(make_job()).score == 6.6
     assert len(nim.calls) == 2
@@ -535,7 +570,7 @@ def evaluate(job=None, bonus_enabled=True, **overrides):
 
 
 def test_score_clamped_into_range():
-    assert evaluate(score=14, role_is_direct_coaching=True).score == 10.0
+    assert evaluate(score=14, is_core_role=True).score == 10.0
     assert evaluate(score=-3, hard_reject=False).score <= 2.0
 
 
@@ -543,48 +578,51 @@ def test_bonus_applies_when_base_at_least_six():
     assert evaluate(score=6.0, matches_bonus_criteria=True).score == 7.5
 
 
-def _chain_from_persona(monkeypatch, persona, payload_json):
-    monkeypatch.setattr(chain_module, "load_candidate_persona", lambda: persona)
-    nim = FakeProvider("nim", [payload_json])
-    return ProviderChainEvaluator([nim])
+def test_per_call_policy_bonus_and_cap():
+    nim = FakeProvider("nim", [payload(score=7.0, matches_bonus_criteria=True, is_core_role=False)])
+    chain = make_chain(nim)
+    bonus_on = ScoringPolicy(system_prompt="P1", bonus_enabled=True, core_cap=8.4)
+    bonus_off = ScoringPolicy(system_prompt="P2", bonus_enabled=False, core_cap=None)
+    assert chain.evaluate_job(make_job(), policy=bonus_on).score == 8.4  # 7.0 + 1.5 capped, non core
+    assert chain.evaluate_job(make_job(), policy=bonus_off).score == 7.0
+    uncapped = ScoringPolicy(system_prompt="P3", bonus_enabled=True, bonus_points=2.5, core_cap=None)
+    assert chain.evaluate_job(make_job(), policy=uncapped).score == 9.5
+    assert [c["system"] for c in nim.calls] == ["P1", "P2", "P3"]  # policy prompt used per call
 
 
-def test_generic_persona_ignores_model_bonus_flag(monkeypatch, caplog):
-    chain = _chain_from_persona(monkeypatch, None, payload(score=7.0, matches_bonus_criteria=True))
-    with caplog.at_level(logging.DEBUG, logger="src.evaluator.chain"):
-        assert chain.evaluate_job(make_job()).score == 7.0
-    assert any("bonus" in r.getMessage().lower() and r.levelno == logging.DEBUG for r in caplog.records)
+def test_system_prompt_arg_wins_over_policy_prompt():
+    nim = FakeProvider("nim", [payload()])
+    chain = make_chain(nim, system_prompt="FROZEN")
+    chain.evaluate_job(make_job(), system_prompt="ARG", policy=ScoringPolicy(system_prompt="POLICY"))
+    chain.evaluate_job(make_job(), policy=ScoringPolicy(system_prompt="POLICY"))
+    assert [c["system"] for c in nim.calls] == ["ARG", "POLICY"]
 
 
-def test_persona_without_bonus_section_ignores_flag(monkeypatch):
-    chain = _chain_from_persona(monkeypatch, "- Domain: Coaching", payload(score=7.0, matches_bonus_criteria=True))
-    assert chain.evaluate_job(make_job()).score == 7.0
+def test_title_safety_net_uses_policy_rules():
+    nim = FakeProvider("nim", [payload(score=7.0)])
+    chain = make_chain(nim)
+    job = make_job(title="Scrum Master")
+    assert chain.evaluate_job(job, policy=ScoringPolicy(system_prompt="P", rules=())).score == 7.0
+    assert chain.evaluate_job(job).score == 2.0  # default policy: legacy rules
 
 
-def test_persona_with_bonus_section_applies_bonus(monkeypatch):
-    persona = "- Domain: Coaching\n\n## Bonus criteria\n- Something valued"
-    chain = _chain_from_persona(
-        monkeypatch, persona, payload(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True)
-    )
-    assert chain.evaluate_job(make_job()).score == 8.5
-
-
-def test_persona_with_bonus_section_still_gated_by_base_score(monkeypatch):
-    persona = "## Bonus criteria\n- Something valued"
-    chain = _chain_from_persona(monkeypatch, persona, payload(score=5.0, matches_bonus_criteria=True))
-    assert chain.evaluate_job(make_job()).score == 5.0
-
-
-def test_explicit_kwarg_wins_over_persona(monkeypatch):
-    monkeypatch.setattr(chain_module, "load_candidate_persona", lambda: "## Bonus criteria\n- x")
-    off = ProviderChainEvaluator([FakeProvider("nim", [payload(score=7.0, matches_bonus_criteria=True)])], bonus_enabled=False)
-    assert off.evaluate_job(make_job()).score == 7.0
-    monkeypatch.setattr(chain_module, "load_candidate_persona", lambda: None)
-    on = ProviderChainEvaluator(
-        [FakeProvider("nim", [payload(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True)])],
-        bonus_enabled=True,
-    )
-    assert on.evaluate_job(make_job()).score == 8.5
+def test_job_prompt_remote_line():
+    nim = FakeProvider("nim", [payload()])
+    chain = make_chain(nim)
+    policy = ScoringPolicy(system_prompt="P", remote_filter_query_ids=frozenset({"Q-REMOTE"}))
+    chain.evaluate_job(make_job(remote_status="verified", source_query="Q-REMOTE|linkedin"), policy=policy)
+    chain.evaluate_job(make_job(remote_status="unverified", source_query="Q-REMOTE|linkedin"), policy=policy)
+    chain.evaluate_job(make_job(remote_status="unverified", source_query="Q-OTHER|linkedin"), policy=policy)
+    chain.evaluate_job(make_job(remote_status="unverified", source_query=None), policy=policy)
+    remote_lines = [
+        next(line for line in c["user"].splitlines() if line.startswith("Remote:")) for c in nim.calls
+    ]
+    assert remote_lines == [
+        "Remote: yes",
+        "Remote: unverified (found with the remote filter)",
+        "Remote: unverified",
+        "Remote: unverified",
+    ]
 
 
 def test_explicit_system_prompt_without_kwarg_disables_bonus():
@@ -593,7 +631,7 @@ def test_explicit_system_prompt_without_kwarg_disables_bonus():
 
 
 def test_bonus_capped_at_ten():
-    assert evaluate(score=9.0, matches_bonus_criteria=True, role_is_direct_coaching=True).score == 10.0
+    assert evaluate(score=9.0, matches_bonus_criteria=True, is_core_role=True).score == 10.0
 
 
 def test_bonus_gate_blocks_mediocre_base():
@@ -602,7 +640,7 @@ def test_bonus_gate_blocks_mediocre_base():
 
 
 def test_bonus_applied_once_only():
-    assert evaluate(score=7.0, matches_bonus_criteria=True, role_is_direct_coaching=True).score == 8.5
+    assert evaluate(score=7.0, matches_bonus_criteria=True, is_core_role=True).score == 8.5
 
 
 def test_no_bonus_flag_no_change():
@@ -637,7 +675,7 @@ def test_title_safety_net_ignores_bonus():
 
 
 def test_title_safety_net_leaves_clean_titles_alone():
-    assert evaluate(job=make_job(title="Career Coach"), score=9.0, role_is_direct_coaching=True).score == 9.0
+    assert evaluate(job=make_job(title="Career Coach"), score=9.0, is_core_role=True).score == 9.0
 
 
 def test_title_safety_net_does_not_raise_low_scores():
@@ -816,7 +854,7 @@ def test_parse_errors_do_not_embed_model_output():
         ProviderChainEvaluator._parse(f"{marker} no json here")
     assert marker not in str(exc_info.value)
     with pytest.raises(InvalidResponse) as exc_info:
-        ProviderChainEvaluator._parse(json.dumps({"score": "x", "summary_uk": marker}))
+        ProviderChainEvaluator._parse(json.dumps({"score": "x", "summary": marker}))
     assert marker not in str(exc_info.value)
     with pytest.raises(InvalidResponse) as exc_info:
         ProviderChainEvaluator._parse(f'["{marker}"]')
@@ -827,50 +865,127 @@ def test_parse_errors_do_not_embed_model_output():
 
 
 def test_non_direct_coaching_raw_nine_is_capped_at_digest_max():
-    result = evaluate(score=9.0, role_is_direct_coaching=False)
+    result = evaluate(score=9.0, is_core_role=False)
     assert result.score == DIGEST_MAX_SCORE == 8.4
 
 
 def test_non_direct_coaching_bonus_cannot_lift_past_digest_max():
-    result = evaluate(score=8.0, matches_bonus_criteria=True, role_is_direct_coaching=False)
+    result = evaluate(score=8.0, matches_bonus_criteria=True, is_core_role=False)
     assert result.score == 8.4
 
 
 def test_non_direct_coaching_below_cap_is_unchanged():
-    assert evaluate(score=7.0, role_is_direct_coaching=False).score == 7.0
-    assert evaluate(score=6.0, matches_bonus_criteria=True, role_is_direct_coaching=False).score == 7.5
+    assert evaluate(score=7.0, is_core_role=False).score == 7.0
+    assert evaluate(score=6.0, matches_bonus_criteria=True, is_core_role=False).score == 7.5
 
 
 def test_direct_coaching_with_bonus_reaches_wow_band():
-    result = evaluate(score=8.0, matches_bonus_criteria=True, role_is_direct_coaching=True)
+    result = evaluate(score=8.0, matches_bonus_criteria=True, is_core_role=True)
     assert result.score == 9.5
 
 
 def test_direct_coaching_is_not_capped():
-    assert evaluate(score=9.0, role_is_direct_coaching=True).score == 9.0
+    assert evaluate(score=9.0, is_core_role=True).score == 9.0
 
 
 def test_hard_reject_still_wins_over_direct_coaching():
-    result = evaluate(score=9.0, hard_reject=True, role_is_direct_coaching=True, matches_bonus_criteria=True)
+    result = evaluate(score=9.0, hard_reject=True, is_core_role=True, matches_bonus_criteria=True)
     assert result.score == 2.0
 
 
 def test_missing_direct_coaching_flag_is_treated_as_false_and_capped():
     data = json.loads(payload(score=9.2))
-    del data["role_is_direct_coaching"]
+    del data["is_core_role"]
     result = make_chain(FakeProvider("nim", [json.dumps(data)])).evaluate_job(make_job())
-    assert result.role_is_direct_coaching is False
+    assert result.is_core_role is False
     assert result.score == 8.4
 
 
 def test_cap_is_logged_with_title_raw_and_final_score(caplog):
     with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
-        evaluate(job=make_job(title="Training Lead"), score=9.0, role_is_direct_coaching=False)
+        evaluate(job=make_job(title="Training Lead"), score=9.0, is_core_role=False)
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
     assert any("Training Lead" in m and "9.0" in m and "8.4" in m for m in messages)
 
 
 def test_cap_is_silent_when_it_does_not_bite(caplog):
     with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
-        evaluate(score=7.0, role_is_direct_coaching=False)
+        evaluate(score=7.0, is_core_role=False)
     assert not any("capped" in r.getMessage().lower() for r in caplog.records)
+
+
+# ---------- raw score recording ----------
+
+def test_postprocess_records_raw_score_before_adjustments():
+    boosted = evaluate(score=7.0, matches_bonus_criteria=True, is_core_role=True)
+    assert boosted.score == 8.5  # 7.0 + BONUS_POINTS (1.5), direct coaching so no cap
+    assert boosted.raw_score == 7.0
+
+    rejected = evaluate(score=9.0, hard_reject=True)
+    assert rejected.score == 2.0
+    assert rejected.raw_score == 9.0
+
+
+def test_postprocess_raw_score_ignores_non_core_cap_and_is_clamped():
+    capped = evaluate(score=9.5, is_core_role=False)
+    assert capped.score == DIGEST_MAX_SCORE
+    assert capped.raw_score == 9.5
+
+    assert evaluate(score=14, is_core_role=True).raw_score == 10.0
+
+
+def test_old_model_keys_round_trip_to_the_stored_columns(tmp_path):
+    """A model that still answers with the old keys ends with eval_is_core_role / summary stored (not NULL)."""
+    from src.storage.db import Database
+
+    old = json.dumps({
+        "score": 9.0, "summary_uk": "Старе резюме вакансії для кандидата.", "reasoning": "r",
+        "role_is_direct_coaching": True,
+    })
+    result = make_chain(FakeProvider("nim", [old])).evaluate_job(make_job())
+    assert (result.summary, result.is_core_role, result.score) == ("Старе резюме вакансії для кандидата.", True, 9.0)
+
+    db = Database(tmp_path / "old_keys.db")
+    db.init_db()
+    job_id, _ = db.save_job(make_job(dedup_hash="old-keys"))
+    db.update_evaluation(job_id, result)
+    stored = db.get_job_by_id(job_id)
+    assert stored.eval_is_core_role is True
+    assert stored.eval_summary_uk == "Старе резюме вакансії для кандидата."
+
+
+def test_cap_log_uses_a_compact_number(caplog):
+    nim = FakeProvider("nim", [payload(score=9.0, is_core_role=False)])
+    policy = ScoringPolicy(system_prompt="P", wow_threshold=8.25, digest_threshold=8.15, core_cap=8.15)
+    with caplog.at_level(logging.INFO, logger="src.evaluator.chain"):
+        make_chain(nim).evaluate_job(make_job(), policy=policy)
+    text = " ".join(r.getMessage() for r in caplog.records if "Core-role cap" in r.getMessage())
+    assert "capped at 8.15" in text and "final score 8.15" in text
+
+
+def test_default_policy_is_built_once_without_taking_the_lock_again():
+    chain = make_chain(FakeProvider("nim", [payload()]))
+    first = chain._get_default_policy()
+    chain._default_lock.acquire()
+    try:  # a held lock must not block the fast path
+        assert chain._get_default_policy() is first
+    finally:
+        chain._default_lock.release()
+
+
+def test_default_policy_comes_from_the_shared_no_profile_helper():
+    from src.evaluator.scoring import no_profile_policy
+
+    chain = make_chain(FakeProvider("nim", [payload()]), bonus_enabled=True, wow_threshold=9.0, digest_threshold=7.0)
+    assert chain._get_default_policy() == no_profile_policy("SYSTEM PROMPT", 9.0, 7.0, bonus_enabled=True)
+    plain = make_chain(FakeProvider("nim", [payload()]))
+    assert plain._get_default_policy() == no_profile_policy("SYSTEM PROMPT")
+
+
+def test_build_chain_from_settings_forwards_the_env_thresholds():
+    from src.config import Settings
+
+    settings = Settings(_env_file=None, NVIDIA_API_KEY="k", WOW_SCORE_THRESHOLD=9.0, DIGEST_SCORE_THRESHOLD=7.0)
+    chain = build_chain_from_settings(settings, system_prompt="p")
+    policy = chain._get_default_policy()
+    assert (policy.wow_threshold, policy.digest_threshold, policy.core_cap) == (9.0, 7.0, 8.9)

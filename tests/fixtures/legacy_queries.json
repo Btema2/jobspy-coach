@@ -1,0 +1,33 @@
+[
+  {
+    "query_id": "Q-FIX-A",
+    "search_term": "<ROLE> OR <ROLE B>",
+    "location": "<MARKET>",
+    "country_code": "poland",
+    "site_names": ["linkedin", "indeed"]
+  },
+  {
+    "query_id": "Q-FIX-B",
+    "search_term": "<ROLE>",
+    "location": "Europe",
+    "country_code": null,
+    "site_names": ["linkedin", "indeed"],
+    "is_remote": true
+  },
+  {
+    "query_id": "Q-FIX-C",
+    "search_term": "<ROLE B>",
+    "location": "<MARKET>",
+    "site_names": ["linkedin", "google"],
+    "is_remote": false,
+    "google_search_term": "<ROLE B> jobs near <MARKET> in the last 3 days"
+  },
+  {
+    "query_id": "Q-FIX-D",
+    "search_term": "<ROLE C>",
+    "location": "Remote",
+    "country_code": "usa",
+    "site_names": ["linkedin", "indeed", "glassdoor", "google"],
+    "is_remote": true
+  }
+]

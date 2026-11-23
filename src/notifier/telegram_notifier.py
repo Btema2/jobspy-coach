@@ -24,6 +24,8 @@ class TelegramNotifier:
         self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         self._external_client = client is not None
         self._client = client or httpx.Client(timeout=self.timeout)
+        # Messages the last ``send_daily_digest`` planned (its chunks); the return value is the delivered count.
+        self.last_digest_total = 0
 
     @classmethod
     def from_settings(
@@ -108,8 +110,8 @@ class TelegramNotifier:
                 logger.error(f"Failed to send Telegram notification: {type(e).__name__}: {redact_secrets(str(e))}")
                 return False
 
-    def send_wow_alert(self, job: JobPosting) -> bool:
-        text, markup = format_wow_alert(job)
+    def send_wow_alert(self, job: JobPosting, lang: Optional[str] = None) -> bool:
+        text, markup = format_wow_alert(job, lang=lang)
         return self.send_message(text, reply_markup=markup)
 
     def send_daily_digest(
@@ -117,11 +119,14 @@ class TelegramNotifier:
         jobs: List[JobPosting],
         date_str: str,
         update_notice: Optional[str] = None,
+        lang: Optional[str] = None,
     ) -> int:
+        self.last_digest_total = 0
         if not jobs:
             return 0
 
-        chunks = format_digest_chunks(jobs, date_str=date_str, update_notice=update_notice)
+        chunks = format_digest_chunks(jobs, date_str=date_str, update_notice=update_notice, lang=lang)
+        self.last_digest_total = len(chunks)
         sent_count = 0
         for chunk in chunks:
             if self.send_message(chunk):

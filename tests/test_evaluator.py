@@ -15,7 +15,7 @@ def test_job_evaluation_result_schema_validation():
     valid_data = {
         "score": 8.5,
         "is_wow": False,
-        "summary_uk": "Відмінна вакансія бізнес-тренера для міжнародної компанії.",
+        "summary": "Відмінна вакансія бізнес-тренера для міжнародної компанії.",
         "reasoning": "Strong corporate fit for executive coaching.",
         "language_requirements": ["EN", "PL"],
         "pros": ["Remote", "Competitive salary"],
@@ -24,7 +24,7 @@ def test_job_evaluation_result_schema_validation():
     result = JobEvaluationResult.model_validate(valid_data)
     assert result.score == 8.5
     assert result.is_wow is False
-    assert result.summary_uk == "Відмінна вакансія бізнес-тренера для міжнародної компанії."
+    assert result.summary == "Відмінна вакансія бізнес-тренера для міжнародної компанії."
     assert result.reasoning == "Strong corporate fit for executive coaching."
     assert result.language_requirements == ["EN", "PL"]
     assert result.pros == ["Remote", "Competitive salary"]
@@ -34,7 +34,7 @@ def test_job_evaluation_result_schema_validation():
     minimal_data = {
         "score": 9.5,
         "is_wow": True,
-        "summary_uk": "Чудова позиція Executive коуча.",
+        "summary": "Чудова позиція Executive коуча.",
         "reasoning": "Fits perfectly.",
     }
     result_min = JobEvaluationResult.model_validate(minimal_data)
@@ -50,9 +50,9 @@ def test_job_evaluation_result_schema_validation():
     with pytest.raises(ValidationError):
         JobEvaluationResult.model_validate({**valid_data, "score": "excellent"})
 
-    # summary_uk too short (< 10 chars)
+    # summary too short (< 10 chars)
     with pytest.raises(ValidationError):
-        JobEvaluationResult.model_validate({**valid_data, "summary_uk": "Коротко"})
+        JobEvaluationResult.model_validate({**valid_data, "summary": "Коротко"})
 
     # Missing required reasoning
     invalid_data = {k: v for k, v in valid_data.items() if k != "reasoning"}

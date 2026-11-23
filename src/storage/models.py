@@ -7,7 +7,7 @@ from typing import List, Optional
 class JobEvaluationResult:
     score: float
     is_wow: bool
-    summary_uk: str
+    summary: str
     reasoning: str
     language_requirements: List[str] = field(default_factory=list)
     pros: List[str] = field(default_factory=list)
@@ -38,6 +38,7 @@ class JobPosting:
     # Pre-filter
     pre_filtered: bool = False
     pre_filter_reason: Optional[str] = None
+    pre_filter_rule: Optional[str] = None  # stable key of the rule that dropped it (None: legacy row or stub)
 
     # LLM Evaluation
     eval_status: str = "unprocessed"  # unprocessed, evaluated, failed, skipped
@@ -52,6 +53,14 @@ class JobPosting:
     evaluated_at: Optional[datetime] = None
     eval_model: Optional[str] = None
     eval_attempts: int = 0
+    eval_raw_score: Optional[float] = None
+    eval_is_core_role: Optional[bool] = None
+    eval_bonus_flag: Optional[bool] = None
+    eval_hard_reject: Optional[bool] = None
+
+    # Provenance
+    source_query: Optional[str] = None
+    remote_status: str = "unverified"
 
     # Notification
     notification_status: str = "pending"  # pending, instant_sent, digest_sent, dismissed, expired_dismissed

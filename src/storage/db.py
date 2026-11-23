@@ -3,12 +3,15 @@ import html
 import json
 import re
 import sqlite3
+import time
 import unicodedata
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 
+from src.storage.migrations import apply_migrations, ensure_column
 from src.storage.models import JobEvaluationResult, JobPosting, ScrapeRun
 
 
@@ -118,6 +121,42 @@ def compute_dedup_hash(company: str, title: str, location: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+_SQL_CHUNK = 500  # bound parameters per statement (SQLite's default limit is far above this)
+STALE_PENDING_DAYS = 7  # pending digest items older than this expire (``expire_stale_pending_jobs``)
+
+
+@dataclass(frozen=True)
+class DroppedJob:
+    """A pre-filtered posting, for the ``/dropped`` view; ``rule_key`` is None for legacy rows and stubs."""
+
+    id: int
+    title: str
+    company: str
+    site: str
+    reason: Optional[str]
+    rule_key: Optional[str]
+    created_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class QueryKeyRuns:
+    """Scrape runs of one ``query_key`` (``<query_id>|<board>``) in a window, for the ``/stats`` view.
+
+    ``ok``, ``empty`` and ``failed`` are exclusive: a run that failed (outcome or status) counts only as failed.
+    """
+
+    query_key: str
+    calls: int
+    ok: int
+    empty: int
+    failed: int
+    new_jobs: int
+
+
+def _opt_bool(val: Any) -> Optional[bool]:
+    return None if val is None else bool(val)
+
+
 def _parse_dt(val: Any) -> Optional[datetime]:
     if not val:
         return None
@@ -129,16 +168,7 @@ def _parse_dt(val: Any) -> Optional[datetime]:
         return None
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
-    """Idempotently add a column; tolerant of a concurrent init_db winning the race."""
-    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if name in existing:
-        return
-    try:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            raise
+_ensure_column = ensure_column  # legacy name; tests import it from here
 
 
 class Database:
@@ -150,8 +180,18 @@ class Database:
     def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
+        # Switching a fresh file to WAL can fail immediately with "database is locked" (the busy
+        # handler is not always consulted) when another process is doing the same; retry briefly.
+        for attempt in range(50):
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 49:
+                    conn.close()
+                    raise
+                time.sleep(0.1)
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
         try:
@@ -226,6 +266,7 @@ class Database:
                 error_message TEXT
             );
             """)
+            apply_migrations(conn)
             conn.commit()
 
     def save_job(self, job: JobPosting) -> Tuple[int, bool]:
@@ -242,17 +283,19 @@ class Database:
                 dedup_hash, site, external_id, job_url, job_url_direct,
                 title, company, location, job_type, date_posted,
                 salary_min, salary_max, salary_currency, salary_interval,
-                description, is_remote, pre_filtered, pre_filter_reason,
+                description, is_remote, pre_filtered, pre_filter_reason, pre_filter_rule,
                 eval_status, eval_score, eval_is_wow, eval_summary_uk,
                 eval_reasoning, eval_languages, eval_pros, eval_cons,
                 eval_error, evaluated_at, eval_model, eval_attempts,
-                notification_status, instant_sent_at, digest_sent_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notification_status, instant_sent_at, digest_sent_at,
+                source_query, remote_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.dedup_hash, job.site, job.external_id, job.job_url, job.job_url_direct,
                 job.title, job.company, job.location, job.job_type, job.date_posted,
                 job.salary_min, job.salary_max, job.salary_currency, job.salary_interval,
                 job.description, int(job.is_remote), int(job.pre_filtered), job.pre_filter_reason,
+                job.pre_filter_rule,
                 job.eval_status, job.eval_score, int(job.eval_is_wow), job.eval_summary_uk,
                 job.eval_reasoning,
                 json.dumps(job.eval_languages, ensure_ascii=False) if job.eval_languages else None,
@@ -265,6 +308,8 @@ class Database:
                 job.notification_status,
                 job.instant_sent_at.isoformat() if job.instant_sent_at else None,
                 job.digest_sent_at.isoformat() if job.digest_sent_at else None,
+                job.source_query,
+                job.remote_status or "unverified",
             ))
             conn.commit()
             new_id = cursor.lastrowid
@@ -298,6 +343,15 @@ class Database:
             )
             return [self._row_to_job(r) for r in cursor.fetchall()]
 
+    def count_unprocessed_jobs(self) -> int:
+        """All rows ``get_unprocessed_jobs`` would return without a limit (same WHERE)."""
+        with self._get_connection() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE eval_status = 'unprocessed' AND pre_filtered = 0"
+                ).fetchone()[0]
+            )
+
     def update_evaluation(
         self,
         job_id: int,
@@ -306,55 +360,43 @@ class Database:
     ) -> None:
         now_str = datetime.now(timezone.utc).isoformat()
         eval_model = eval_result.eval_model if isinstance(eval_result.eval_model, str) else None
+        def _opt_int(value: Any) -> Optional[int]:
+            return None if value is None else int(bool(value))
+
+        raw_score = getattr(eval_result, "raw_score", None)
         with self._get_connection() as conn:
-            if notification_status is not None:
-                conn.execute("""
-                UPDATE jobs SET
-                    eval_status = 'evaluated',
-                    eval_score = ?,
-                    eval_is_wow = ?,
-                    eval_summary_uk = ?,
-                    eval_reasoning = ?,
-                    eval_languages = ?,
-                    eval_pros = ?,
-                    eval_cons = ?,
-                    eval_model = ?,
-                    notification_status = ?,
-                    evaluated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """, (
-                    eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
-                    json.dumps(eval_result.language_requirements, ensure_ascii=False),
-                    json.dumps(eval_result.pros, ensure_ascii=False),
-                    json.dumps(eval_result.cons, ensure_ascii=False),
-                    eval_model,
-                    notification_status,
-                    now_str, now_str, job_id
-                ))
-            else:
-                conn.execute("""
-                UPDATE jobs SET
-                    eval_status = 'evaluated',
-                    eval_score = ?,
-                    eval_is_wow = ?,
-                    eval_summary_uk = ?,
-                    eval_reasoning = ?,
-                    eval_languages = ?,
-                    eval_pros = ?,
-                    eval_cons = ?,
-                    eval_model = ?,
-                    evaluated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """, (
-                    eval_result.score, int(eval_result.is_wow), eval_result.summary_uk, eval_result.reasoning,
-                    json.dumps(eval_result.language_requirements, ensure_ascii=False),
-                    json.dumps(eval_result.pros, ensure_ascii=False),
-                    json.dumps(eval_result.cons, ensure_ascii=False),
-                    eval_model,
-                    now_str, now_str, job_id
-                ))
+            conn.execute("""
+            UPDATE jobs SET
+                eval_status = 'evaluated',
+                eval_score = ?,
+                eval_is_wow = ?,
+                eval_summary_uk = ?,
+                eval_reasoning = ?,
+                eval_languages = ?,
+                eval_pros = ?,
+                eval_cons = ?,
+                eval_model = ?,
+                eval_raw_score = ?,
+                eval_is_core_role = ?,
+                eval_bonus_flag = ?,
+                eval_hard_reject = ?,
+                notification_status = COALESCE(?, notification_status),
+                evaluated_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """, (
+                eval_result.score, int(eval_result.is_wow), eval_result.summary, eval_result.reasoning,
+                json.dumps(eval_result.language_requirements, ensure_ascii=False),
+                json.dumps(eval_result.pros, ensure_ascii=False),
+                json.dumps(eval_result.cons, ensure_ascii=False),
+                eval_model,
+                float(raw_score) if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool) else None,
+                _opt_int(getattr(eval_result, "is_core_role", None)),
+                _opt_int(getattr(eval_result, "matches_bonus_criteria", None)),
+                _opt_int(getattr(eval_result, "hard_reject", None)),
+                notification_status,
+                now_str, now_str, job_id
+            ))
             conn.commit()
 
     def mark_dismissed(self, job_id: int) -> None:
@@ -418,6 +460,21 @@ class Database:
             """, (min_score, limit))
             return [self._row_to_job(r) for r in cursor.fetchall()]
 
+    def count_pending_digest_jobs(self, min_score: float) -> int:
+        """All rows ``get_pending_digest_jobs`` would return without a limit (same WHERE)."""
+        with self._get_connection() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM jobs
+                    WHERE eval_status = 'evaluated'
+                      AND notification_status = 'pending'
+                      AND eval_score >= ?
+                    """,
+                    (min_score,),
+                ).fetchone()[0]
+            )
+
     def mark_instant_sent(self, job_id: int) -> None:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -453,7 +510,12 @@ class Database:
         new_jobs_saved: int,
         duration_sec: float,
         status: str,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        *,
+        rows_returned: int = 0,
+        prefiltered: int = 0,
+        outcome: Optional[str] = None,
+        query_key: Optional[str] = None,
     ) -> int:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -461,16 +523,18 @@ class Database:
             cursor.execute("""
             INSERT INTO scrape_runs (
                 run_time, board, query, jobs_found, new_jobs_saved,
-                duration_sec, status, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                duration_sec, status, error_message,
+                rows_returned, prefiltered, outcome, query_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, board, query, jobs_found, new_jobs_saved,
-                duration_sec, status, error_message
+                duration_sec, status, error_message,
+                rows_returned, prefiltered, outcome, query_key
             ))
             conn.commit()
             return cursor.lastrowid
 
-    def expire_stale_pending_jobs(self, days: int = 7) -> int:
+    def expire_stale_pending_jobs(self, days: int = STALE_PENDING_DAYS) -> int:
         now_str = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -495,6 +559,71 @@ class Database:
             conn.commit()
             return cursor.rowcount
 
+    def record_job_hit(self, job_id: int, query_key: str) -> None:
+        """Record that ``query_key`` surfaced this job; keeps ``first_seen``, refreshes ``last_seen``."""
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO job_hits (job_id, query_key, first_seen, last_seen) VALUES (?, ?, ?, ?)
+                ON CONFLICT(job_id, query_key) DO UPDATE SET last_seen = excluded.last_seen
+                """,
+                (job_id, query_key, now_str, now_str),
+            )
+
+    def get_job_hits(self, job_id: int) -> List[Dict[str, str]]:
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT query_key, first_seen, last_seen FROM job_hits WHERE job_id = ? "
+                "ORDER BY first_seen, query_key",
+                (job_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_query_key_runs(self, days: int = 7) -> List[QueryKeyRuns]:
+        """Per ``query_key`` run counts over the last ``days`` days; skipped boards and keyless runs are left out."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT query_key,
+                       COUNT(*) AS calls,
+                       SUM(CASE WHEN failed = 0 AND outcome = 'ok' THEN 1 ELSE 0 END) AS ok,
+                       SUM(CASE WHEN failed = 0 AND outcome = 'empty' THEN 1 ELSE 0 END) AS empty,
+                       SUM(failed) AS failed,
+                       SUM(new_jobs_saved) AS new_jobs
+                FROM (
+                    SELECT query_key, outcome, new_jobs_saved,
+                           CASE WHEN outcome = 'failed' OR status = 'failed' THEN 1 ELSE 0 END AS failed
+                    FROM scrape_runs
+                    WHERE query_key IS NOT NULL
+                      AND COALESCE(outcome, '') <> 'skipped'
+                      AND datetime(run_time) >= datetime('now', ?)
+                )
+                GROUP BY query_key
+                ORDER BY query_key
+                """,
+                (f"-{int(days)} days",),
+            ).fetchall()
+        return [
+            QueryKeyRuns(r["query_key"], r["calls"], r["ok"], r["empty"], r["failed"], r["new_jobs"])
+            for r in rows
+        ]
+
+    def get_relevant_hits(self, days: int, min_score: float) -> List[Tuple[str, int]]:
+        """``(query_key, job_id)`` of jobs seen in the last ``days`` days that were evaluated at ``min_score`` or more."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT h.query_key, h.job_id
+                FROM job_hits h JOIN jobs j ON j.id = h.job_id
+                WHERE j.eval_status = 'evaluated' AND j.eval_score >= ?
+                  AND datetime(h.last_seen) >= datetime('now', ?)
+                ORDER BY h.query_key, h.job_id
+                """,
+                (min_score, f"-{int(days)} days"),
+            ).fetchall()
+        return [(r["query_key"], r["job_id"]) for r in rows]
+
     def rehash_all(self, dry_run: bool = False) -> Dict[str, int]:
         """Recompute ``dedup_hash`` for every row with the current normalization (idempotent).
 
@@ -503,7 +632,7 @@ class Database:
         pre-filtered (so a legacy stub never beats a full posting), else the oldest (lowest id). The other rows are deleted, EXCEPT further alert-sent rows: those are never deleted;
         they keep a unique filler hash derived from the canonical one ("twins"). Returns counters:
         ``total`` rows scanned, ``rehashed`` rows whose stored hash changed, ``merged`` rows deleted,
-        ``kept_twins`` alert-sent rows kept as twins. With ``dry_run`` nothing is written.
+        ``kept_twins`` alert-sent rows kept as twins. ``job_hits`` of deleted rows move to the keeper. With ``dry_run`` nothing is written.
         """
         alerted = ("instant_sent", "digest_sent")
         with self._get_connection() as conn:
@@ -518,6 +647,7 @@ class Database:
                 ).append(row)
 
             deletions: List[int] = []
+            merged_into: Dict[int, int] = {}
             targets: Dict[int, str] = {}
             twins = 0
             for canonical, members in groups.items():
@@ -536,6 +666,7 @@ class Database:
                         ).hexdigest()
                     else:
                         deletions.append(extra["id"])
+                        merged_into[extra["id"]] = members[0]["id"]
 
             current = {r["id"]: r["dedup_hash"] for r in rows}
             changes = {i: h for i, h in targets.items() if current[i] != h}
@@ -549,6 +680,12 @@ class Database:
                 return stats
 
             for job_id in deletions:
+                # Move the duplicate's per-query hits to the keeper; clashing (job_id, query_key) rows
+                # are ignored here and removed by the delete's ON DELETE CASCADE.
+                conn.execute(
+                    "UPDATE OR IGNORE job_hits SET job_id = ? WHERE job_id = ?",
+                    (merged_into[job_id], job_id),
+                )
                 conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             # Two phases so a new hash can never collide with a not-yet-rewritten old hash (UNIQUE).
             for job_id in changes:
@@ -556,6 +693,116 @@ class Database:
             for job_id, new_hash in changes.items():
                 conn.execute("UPDATE jobs SET dedup_hash = ? WHERE id = ?", (new_hash, job_id))
             return stats
+
+    def get_recent_prefiltered(self, limit: int = 20) -> List[DroppedJob]:
+        """The newest pre-filtered postings, newest first."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, title, company, site, pre_filter_reason, pre_filter_rule, created_at "
+                "FROM jobs WHERE pre_filtered = 1 ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            DroppedJob(
+                id=r["id"], title=r["title"], company=r["company"], site=r["site"],
+                reason=r["pre_filter_reason"], rule_key=r["pre_filter_rule"], created_at=_parse_dt(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    def get_titles_for_backtest(self, limit: int = 5000) -> List[str]:
+        """Titles of the newest stored jobs (non-empty), newest first, for the rule backtest."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT title FROM jobs WHERE title IS NOT NULL AND TRIM(title) != '' ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [r["title"] for r in rows]
+
+    def get_prefiltered_for_requeue(self, max_age_days: int) -> List[JobPosting]:
+        """Pre-filtered rows created within ``max_age_days`` (older ones would expire before any digest)."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE pre_filtered = 1 "
+                "AND datetime(created_at) >= datetime('now', '-' || ? || ' days') ORDER BY id ASC",
+                (max_age_days,),
+            ).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def count_prefiltered_older_than(self, max_age_days: int) -> int:
+        with self._get_connection() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE pre_filtered = 1 "
+                "AND datetime(created_at) < datetime('now', '-' || ? || ' days')",
+                (max_age_days,),
+            ).fetchone()[0]
+
+    def requeue_jobs(self, ids: Sequence[int]) -> int:
+        """Return pre-filtered rows to the evaluation queue (one transaction); their dedup hash is kept."""
+        if not ids:
+            return 0
+        now_str = datetime.now(timezone.utc).isoformat()
+        revived = 0
+        with self._get_connection() as conn:
+            for start in range(0, len(ids), _SQL_CHUNK):
+                chunk = list(ids[start:start + _SQL_CHUNK])
+                marks = ",".join("?" * len(chunk))
+                revived += conn.execute(
+                    f"""UPDATE jobs SET pre_filtered = 0, pre_filter_reason = NULL, pre_filter_rule = NULL,
+                        eval_status = 'unprocessed', notification_status = 'pending', eval_attempts = 0,
+                        updated_at = ?
+                    WHERE id IN ({marks}) AND pre_filtered = 1""",
+                    [now_str, *chunk],
+                ).rowcount
+            conn.commit()
+        return revived
+
+    def get_rebucket_candidates(self, max_age_days: Optional[int] = None) -> List[JobPosting]:
+        """Evaluated rows whose bucket may still change (never alerted rows).
+
+        With ``max_age_days`` only rows created within that window: an older row that became ``pending``
+        would be expired by the next digest before it could be sent.
+        """
+        sql = (
+            "SELECT * FROM jobs WHERE eval_status = 'evaluated' "
+            "AND notification_status IN ('pending', 'dismissed')"
+        )
+        params: tuple = ()
+        if max_age_days is not None:
+            sql += " AND datetime(created_at) >= datetime('now', '-' || ? || ' days')"
+            params = (max_age_days,)
+        with self._get_connection() as conn:
+            rows = conn.execute(sql + " ORDER BY id ASC", params).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def count_rebucket_older_than(self, max_age_days: int) -> int:
+        with self._get_connection() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE eval_status = 'evaluated' "
+                "AND notification_status IN ('pending', 'dismissed') "
+                "AND datetime(created_at) < datetime('now', '-' || ? || ' days')",
+                (max_age_days,),
+            ).fetchone()[0]
+
+    def apply_rebucket(self, changes: Sequence[Tuple[int, float, str]]) -> int:
+        """Write ``(id, score, notification_status)`` changes in one transaction; returns rows updated.
+
+        ``eval_is_wow`` is cleared (a re-bucketed row never sends an instant alert) and the status guard in
+        the ``WHERE`` keeps rows that were alerted or expired meanwhile untouched.
+        """
+        if not changes:
+            return 0
+        now_str = datetime.now(timezone.utc).isoformat()
+        updated = 0
+        with self._get_connection() as conn:
+            for job_id, score, status in changes:
+                updated += conn.execute(
+                    """UPDATE jobs SET eval_score = ?, notification_status = ?, eval_is_wow = 0, updated_at = ?
+                    WHERE id = ? AND eval_status = 'evaluated' AND notification_status IN ('pending', 'dismissed')""",
+                    (score, status, now_str, job_id),
+                ).rowcount
+            conn.commit()
+        return updated
 
     def get_stats(self, pending_threshold: float = 6.0) -> Dict[str, int]:
         with self._get_connection() as conn:
@@ -598,6 +845,7 @@ class Database:
             is_remote=bool(row["is_remote"]),
             pre_filtered=bool(row["pre_filtered"]),
             pre_filter_reason=row["pre_filter_reason"],
+            pre_filter_rule=row["pre_filter_rule"],
             eval_status=row["eval_status"],
             eval_score=row["eval_score"],
             eval_is_wow=bool(row["eval_is_wow"]),
@@ -610,6 +858,12 @@ class Database:
             evaluated_at=_parse_dt(row["evaluated_at"]),
             eval_model=row["eval_model"],
             eval_attempts=row["eval_attempts"] or 0,
+            eval_raw_score=row["eval_raw_score"],
+            eval_is_core_role=_opt_bool(row["eval_is_core_role"]),
+            eval_bonus_flag=_opt_bool(row["eval_bonus_flag"]),
+            eval_hard_reject=_opt_bool(row["eval_hard_reject"]),
+            source_query=row["source_query"],
+            remote_status=row["remote_status"] or "unverified",
             notification_status=row["notification_status"],
             instant_sent_at=_parse_dt(row["instant_sent_at"]),
             digest_sent_at=_parse_dt(row["digest_sent_at"]),

@@ -7,7 +7,7 @@ bakeoff = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bakeoff)
 
 VALID = (
-    '{"score": 1.5, "summary_uk": "Коротке резюме вакансії.", "reasoning": "r", '
+    '{"score": 1.5, "summary": "Коротке резюме вакансії.", "reasoning": "r", '
     '"language_requirements": [], "pros": [], "cons": [], "hard_reject": true}'
 )
 

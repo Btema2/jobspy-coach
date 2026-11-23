@@ -3,8 +3,12 @@ import time
 
 import pytest
 
-from src.evaluator.errors import StopRequested
-from src.evaluator.rate_limiter import BOUNDARY_MARGIN_SECONDS, SlidingWindowRateLimiter
+from src.evaluator.errors import RateLimited, RateLimitWaitExceeded, StopRequested
+from src.evaluator.rate_limiter import (
+    BOUNDARY_MARGIN_SECONDS,
+    PRIORITY_YIELD_SECONDS,
+    SlidingWindowRateLimiter,
+)
 
 
 class FakeClock:
@@ -219,3 +223,174 @@ def test_default_waits_use_stop_event_not_sleep(monkeypatch):
     limiter = SlidingWindowRateLimiter(1, period=0.05)
     limiter.acquire()
     limiter.acquire()  # waits ~50 ms via Event.wait
+
+
+# ---------- priority and per-call stop event (chat path) ----------
+
+def test_acquire_without_arguments_unchanged():
+    limiter, clock = make(max_calls=2, period=10.0)
+    limiter.acquire()
+    limiter.acquire()
+    limiter.acquire()
+    assert clock.waits == [pytest.approx(10.0 + BOUNDARY_MARGIN_SECONDS)]
+    assert limiter.priority_waiters == 0
+
+
+class Gates:
+    """Per-thread blocking ``wait_fn``: a thread in ``wait`` stays blocked until the test releases it."""
+
+    def __init__(self):
+        self._sems = {}
+        self._lock = threading.Lock()
+        self.waits = {}
+
+    def _sem(self, name):
+        with self._lock:
+            return self._sems.setdefault(name, threading.Semaphore(0))
+
+    def wait(self, seconds):
+        name = threading.current_thread().name
+        with self._lock:
+            self.waits.setdefault(name, []).append(seconds)
+        self._sem(name).acquire(timeout=5)
+        return False
+
+    def release(self, name):
+        self._sem(name).release()
+
+    def wait_until_waiting(self, name, count=1):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self._lock:
+                if len(self.waits.get(name, [])) >= count:
+                    return
+            time.sleep(0.005)
+        raise AssertionError(f"{name} never started waiting")
+
+
+def test_priority_acquire_beats_saturated_batch():
+    clock = FakeClock()
+    gates = Gates()
+    limiter = SlidingWindowRateLimiter(2, 10.0, time_fn=clock, wait_fn=gates.wait)
+    limiter.acquire()  # stamp at 1000
+    clock.now = 1005.0
+    limiter.acquire()  # stamp at 1005; the window is now full
+    clock.now = 1006.0
+    order = []
+    order_lock = threading.Lock()
+
+    def run(priority):
+        stamp = limiter.acquire(priority=priority)
+        with order_lock:
+            order.append(("priority" if priority else "batch", stamp))
+
+    batch = threading.Thread(target=run, args=(False,), name="batch", daemon=True)
+    batch.start()
+    gates.wait_until_waiting("batch")
+    chat = threading.Thread(target=run, args=(True,), name="chat", daemon=True)
+    chat.start()
+    gates.wait_until_waiting("chat")
+    assert limiter.priority_waiters == 1
+
+    clock.now = 1010.1  # the oldest stamp has aged out: exactly one slot is free
+    gates.release("batch")  # the batch caller wakes first, while the priority caller is still registered
+    gates.wait_until_waiting("batch", count=2)
+    assert gates.waits["batch"][1] >= PRIORITY_YIELD_SECONDS  # it yielded instead of taking the free slot
+    assert order == []
+    assert limiter.priority_waiters == 1
+
+    gates.release("chat")  # the priority caller takes the free slot
+    chat.join(timeout=5)
+    assert not chat.is_alive()
+    assert [name for name, _ in order] == ["priority"]
+
+    clock.now = 1015.2  # the second stamp ages out: the following slot goes to the batch caller
+    gates.release("batch")
+    batch.join(timeout=5)
+    assert not batch.is_alive()
+    assert [name for name, _ in order] == ["priority", "batch"]
+    assert order[0][1] == pytest.approx(1010.1)
+    assert order[1][1] == pytest.approx(1015.2)
+    assert limiter.priority_waiters == 0
+
+
+def test_batch_yields_while_priority_waits():
+    clock = FakeClock()
+    limiter = SlidingWindowRateLimiter(5, 60.0, time_fn=clock)
+
+    def waiting(seconds):
+        clock.waits.append(seconds)
+        clock.now += seconds
+        with limiter._lock:
+            limiter._priority_waiters = 0  # the priority caller finished while the batch caller waited
+        return False
+
+    limiter._wait = waiting
+    with limiter._lock:
+        limiter._priority_waiters = 1  # simulate a blocked priority caller; the slot itself is free
+    assert limiter.priority_waiters == 1
+    limiter.acquire()
+    assert clock.waits and clock.waits[0] >= PRIORITY_YIELD_SECONDS
+
+
+def test_priority_waiters_restored_after_stop():
+    stop = threading.Event()
+    stop.set()
+    limiter, _ = make(max_calls=1, stop_event=stop)
+    with pytest.raises(StopRequested):
+        limiter.acquire(priority=True)
+    assert limiter.priority_waiters == 0
+
+
+def test_per_call_stop_event_independent_of_limiter_event():
+    limiter_stop = threading.Event()
+    limiter_stop.set()
+    limiter = SlidingWindowRateLimiter(1, 3600.0, stop_event=limiter_stop)
+    with pytest.raises(StopRequested):
+        limiter.acquire()
+    clear = threading.Event()
+    limiter.acquire(stop_event=clear)  # the batch event is set but this caller's own event is not
+    outcome = {}
+
+    def waiter():
+        try:
+            limiter.acquire(stop_event=clear)
+        except StopRequested:
+            outcome["stopped"] = True
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    time.sleep(0.02)
+    clear.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert outcome == {"stopped": True}
+
+
+def test_max_wait_raises_rate_limit_wait_exceeded():
+    limiter, clock = make(max_calls=1, period=50.0)
+    limiter.acquire()
+    with pytest.raises(RateLimitWaitExceeded) as exc_info:
+        limiter.acquire(max_wait=30.0)
+    assert isinstance(exc_info.value, RateLimited)
+    assert exc_info.value.retry_after is None
+    assert clock.waits == []  # no wait that would cross the limit was started
+
+
+def test_max_wait_allows_a_wait_inside_the_limit():
+    limiter, clock = make(max_calls=1, period=10.0)
+    limiter.acquire()
+    limiter.acquire(max_wait=30.0)
+    assert len(clock.waits) == 1
+
+
+def test_pause_for_applies_to_priority_callers():
+    limiter, clock = make(max_calls=5)
+    limiter.pause_for(15.0)
+    start = clock.now
+    limiter.acquire(priority=True)
+    assert clock.now - start == pytest.approx(15.0)
+    limiter.pause_for(40.0)
+    with pytest.raises(RateLimitWaitExceeded):
+        limiter.acquire(priority=True, max_wait=30.0)
+    assert limiter.priority_waiters == 0

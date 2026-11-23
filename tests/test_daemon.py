@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock
-from src.scheduler.daemon import DaemonService
+from src.scheduler.daemon import DaemonService, EvalSummary
 from src.storage.models import JobPosting
 from src.scraper.query_catalog import SearchQuery
 
@@ -27,7 +27,7 @@ def test_daemon_pipeline_cycle(monkeypatch, tmp_path):
     mock_eval_result = MagicMock()
     mock_eval_result.score = 9.5
     mock_eval_result.is_wow = True
-    mock_eval_result.summary_uk = "Чудова роль executive коуча."
+    mock_eval_result.summary = "Чудова роль executive коуча."
     mock_eval_result.reasoning = "Top fit"
     mock_eval_result.language_requirements = ["English"]
     mock_eval_result.pros = []
@@ -88,7 +88,7 @@ def test_daemon_evaluate_transient_error_leaves_unprocessed(tmp_path):
     job_id, _ = daemon.db.save_job(job)
 
     # Evaluate unprocessed
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10).as_tuple()
     assert evaluated_count == 0
     assert wow_sent == 0
 
@@ -147,7 +147,7 @@ def test_daemon_evaluate_permanent_failure_marks_failed(tmp_path):
     )
     daemon.db.save_job(job)
 
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10).as_tuple()
     assert evaluated_count == 0
     assert wow_sent == 0
 
@@ -286,7 +286,7 @@ def test_daemon_evaluate_unprocessed_dry_run(tmp_path):
     )
     daemon.db.save_job(job)
 
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10, dry_run=True)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10, dry_run=True).as_tuple()
     assert evaluated_count == 1
     assert wow_sent == 1
     assert not mock_notifier.send_wow_alert.called
@@ -338,8 +338,8 @@ def test_daemon_start_lifecycle_and_shutdown(monkeypatch, tmp_path):
     monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", MagicMock(return_value=None))
 
     daemon = DaemonService(db_path=tmp_path / "daemon_start.db")
-    mock_run = MagicMock(return_value=(0, 0))
-    daemon.run_pipeline_cycle = mock_run
+    mock_run = MagicMock(return_value=None)
+    daemon.run_pipeline_cycle_report = mock_run
 
     handlers = {}
 
@@ -400,7 +400,7 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     eval_low = MagicMock()
     eval_low.score = 4.5
     eval_low.is_wow = False
-    eval_low.summary_uk = "Low match"
+    eval_low.summary = "Low match"
     eval_low.reasoning = "Not relevant"
     eval_low.language_requirements = []
     eval_low.pros = []
@@ -412,7 +412,7 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     eval_high = MagicMock()
     eval_high.score = 7.5
     eval_high.is_wow = False
-    eval_high.summary_uk = "High match"
+    eval_high.summary = "High match"
     eval_high.reasoning = "Good fit"
     eval_high.language_requirements = []
     eval_high.pros = []
@@ -448,7 +448,7 @@ def test_daemon_evaluate_unprocessed_immediate_dismissal(tmp_path):
     daemon.db.save_job(job_low)
     daemon.db.save_job(job_high)
 
-    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10)
+    evaluated_count, wow_sent = daemon.evaluate_unprocessed(limit=10).as_tuple()
     assert evaluated_count == 2
     assert wow_sent == 0
 
@@ -565,7 +565,7 @@ def test_daemon_start_logs_update_notice(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr("src.scheduler.daemon.check_jobspy_update", mock_check)
 
     daemon = DaemonService(db_path=tmp_path / "daemon_start_log.db")
-    daemon.run_pipeline_cycle = MagicMock(return_value=(0, 0))
+    daemon.run_pipeline_cycle_report = MagicMock(return_value=None)
 
     with caplog.at_level(logging.INFO):
         daemon.start()
@@ -574,3 +574,216 @@ def test_daemon_start_logs_update_notice(monkeypatch, tmp_path, caplog):
 
 
 
+
+
+# --- Task 9: truthful scrape outcomes and per-query job hits -------------------------------------
+
+from src.scraper.outcome import ScrapeOutcome
+from src.scraper.query_catalog import query_key
+
+_LONG_DESC = (
+    "A corporate leadership coaching opportunity with senior executives to develop organizational "
+    "strategy and drive executive performance in high-growth companies across many global markets."
+)
+
+
+def _posting(hash_: str, source_query=None) -> JobPosting:
+    return JobPosting(
+        dedup_hash=hash_,
+        site="indeed",
+        job_url=f"https://indeed.com/{hash_}",
+        title="Executive Coach",
+        company="Global Leadership",
+        location="Remote",
+        description=_LONG_DESC,
+        is_remote=True,
+        source_query=source_query,
+    )
+
+
+class _OutcomeScraper:
+    """Test double exposing only scrape_board_outcome, returning queued outcomes in call order."""
+
+    def __init__(self, *outcomes):
+        self._outcomes = list(outcomes)
+
+    def scrape_board_outcome(self, site, query):
+        return self._outcomes.pop(0)
+
+
+def _query(query_id="Q-OUT", site="indeed"):
+    return SearchQuery(query_id=query_id, search_term="Executive Coach", location="Remote", site_names=[site])
+
+
+def _daemon(tmp_path, scraper):
+    """Daemon whose evaluation step is stubbed out: these tests only exercise scrape recording."""
+    daemon = DaemonService(db_path=tmp_path / "d.db", scraper=scraper, evaluator=MagicMock())
+    daemon.evaluate_unprocessed = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
+    return daemon
+
+
+def _runs(daemon):
+    with daemon.db._get_connection() as conn:
+        return conn.execute("SELECT * FROM scrape_runs ORDER BY id").fetchall()
+
+
+def test_cycle_records_failed_outcome_from_blocked_board(tmp_path):
+    scraper = _OutcomeScraper(ScrapeOutcome(postings=[], rows=0, status="failed", error="blocked"))
+    daemon = _daemon(tmp_path, scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    runs = _runs(daemon)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert runs[0]["outcome"] == "failed"
+    assert runs[0]["error_message"] == "blocked"
+    assert runs[0]["query_key"] == "Q-OUT|indeed"
+
+
+def test_cycle_records_empty_outcome_as_completed(tmp_path):
+    scraper = _OutcomeScraper(ScrapeOutcome(postings=[], rows=0, status="empty"))
+    daemon = _daemon(tmp_path, scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    runs = _runs(daemon)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["outcome"] == "empty"
+    assert runs[0]["rows_returned"] == 0
+    assert runs[0]["error_message"] is None
+
+
+def test_cycle_records_skipped_outcome_as_completed(tmp_path):
+    scraper = _OutcomeScraper(
+        ScrapeOutcome(postings=[], rows=0, status="skipped", skip_reason="no_country")
+    )
+    daemon = _daemon(tmp_path, scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    runs = _runs(daemon)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["outcome"] == "skipped"
+
+
+def test_cycle_records_rows_and_prefiltered_from_outcome(tmp_path):
+    scraper = _OutcomeScraper(
+        ScrapeOutcome(postings=[_posting("h-rows")], rows=7, status="ok", prefiltered=3)
+    )
+    daemon = _daemon(tmp_path, scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    runs = _runs(daemon)
+    assert runs[0]["outcome"] == "ok"
+    assert runs[0]["rows_returned"] == 7
+    assert runs[0]["prefiltered"] == 3
+    assert runs[0]["jobs_found"] == 1
+    assert runs[0]["new_jobs_saved"] == 1
+
+
+def test_same_job_from_two_queries_gets_two_hits_and_first_source(tmp_path):
+    q1, q2 = _query("Q-ONE"), _query("Q-TWO")
+    k1, k2 = query_key(q1, "indeed"), query_key(q2, "indeed")
+    scraper = _OutcomeScraper(
+        ScrapeOutcome(postings=[_posting("h-same", source_query=k1)], rows=1, status="ok"),
+        ScrapeOutcome(postings=[_posting("h-same", source_query=k2)], rows=1, status="ok"),
+    )
+    daemon = _daemon(tmp_path, scraper)
+    new_jobs, _ = daemon.run_pipeline_cycle(queries=[q1, q2], dry_run=False)
+    assert new_jobs == 1
+    with daemon.db._get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    job = daemon.db.get_job_by_hash("h-same")
+    assert job.source_query == k1
+    hits = daemon.db.get_job_hits(job.id)
+    assert {h["query_key"] for h in hits} == {k1, k2}
+    runs = _runs(daemon)
+    assert [r["new_jobs_saved"] for r in runs] == [1, 0]
+
+
+def test_cycle_works_with_double_lacking_scrape_board_outcome(tmp_path):
+    class LegacyScraper:
+        def scrape_board(self, site, query):
+            return [_posting("h-legacy")]
+
+    daemon = _daemon(tmp_path, LegacyScraper())
+    new_jobs, _ = daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    assert new_jobs == 1
+    runs = _runs(daemon)
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["outcome"] == "ok"
+    assert runs[0]["rows_returned"] == 1
+    job = daemon.db.get_job_by_hash("h-legacy")
+    assert [h["query_key"] for h in daemon.db.get_job_hits(job.id)] == ["Q-OUT|indeed"]
+
+
+def test_cycle_works_with_magicmock_scraper(tmp_path):
+    mock_scraper = MagicMock()
+    mock_scraper.scrape_board.return_value = [_posting("h-mm")]
+    daemon = _daemon(tmp_path, mock_scraper)
+    new_jobs, _ = daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    assert new_jobs == 1
+    assert _runs(daemon)[0]["outcome"] == "ok"
+
+
+def test_dry_run_writes_no_hits_or_runs(tmp_path):
+    scraper = _OutcomeScraper(ScrapeOutcome(postings=[_posting("h-dry")], rows=1, status="ok"))
+    daemon = DaemonService(db_path=tmp_path / "d.db", scraper=scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=True)
+    with daemon.db._get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM scrape_runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM job_hits").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_exception_path_records_failed_outcome_and_query_key(tmp_path):
+    mock_scraper = MagicMock()
+    mock_scraper.scrape_board.side_effect = RuntimeError("boom")
+    daemon = DaemonService(db_path=tmp_path / "d.db", scraper=mock_scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    runs = _runs(daemon)
+    assert runs[0]["status"] == "failed"
+    assert runs[0]["outcome"] == "failed"
+    assert runs[0]["query_key"] == "Q-OUT|indeed"
+
+
+def test_outcome_error_with_proxy_url_is_redacted_before_storing(tmp_path):
+    err = "ProxyError: cannot connect to http://scrapeuser:s3cretpw@proxy.example.com:8080 " + "x" * 500
+    scraper = _OutcomeScraper(ScrapeOutcome(postings=[], rows=0, status="failed", error=err))
+    daemon = _daemon(tmp_path, scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    stored = _runs(daemon)[0]["error_message"]
+    assert "s3cretpw" not in stored
+    assert "scrapeuser" not in stored
+    assert "proxy.example.com" in stored
+    assert len(stored) <= 300
+
+
+def test_exception_message_with_proxy_url_is_redacted_before_storing(tmp_path):
+    mock_scraper = MagicMock()
+    mock_scraper.scrape_board.side_effect = RuntimeError(
+        "tunnel failed via socks5://scrapeuser:s3cretpw@proxy.example.com:1080"
+    )
+    daemon = DaemonService(db_path=tmp_path / "d.db", scraper=mock_scraper)
+    daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    stored = _runs(daemon)[0]["error_message"]
+    assert "s3cretpw" not in stored
+    assert "scrapeuser" not in stored
+    assert "tunnel failed" in stored
+
+
+def test_exception_log_keeps_full_redacted_text_while_stored_value_is_truncated(tmp_path, caplog):
+    import logging
+
+    tail = "DIAGNOSTIC-TAIL-MARKER"
+    mock_scraper = MagicMock()
+    mock_scraper.scrape_board.side_effect = RuntimeError(
+        "tunnel failed via socks5://scrapeuser:s3cretpw@proxy.example.com:1080 " + "x" * 400 + " " + tail
+    )
+    daemon = DaemonService(db_path=tmp_path / "d.db", scraper=mock_scraper)
+    with caplog.at_level(logging.ERROR):
+        daemon.run_pipeline_cycle(queries=[_query()], dry_run=False)
+    assert "Failed scrape cycle" in caplog.text
+    assert tail in caplog.text
+    assert "s3cretpw" not in caplog.text
+    assert "scrapeuser" not in caplog.text
+    stored = _runs(daemon)[0]["error_message"]
+    assert len(stored) <= 300
+    assert tail not in stored
+    assert "s3cretpw" not in stored

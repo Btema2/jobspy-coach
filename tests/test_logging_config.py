@@ -167,3 +167,11 @@ def test_redact_secrets_whole_authorization_value(header):
     for leaked in ("dXNlcjpwYXNzd29yZA", "sk-fake-1234567890abcdef", "abc123secretvalue", "rawsecretvalue99"):
         assert leaked not in out
     assert "<redacted>" in out
+
+
+def test_redact_secrets_masks_url_credentials_but_keeps_host():
+    text = "proxy http://user:p%40ss@proxy.example.com:8080 and socks5://tok@h.example:1080/x failed"
+    out = redact_secrets(text)
+    assert "p%40ss" not in out and "user:" not in out and "tok@" not in out
+    assert "proxy.example.com:8080" in out and "h.example:1080/x" in out
+    assert redact_secrets("see https://example.com/a@b") == "see https://example.com/a@b"

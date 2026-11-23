@@ -51,6 +51,7 @@ cover/
 
 # Environments
 .env
+.env.lock
 .venv
 .venv/
 env/
@@ -67,6 +68,7 @@ config/candidate_profile.*
 config/custom_*
 config/queries.json
 queries.json
+profile-export*.yaml
 local/
 
 # SQLite / Databases

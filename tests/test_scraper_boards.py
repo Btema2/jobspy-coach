@@ -1,5 +1,4 @@
 """Per-board kwargs passed to python-jobspy (no network: scrape_jobs is monkeypatched)."""
-import json
 import logging
 from unittest.mock import MagicMock
 
@@ -7,7 +6,7 @@ import pandas as pd
 import pytest
 
 from src.scraper.jobspy_scraper import JobSpyScraper, build_google_search_term
-from src.scraper.query_catalog import SearchQuery, load_custom_queries
+from src.scraper.query_catalog import SearchQuery
 
 
 @pytest.fixture
@@ -195,32 +194,54 @@ def test_other_boards_hours_old_unchanged(mock_scrape, board):
     assert mock_scrape.call_args.kwargs["hours_old"] == 48
 
 
-# ---------------------------------------------------------------- loader
+# ---------------------------------------------------------------- remote status / attribution
 
 
-def test_loader_reads_optional_google_search_term(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "queries.json").write_text(
-        json.dumps(
-            [
-                {"query_id": "A", "search_term": "t", "location": "l", "site_names": ["google"],
-                 "google_search_term": "override"},
-                {"query_id": "B", "search_term": "t", "location": "l", "site_names": ["google"]},
-            ]
-        ),
-        encoding="utf-8",
-    )
-    a, b = load_custom_queries()
-    assert a.google_search_term == "override"
-    assert b.google_search_term is None
+def _row_frame(**over):
+    row = {
+        "title": "Career Coach",
+        "job_url": "https://example.com/job/1",
+        "company": "Acme",
+        "location": "Testland",
+        "description": "word " * 80,
+        "is_remote": True,
+    }
+    row.update(over)
+    return pd.DataFrame([row])
 
 
-def test_example_queries_json_is_loadable_and_generic(tmp_path, monkeypatch):
-    from pathlib import Path
+def _convert(df, query=None, site="indeed"):
+    postings, _ = _scraper()._rows_to_postings(df, site, query or _query())
+    assert len(postings) == 1
+    return postings[0]
 
-    src = Path(__file__).resolve().parent.parent / "queries.example.json"
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "queries.json").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    qs = load_custom_queries()
-    assert qs and all(q.query_id and q.search_term for q in qs)
-    assert any(q.google_search_term for q in qs)
+
+def test_remote_true_is_verified():
+    p = _convert(_row_frame(is_remote=True))
+    assert p.is_remote is True
+    assert p.remote_status == "verified"
+
+
+def test_remote_false_is_unverified_and_kept():
+    p = _convert(_row_frame(is_remote=False), _query(is_remote=True))
+    assert p.is_remote is False
+    assert p.remote_status == "unverified"
+
+
+@pytest.mark.parametrize("missing", [float("nan"), None])
+def test_missing_remote_value_does_not_use_query_flag(missing):
+    p = _convert(_row_frame(is_remote=missing), _query(is_remote=True))
+    assert p.is_remote is False
+    assert p.remote_status == "unverified"
+
+
+def test_missing_remote_column_does_not_use_query_flag():
+    df = _row_frame().drop(columns=["is_remote"])
+    p = _convert(df, _query(is_remote=True))
+    assert p.is_remote is False
+    assert p.remote_status == "unverified"
+
+
+def test_postings_carry_source_query():
+    p = _convert(_row_frame(), _query(query_id="Q-X"), site="LinkedIn")
+    assert p.source_query == "Q-X|linkedin"

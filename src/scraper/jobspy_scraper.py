@@ -2,14 +2,23 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import jobspy
 import pandas as pd
 
 from src.filters.pre_filter import classify_title, pre_filter_job
-from src.scraper.query_catalog import DEFAULT_QUERY_CATALOG, SearchQuery, get_active_queries
+from src.filters.rules import CompiledRule
+from src.scraper.coordinator import ScrapeCoordinator
+from src.scraper.outcome import (
+    STATUS_EMPTY,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_SKIPPED,
+    ScrapeOutcome,
+)
+from src.scraper.query_catalog import SearchQuery, query_key
 from src.storage.db import compute_dedup_hash
 from src.storage.models import JobPosting
 
@@ -145,6 +154,7 @@ class JobSpyScraper:
         proxies: Optional[List[str]] = None,
         linkedin_cooldown_seconds: float = 12.0,
         fetch_description: bool = True,
+        coordinator: Optional[ScrapeCoordinator] = None,
     ):
         self.jitter_min = jitter_min
         self.jitter_max = jitter_max
@@ -153,14 +163,31 @@ class JobSpyScraper:
         self.apply_prefilter = apply_prefilter
         self.enabled_boards = enabled_boards
         self.proxies = proxies
-        self.linkedin_cooldown_seconds = linkedin_cooldown_seconds
-        self.last_linkedin_call_time = 0.0
+        self._coordinator = coordinator or ScrapeCoordinator(linkedin_cooldown_seconds)
         self.fetch_description = fetch_description
         self._logged_skips: set = set()
         self._logged_board_errors: set = set()
         self._cycle: Optional[_Cycle] = None
 
-    def _build_scrape_kwargs(self, site_name: str, query: SearchQuery) -> dict:
+    @property
+    def linkedin_cooldown_seconds(self) -> float:
+        return self._coordinator.linkedin_cooldown_seconds
+
+    @linkedin_cooldown_seconds.setter
+    def linkedin_cooldown_seconds(self, value: float) -> None:
+        self._coordinator.linkedin_cooldown_seconds = value
+
+    @property
+    def last_linkedin_call_time(self) -> float:
+        return self._coordinator.last_linkedin_call_time
+
+    @last_linkedin_call_time.setter
+    def last_linkedin_call_time(self, value: float) -> None:
+        self._coordinator.last_linkedin_call_time = value
+
+    def _build_scrape_kwargs(
+        self, site_name: str, query: SearchQuery, results_wanted: Optional[int] = None
+    ) -> dict:
         board = site_name.lower()
         search_term = query.search_term
         hours_old = self.hours_old
@@ -175,7 +202,7 @@ class JobSpyScraper:
             "site_name": [site_name],
             "search_term": search_term,
             "location": query.location,
-            "results_wanted": self.results_per_query,
+            "results_wanted": self.results_per_query if results_wanted is None else results_wanted,
             "hours_old": hours_old,
             "is_remote": query.is_remote,
             "proxies": self.proxies,
@@ -258,11 +285,15 @@ class JobSpyScraper:
             site_name, n_queries, "y" if n_queries == 1 else "ies", query.query_id, query.location, site_name,
         )
 
-    def end_cycle(self) -> None:
-        """Logs per-board totals for the cycle and stops progress tracking."""
+    def end_cycle(self) -> int:
+        """Logs per-board totals for the cycle and stops progress tracking.
+
+        Returns how many distinct boards the cycle skipped for a missing country (0 without a cycle; the
+        per-query counts stay in the summary log); disabled boards are deliberate and not counted.
+        """
         cycle, self._cycle = self._cycle, None
         if cycle is None:
-            return
+            return 0
         parts = []
         for board, t in cycle.totals.items():
             part = f"{board}: {t.calls} calls, {t.rows} rows, {t.kept} kept, {t.prefiltered} pre-filtered"
@@ -277,6 +308,7 @@ class JobSpyScraper:
                 f"{board} (no country_code) x{n}" for (board, _), n in cycle.skipped.items()
             )
         logger.info("Scrape summary (%d calls, %.0fs): %s", cycle.total, time.time() - cycle.started, summary)
+        return len(cycle.skipped)  # keys are (board, "no_country"): one per board
 
     def _call_prefix(self) -> str:
         c = self._cycle
@@ -285,50 +317,80 @@ class JobSpyScraper:
     def _totals(self, board: str) -> Optional[_BoardTotals]:
         return self._cycle.totals.setdefault(board, _BoardTotals()) if self._cycle else None
 
+    @staticmethod
+    def _board_error(df: Optional[pd.DataFrame], board: str) -> Optional[str]:
+        """The error python-jobspy recorded for ``board`` in ``df.attrs["errors"]``, if any. Keys may be
+        enum-like (``Site.LINKEDIN``), so they are normalised to the lowercase board name."""
+        if not isinstance(df, pd.DataFrame):
+            return None
+        errors = df.attrs.get("errors") or {}
+        for key, err in errors.items():
+            if str(getattr(key, "value", key)).lower() == board and err:
+                return str(err)
+        return None
+
     def scrape_board(self, site_name: str, query: SearchQuery) -> List[JobPosting]:
+        return self.scrape_board_outcome(site_name, query).postings
+
+    def scrape_board_outcome(
+        self,
+        site_name: str,
+        query: SearchQuery,
+        *,
+        track_cycle: bool = True,
+        rules: Optional[Sequence[CompiledRule]] = None,
+        results_wanted: Optional[int] = None,
+    ) -> ScrapeOutcome:
+        """Scrapes one (query, board).
+
+        ``track_cycle=True`` advances the cycle's ``[i/N]`` counter and totals; ``track_cycle=False`` (e.g. an
+        on-demand search interleaved with a running cycle) leaves them untouched and omits the prefix. The
+        ``[i/N]`` line is logged before the coordinator lock is taken, so it can precede a wait for LinkedIn
+        pacing. ``rules`` (compiled profile rules, ``None`` = the legacy seed) drive the title pre-filter and
+        the LinkedIn empty-description check; a dropped posting carries the key of the rule that dropped it.
+        ``results_wanted`` overrides ``results_per_query`` for this call (the bot's ``/test`` asks for few rows).
+        """
         board = site_name.lower()
         reason = self.board_skip_reason(site_name, query)
         if reason == "disabled":
             logger.debug("Skipping board '%s' as it is not in enabled_boards", site_name)
-            return []
+            return ScrapeOutcome(postings=[], rows=0, status=STATUS_SKIPPED, skip_reason="disabled")
         if reason == "no_country":
             self._warn_missing_country_once(site_name, query, 1)
-            return []
+            return ScrapeOutcome(postings=[], rows=0, status=STATUS_SKIPPED, skip_reason="no_country")
 
         # Every real request is logged here (not in a caller) so that the CLI `scrape`, the daemon and
         # scrape_query/scrape_all_queries, which all end up in scrape_board, show the same progress.
-        if self._cycle:
+        tracked = track_cycle and self._cycle is not None
+        if tracked:
             self._cycle.index += 1
-        prefix = self._call_prefix()
+        prefix = self._call_prefix() if tracked else ""
         logger.info('%s%s %s "%s" %s', prefix, query.query_id, site_name, query.search_term, query.location)
-        totals = self._totals(board)
+        totals = self._totals(board) if tracked else None
 
-        if board == "linkedin":
-            elapsed = time.time() - self.last_linkedin_call_time
-            if elapsed < self.linkedin_cooldown_seconds:
-                time.sleep(self.linkedin_cooldown_seconds - elapsed)
-            self.last_linkedin_call_time = time.time()
-
-        t0 = time.time()
-        df: Optional[pd.DataFrame] = None
-        failed = False
-        for attempt in range(1, 4):
-            try:
-                df = scrape_jobs(**self._build_scrape_kwargs(site_name, query))
-                break
-            except Exception as e:
-                if attempt < 3:
-                    backoff = (2 ** attempt) * 3
-                    logger.warning(
-                        f"Attempt {attempt}/3 failed scraping '{site_name}' for query '{query.query_id}': {e}. "
-                        f"Retrying in {backoff}s..."
-                    )
-                    time.sleep(backoff)
-                else:
-                    logger.warning(
-                        f"Error scraping board '{site_name}' for query '{query.query_id}' after 3 attempts: {e}"
-                    )
-                    failed = True
+        with self._coordinator.call(board):
+            t0 = time.time()
+            df: Optional[pd.DataFrame] = None
+            failed = False
+            last_error: Optional[str] = None
+            for attempt in range(1, 4):
+                try:
+                    df = scrape_jobs(**self._build_scrape_kwargs(site_name, query, results_wanted))
+                    break
+                except Exception as e:
+                    last_error = str(e) or type(e).__name__
+                    if attempt < 3:
+                        backoff = (2 ** attempt) * 3
+                        logger.warning(
+                            f"Attempt {attempt}/3 failed scraping '{site_name}' for query '{query.query_id}': {e}. "
+                            f"Retrying in {backoff}s..."
+                        )
+                        time.sleep(backoff)
+                    else:
+                        logger.warning(
+                            f"Error scraping board '{site_name}' for query '{query.query_id}' after 3 attempts: {e}"
+                        )
+                        failed = True
 
         if failed:
             seconds = time.time() - t0
@@ -337,7 +399,7 @@ class JobSpyScraper:
                 totals.calls += 1
                 totals.failed += 1
                 totals.seconds += seconds
-            return []
+            return ScrapeOutcome(postings=[], rows=0, status=STATUS_FAILED, error=last_error)
 
         if isinstance(df, pd.DataFrame):
             self._warn_board_errors_once(df)
@@ -346,7 +408,7 @@ class JobSpyScraper:
         postings: List[JobPosting] = []
         skipped_empty = 0
         if df is not None and not df.empty:
-            postings, skipped_empty = self._rows_to_postings(df, site_name, query)
+            postings, skipped_empty = self._rows_to_postings(df, site_name, query, rules)
 
         seconds = time.time() - t0
         prefiltered = sum(1 for p in postings if p.pre_filtered)
@@ -371,10 +433,29 @@ class JobSpyScraper:
             totals.prefiltered += prefiltered
             totals.skipped_empty += skipped_empty
             totals.seconds += seconds
-        return postings
+
+        board_error = self._board_error(df, board)
+        if board_error and rows == 0:
+            status = STATUS_FAILED
+        elif rows == 0:
+            status = STATUS_EMPTY
+        else:
+            status = STATUS_OK
+        return ScrapeOutcome(
+            postings=postings,
+            rows=rows,
+            status=status,
+            error=board_error,
+            prefiltered=prefiltered,
+            skipped_empty=skipped_empty,
+        )
 
     def _rows_to_postings(
-        self, df: pd.DataFrame, site_name: str, query: SearchQuery
+        self,
+        df: pd.DataFrame,
+        site_name: str,
+        query: SearchQuery,
+        rules: Optional[Sequence[CompiledRule]] = None,
     ) -> Tuple[List[JobPosting], int]:
         """Converts a python-jobspy frame to postings; returns them plus the count of LinkedIn rows skipped
         because their description is empty."""
@@ -406,7 +487,7 @@ class JobSpyScraper:
                 board == "linkedin"
                 and self.fetch_description
                 and not desc
-                and not (self.apply_prefilter and classify_title(title))
+                and not (self.apply_prefilter and classify_title(title, rules))
             ):
                 skipped_empty += 1
                 continue
@@ -414,23 +495,28 @@ class JobSpyScraper:
             dedup_hash = compute_dedup_hash(company, title, location)
 
             if self.apply_prefilter:
-                pf_res = pre_filter_job(title, desc)
+                pf_res = pre_filter_job(title, desc, rules)
                 is_prefiltered = not pf_res.passed
                 pre_filter_reason = pf_res.reason if is_prefiltered else None
+                pre_filter_rule = pf_res.rule_key if is_prefiltered else None
                 notification_status = "dismissed" if is_prefiltered else "pending"
             else:
                 is_prefiltered = False
                 pre_filter_reason = None
+                pre_filter_rule = None
                 notification_status = "pending"
 
             raw_direct_url = _clean_str(row.get("job_url_direct"))
             job_url_direct = clean_job_url(raw_direct_url) if raw_direct_url else None
 
+            # The board's own flag is positive-only evidence: True is verified remote; False or a missing
+            # value is merely unverified. The query's own is_remote flag is never substituted for it.
             is_remote_val = row.get("is_remote")
             if is_remote_val is None or pd.isna(is_remote_val):
-                is_remote = query.is_remote
+                is_remote = False
             else:
                 is_remote = bool(is_remote_val)
+            remote_status = "verified" if is_remote else "unverified"
 
             date_posted_val = _clean_str(row.get("date_posted")) or ""
             external_id_val = _clean_str(row.get("id")) or ""
@@ -452,9 +538,12 @@ class JobSpyScraper:
                     salary_currency=_clean_str(row.get("currency")),
                     salary_interval=_clean_str(row.get("interval")),
                     is_remote=is_remote,
+                    remote_status=remote_status,
+                    source_query=query_key(query, site_name),
                     date_posted=date_posted_val,
                     pre_filtered=is_prefiltered,
                     pre_filter_reason=pre_filter_reason,
+                    pre_filter_rule=pre_filter_rule,
                     notification_status=notification_status,
                 )
             )
@@ -482,12 +571,11 @@ class JobSpyScraper:
                 self.end_cycle()
         return all_postings
 
-    def scrape_all_queries(self, queries: Optional[List[SearchQuery]] = None) -> List[JobPosting]:
-        active_queries = queries or get_active_queries()
-        self.begin_cycle(active_queries)
+    def scrape_all_queries(self, queries: List[SearchQuery]) -> List[JobPosting]:
+        self.begin_cycle(queries)
         aggregated: List[JobPosting] = []
         try:
-            for q in active_queries:
+            for q in queries:
                 aggregated.extend(self.scrape_query(q))
         finally:
             self.end_cycle()

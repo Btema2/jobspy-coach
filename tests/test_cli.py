@@ -1,7 +1,9 @@
+from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 from unittest.mock import MagicMock
 from src.cli import app
+from src.scheduler.daemon import EvalSummary
 
 
 runner = CliRunner()
@@ -13,6 +15,7 @@ def isolate_cli_test_db(tmp_path, monkeypatch):
     test_db = tmp_path / "test_cli.db"
     monkeypatch.setenv("DB_PATH", str(test_db))
     monkeypatch.setenv("DATABASE_PATH", str(test_db))
+    monkeypatch.chdir(tmp_path)  # the CLI auto-imports legacy files from the cwd: never the real ones
     from src.config import get_settings
 
     get_settings.cache_clear()
@@ -95,7 +98,7 @@ def test_cli_test_telegram_command_failure(monkeypatch):
 
 
 def test_cli_evaluate_command(monkeypatch):
-    mock_eval = MagicMock(return_value=(5, 1))
+    mock_eval = MagicMock(return_value=EvalSummary(5, 1, 0, 0, None))
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.evaluate_unprocessed", mock_eval)
 
     result = runner.invoke(app, ["evaluate", "--limit", "10"])
@@ -110,7 +113,7 @@ def test_cli_evaluate_default_limit_comes_from_settings(monkeypatch):
     from src.config import get_settings
 
     get_settings.cache_clear()
-    mock_eval = MagicMock(return_value=(0, 0))
+    mock_eval = MagicMock(return_value=EvalSummary(0, 0, 0, 0, None))
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.evaluate_unprocessed", mock_eval)
 
     result = runner.invoke(app, ["evaluate"])
@@ -178,7 +181,13 @@ def test_cli_digest_command(monkeypatch):
     mock_digest.assert_called_once_with(dry_run=False)
 
 
+def _create_profile():
+    """`run` refuses to start without a stored profile."""
+    assert runner.invoke(app, ["init", "--skip-credentials", "--no-start"]).exit_code == 0
+
+
 def test_cli_run_command(monkeypatch):
+    _create_profile()
     mock_start = MagicMock()
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.start", mock_start)
 
@@ -190,6 +199,7 @@ def test_cli_run_command(monkeypatch):
 
 def test_main_entrypoint(monkeypatch):
     import runpy
+    _create_profile()
     mock_start = MagicMock()
     monkeypatch.setattr("src.scheduler.daemon.DaemonService.start", mock_start)
     monkeypatch.setattr("sys.argv", ["jobspy-coach", "run"])
@@ -229,3 +239,209 @@ def test_cli_cleanup_empty_deletes_empty_description_stubs(monkeypatch):
     assert result.exit_code == 0
     mock_delete.assert_called_once_with("linkedin")
     assert "4" in result.stdout
+
+
+def _stats_threshold(monkeypatch) -> float:
+    mock_stats = MagicMock(return_value={"total_jobs": 1})
+    monkeypatch.setattr("src.storage.db.Database.get_stats", mock_stats)
+    monkeypatch.setattr("src.cli.check_jobspy_update", MagicMock(return_value=None))
+    assert runner.invoke(app, ["stats"]).exit_code == 0
+    return mock_stats.call_args.kwargs["pending_threshold"]
+
+
+def test_cli_stats_uses_the_profile_digest_threshold(monkeypatch):
+    from src.profile.ops import ReplaceProfile, apply_changes
+    from src.profile.snapshot import PinnedQuery, ProfileFields, ProfileSnapshot
+    from src.config import get_settings
+    from src.profile.store import ProfileStore
+    from src.storage.db import Database
+
+    db = Database(get_settings().db_path)
+    db.init_db()
+    snapshot = ProfileSnapshot(
+        ProfileFields(persona="<PERSONA>", digest_threshold=6.0, wow_threshold=8.0),
+        pinned_queries=(PinnedQuery("Q-1", "<ROLE>", "<MARKET>", ("linkedin",)),),
+    )
+    apply_changes(ProfileStore(db), [ReplaceProfile(snapshot)], label="p", expected_version=0)
+
+    assert _stats_threshold(monkeypatch) == 6.0
+
+
+def test_cli_stats_without_profile_uses_env_threshold(monkeypatch):
+    monkeypatch.setenv("DIGEST_SCORE_THRESHOLD", "6.8")
+
+    assert _stats_threshold(monkeypatch) == 6.8
+
+
+def test_cli_test_telegram_uses_profile_language(monkeypatch, isolate_cli_test_db):
+    from src.i18n import t
+    from src.profile.ops import ReplaceProfile, apply_changes
+    from src.profile.snapshot import ProfileFields, ProfileSnapshot
+    from src.profile.store import ProfileStore
+    from src.storage.db import Database
+
+    sent = []
+
+    def fake_send(self, text, reply_markup=None):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr("src.notifier.telegram_notifier.TelegramNotifier.send_message", fake_send)
+
+    assert runner.invoke(app, ["test-telegram"]).exit_code == 0
+    assert sent[-1] == t("test_telegram", None)
+    assert sent[-1] == "👋 <b>JobSpy Coach Daemon</b> | Підключення успішне! Тестове сповіщення доставлено."
+
+    db = Database(isolate_cli_test_db)
+    db.init_db()
+    snapshot = ProfileSnapshot(ProfileFields(paused=True, output_language="en"))
+    apply_changes(ProfileStore(db), [ReplaceProfile(snapshot)], label="test", expected_version=0)
+
+    assert runner.invoke(app, ["test-telegram"]).exit_code == 0
+    assert sent[-1] == t("test_telegram", "en")
+    assert sent[-1] != sent[0]
+
+
+def test_init_never_accepts_secrets_as_arguments():
+    for args in (["init", "--token", "x"], ["init", "--api-key", "x"], ["init", "--nvidia-api-key", "x"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2, result.output
+
+
+def test_init_options_and_run_init_wiring(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run_init(**kwargs):
+        captured.update(kwargs)
+        return 3
+
+    monkeypatch.setattr("src.cli.run_init", fake_run_init)
+
+    result = runner.invoke(app, ["init", "--skip-credentials", "--no-start", "--language", "pl"])
+
+    assert result.exit_code == 3
+    options = captured["options"]
+    assert (options.skip_credentials, options.start, options.language) == (True, False, "pl")
+    assert captured["env_path"] == Path(".env")
+    result = runner.invoke(app, ["init"])
+    assert captured["options"].start is None and captured["options"].language == "en"
+
+
+def test_init_start_daemon_clears_settings_cache_then_runs_the_run_path(monkeypatch):
+    from src.config import get_settings
+
+    calls = []
+
+    def fake_run_init(**kwargs):
+        get_settings()  # fill the cache
+        kwargs["start_daemon"]()
+        return 0
+
+    monkeypatch.setattr("src.cli.run_init", fake_run_init)
+    monkeypatch.setattr("src.cli._run_daemon", lambda: calls.append(get_settings.cache_info().currsize))
+    assert runner.invoke(app, ["init", "--skip-credentials", "--start"]).exit_code == 0
+
+    assert calls == [0]
+
+
+def test_bot_unpair_clears_pairing_and_chat_id(isolate_cli_test_db, tmp_path):
+    from src.bot.state import BotStateStore
+    from src.storage.db import Database
+
+    db = Database(isolate_cli_test_db)
+    db.init_db()
+    state = BotStateStore(db)
+    state.set_pairing(5, 5)
+    env = tmp_path / ".env"
+    env.write_text("# keep\nTELEGRAM_BOT_TOKEN=123:<TOKEN>\nTELEGRAM_CHAT_ID=5\nOTHER=1\n")
+
+    result = runner.invoke(app, ["bot", "unpair"])
+
+    assert result.exit_code == 0, result.output
+    assert state.get_pairing() is None
+    assert env.read_text() == "# keep\nTELEGRAM_BOT_TOKEN=123:<TOKEN>\nTELEGRAM_CHAT_ID=\nOTHER=1\n"
+    assert result.output.strip().startswith("Unpaired. Alerts stop until you pair again")
+    assert "jobspy-coach init" in result.output and "Restart the daemon" in result.output
+
+
+def test_bot_unpair_clears_llm_tables(isolate_cli_test_db, tmp_path):
+    import time
+
+    from src.bot.conversation_store import ConversationStore, PendingChange
+    from src.bot.state import BotStateStore
+    from src.storage.db import Database
+
+    db = Database(isolate_cli_test_db)
+    db.init_db()
+    BotStateStore(db).set_pairing(5, 5)
+    store = ConversationStore(db)
+    store.put_pending(PendingChange(5, "abcd1234", 1, "chat", "[]", None, time.time()))
+    store.set_state(5, "awaiting_clarification", {"rounds": [["<MARKER>", "?"]]}, time.time())
+    store.record_consent(5, 1)
+
+    result = runner.invoke(app, ["bot", "unpair"])
+
+    assert result.exit_code == 0, result.output
+    assert store.get_pending(5) is None
+    assert store.get_state(5).state == "idle" and store.get_state(5).context is None
+    assert not store.has_consent(5, 1)
+
+
+def test_bot_unpair_without_env_file(isolate_cli_test_db, tmp_path):
+    result = runner.invoke(app, ["bot", "unpair"])
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / ".env").exists()
+
+
+def test_run_and_init_start_share_one_code_path(monkeypatch):
+    assert runner.invoke(app, ["init", "--skip-credentials", "--no-start"]).exit_code == 0
+    started = []
+    monkeypatch.setattr("src.scheduler.daemon.DaemonService.start", lambda self: started.append(1))
+
+    assert runner.invoke(app, ["run"]).exit_code == 0
+    assert runner.invoke(app, ["init", "--skip-credentials", "--start"]).exit_code == 0
+    assert started == [1, 1]
+
+
+def test_init_interactive_flow_writes_env_and_never_echoes_secrets(monkeypatch, tmp_path):
+    from src.bot.bootstrap import CheckResult, Validators
+    from src.bot.state import BotStateStore
+    from src.envfile import read_env_value
+    from src.storage.db import Database
+
+    ok = lambda value: CheckResult(True, "ok")  # noqa: E731
+    monkeypatch.setattr("src.cli.http_validators", lambda settings: Validators(ok, ok, ok))
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NVIDIA_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    result = runner.invoke(app, ["init", "--no-start"], input="111:<BOT>\nnvapi-<NIM>\n\n")
+
+    assert result.exit_code == 0, result.output
+    env = tmp_path / ".env"
+    assert read_env_value(env, "TELEGRAM_BOT_TOKEN") == "111:<BOT>"
+    assert read_env_value(env, "NVIDIA_API_KEY") == "nvapi-<NIM>"
+    assert (env.stat().st_mode & 0o777) == 0o600
+    assert "<BOT>" not in result.output and "<NIM>" not in result.output
+    assert "Send /start " in result.output
+    from src.config import get_settings
+
+    db = Database(get_settings().db_path)
+    assert BotStateStore(db).get_pairing_code() is not None
+
+
+def test_stored_output_language_lookup_is_read_only(tmp_path, monkeypatch):
+    from src.cli import _stored_output_language
+    from src.storage.db import Database
+
+    def no_init(self):
+        raise AssertionError("init_db must not be called")
+
+    monkeypatch.setattr(Database, "init_db", no_init)
+    missing = tmp_path / "missing.db"
+
+    class _Settings:
+        db_path = missing
+
+    assert _stored_output_language(_Settings()) is None
+    assert not missing.exists()

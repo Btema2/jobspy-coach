@@ -1,5 +1,6 @@
 import html
 from typing import Any, Dict, List, Optional, Tuple
+from src.i18n import t
 from src.scraper.version_checker import VersionCheckResult
 from src.storage.models import JobPosting
 
@@ -16,7 +17,7 @@ def _format_salary_val(val: Optional[float]) -> Optional[str]:
         return str(val)
 
 
-def _format_salary_line(job: JobPosting) -> str:
+def _format_salary_line(job: JobPosting, lang: Optional[str] = None) -> str:
     min_val = job.salary_min if (job.salary_min is not None and job.salary_min > 0) else None
     max_val = job.salary_max if (job.salary_max is not None and job.salary_max > 0) else None
 
@@ -31,13 +32,13 @@ def _format_salary_line(job: JobPosting) -> str:
     if min_str is not None and max_str is not None:
         sal = f"{min_str} - {max_str}{curr}"
     elif min_str is not None:
-        sal = f"від {min_str}{curr}"
+        sal = t("salary_from", lang, amount=f"{min_str}{curr}")
     elif max_str is not None:
-        sal = f"до {max_str}{curr}"
+        sal = t("salary_to", lang, amount=f"{max_str}{curr}")
     else:
         return ""
 
-    return f"\n💰 <b>Вилка:</b> {sal}"
+    return t("salary_line", lang, salary=sal)
 
 
 def _truncate_escaped_html(text: str, max_length: int) -> str:
@@ -52,69 +53,67 @@ def _truncate_escaped_html(text: str, max_length: int) -> str:
     return truncated.rstrip() + "..."
 
 
-def format_wow_alert(job: JobPosting) -> Tuple[str, Dict[str, Any]]:
+def format_wow_alert(job: JobPosting, lang: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     title_esc = html.escape(job.title or "")
     comp_esc = html.escape(job.company or "")
     loc_esc = html.escape(job.location or "")
 
-    summary_raw = job.eval_summary_uk or "Опис відсутній."
+    summary_raw = job.eval_summary_uk or t("wow_summary_missing", lang)
     summary_esc = html.escape(summary_raw)
     if len(summary_esc) > 600:
         summary_esc = _truncate_escaped_html(summary_esc, 600)
 
-    reasoning_raw = job.eval_reasoning or "Високий рівень відповідності профілю."
+    reasoning_raw = job.eval_reasoning or t("wow_reasoning_missing", lang)
     reasoning_esc = html.escape(reasoning_raw)
     if len(reasoning_esc) > 800:
         reasoning_esc = _truncate_escaped_html(reasoning_esc, 800)
 
     score_str = f"{job.eval_score:.1f}" if job.eval_score is not None else "9.0"
 
-    salary_line = _format_salary_line(job)
+    salary_line = _format_salary_line(job, lang)
 
     langs_line = ""
     if job.eval_languages:
         langs_esc = html.escape(", ".join(job.eval_languages))
-        langs_line = f"\n🌐 <b>Мови:</b> {langs_esc}"
+        langs_line = t("wow_languages_line", lang, languages=langs_esc)
 
-    msg = (
-        f"🚨 <b>WOW JOB ALERT | Топ-Вакансія Коучингу</b>\n"
-        f"⭐️ <b>Оцінка: {score_str} / 10</b>\n\n"
-        f"💼 <b>Посада:</b> {title_esc}\n"
-        f"🏢 <b>Компанія:</b> {comp_esc}\n"
-        f"📍 <b>Локація:</b> {loc_esc}{salary_line}{langs_line}\n\n"
-        f"💡 <b>Про вакансію:</b>\n{summary_esc}\n\n"
-        f"🎯 <b>Чому це WOW:</b>\n{reasoning_esc}"
+    msg = t(
+        "wow_body",
+        lang,
+        score=score_str,
+        title=title_esc,
+        company=comp_esc,
+        location=loc_esc,
+        salary_line=salary_line,
+        languages_line=langs_line,
+        summary=summary_esc,
+        reasoning=reasoning_esc,
     )
 
     markup = {
         "inline_keyboard": [
-            [{"text": "🚀 Apply / View Job", "url": job.job_url}]
+            [{"text": t("wow_button", lang), "url": job.job_url}]
         ]
     }
     return msg, markup
 
 
-def format_version_update_notice(result: VersionCheckResult) -> str:
-    """Formats a Ukrainian localized update notice for Telegram HTML digest."""
+def format_version_update_notice(result: VersionCheckResult, lang: Optional[str] = None) -> str:
+    """Formats the update notice for the Telegram HTML digest (language table per the profile)."""
     latest_esc = html.escape(result.latest_version)
     installed_esc = html.escape(result.installed_version)
-    return (
-        f"\n\nℹ️ <i>Доступне оновлення python-jobspy: v{latest_esc} (встановлено: v{installed_esc}).\n"
-        f"Щоб оновити: <code>pip install -U python-jobspy</code></i>"
-    )
+    return t("update_notice", lang, latest=latest_esc, installed=installed_esc)
 
 
 def format_digest_chunks(
     jobs: List[JobPosting],
     date_str: str,
     update_notice: Optional[str] = None,
+    lang: Optional[str] = None,
 ) -> List[str]:
     date_esc = html.escape(date_str or "")
-    header = (
-        f"☕️ <b>Ранковий Дайджест Вакансій Коучингу | {date_esc}</b>\n"
-        f"Знайдено нових актуальних позицій: <b>{len(jobs)}</b>\n\n"
-    )
-    standard_footer = "\n<i>Всі позиції збережено в базі. Бажаємо продуктивного дня!</i>"
+    header = t("digest_header", lang, date=date_esc, count=str(len(jobs)))
+    standard_footer = t("digest_footer", lang)
     final_footer = standard_footer + (update_notice if update_notice else "")
 
     chunks = []
@@ -130,11 +129,16 @@ def format_digest_chunks(
         summary_esc = html.escape(job.eval_summary_uk or "")
         url_esc = html.escape(job.job_url or "", quote=True)
 
-        item_str = (
-            f"{idx}. ⭐️ <b>{score_str}/10</b> — <b>{title_esc}</b>\n"
-            f"   🏢 {comp_esc} | 📍 {loc_esc}\n"
-            f"   💡 {summary_esc}\n"
-            f"   🔗 <a href=\"{url_esc}\">Переглянути вакансію</a>\n\n"
+        item_str = t(
+            "digest_item",
+            lang,
+            idx=str(idx),
+            score=score_str,
+            title=title_esc,
+            company=comp_esc,
+            location=loc_esc,
+            summary=summary_esc,
+            url=url_esc,
         )
 
         needed_footer = final_footer if idx == total_jobs else standard_footer
@@ -142,7 +146,7 @@ def format_digest_chunks(
             current_chunk += standard_footer
             chunks.append(current_chunk)
             chunk_index += 1
-            current_chunk = f"☕️ <b>Ранковий Дайджест | Частина {chunk_index}</b>\n\n" + item_str
+            current_chunk = t("digest_part_header", lang, part=str(chunk_index)) + item_str
         else:
             current_chunk += item_str
 

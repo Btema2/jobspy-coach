@@ -11,14 +11,18 @@ _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 # Whole "Authorization: <scheme> <credential>" value (any scheme) up to end of line or closing quote.
 _AUTH_HEADER_RE = re.compile(r"(?i)(\bAuthorization\b['\"]?\s*[:=]\s*['\"]?)[^\r\n'\"]+")
 
+# Credentials embedded in a URL authority: scheme://user:pass@host (proxy URLs); keeps scheme and host.
+_URL_CREDENTIALS_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]+@")
+
 _NOISY_LOGGERS = ("httpx", "httpcore")
 
 
 def redact_secrets(text: str) -> str:
-    """Return ``text`` with Telegram bot tokens and bearer/authorization secrets masked."""
+    """Return ``text`` with Telegram bot tokens, bearer/authorization secrets and URL credentials masked."""
     text = _TELEGRAM_TOKEN_RE.sub("bot<redacted>", text)
     text = _BEARER_RE.sub("Bearer <redacted>", text)
     text = _AUTH_HEADER_RE.sub(r"\1<redacted>", text)
+    text = _URL_CREDENTIALS_RE.sub(r"\1<redacted>@", text)
     return text
 
 

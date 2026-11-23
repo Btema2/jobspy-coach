@@ -64,7 +64,7 @@ def test_database_init_and_job_lifecycle(tmp_path: Path):
     eval_res = JobEvaluationResult(
         score=9.2,
         is_wow=True,
-        summary_uk="Чудова вакансія для лідерського коучингу.",
+        summary="Чудова вакансія для лідерського коучингу.",
         reasoning="Strong match for executive coach persona",
         language_requirements=["English", "Polish"],
         pros=["High autonomy"],
@@ -140,7 +140,7 @@ def test_database_pending_digest_jobs(tmp_path: Path):
         eval_result=JobEvaluationResult(
             score=8.0,
             is_wow=False,
-            summary_uk="Робота в Варшаві.",
+            summary="Робота в Варшаві.",
             reasoning="Good",
             language_requirements=["Polish"],
             pros=[],
@@ -165,7 +165,7 @@ def test_database_pending_digest_jobs(tmp_path: Path):
         eval_result=JobEvaluationResult(
             score=4.5,
             is_wow=False,
-            summary_uk="Низький бал.",
+            summary="Низький бал.",
             reasoning="Poor fit",
             language_requirements=[],
             pros=[],
@@ -239,6 +239,29 @@ def test_database_record_scrape_run(tmp_path: Path):
         assert row["duration_sec"] == 3.45
         assert row["status"] == "completed"
         assert row["error_message"] is None
+
+
+def test_record_scrape_run_stores_outcome_fields(tmp_path: Path):
+    db = Database(tmp_path / "test_scrape_outcome.db")
+    db.init_db()
+
+    run_id = db.record_scrape_run(
+        "indeed", "Career Coach", 10, 2, 1.5, "completed",
+        rows_returned=10, prefiltered=3, outcome="empty", query_key="Q|indeed",
+    )
+    plain_id = db.record_scrape_run("indeed", "Career Coach", 0, 0, 0.5, "completed")
+
+    with db._get_connection() as conn:
+        row = conn.execute(
+            "SELECT rows_returned, prefiltered, outcome, query_key FROM scrape_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        assert tuple(row) == (10, 3, "empty", "Q|indeed")
+        plain = conn.execute(
+            "SELECT rows_returned, prefiltered, outcome, query_key FROM scrape_runs WHERE id = ?",
+            (plain_id,),
+        ).fetchone()
+        assert tuple(plain) == (0, 0, None, None)
 
 
 def test_database_get_job_by_id_and_not_found(tmp_path: Path):
@@ -359,7 +382,7 @@ def test_database_update_evaluation_with_notification_status(tmp_path: Path):
     eval_res = JobEvaluationResult(
         score=4.0,
         is_wow=False,
-        summary_uk="Низька оцінка.",
+        summary="Низька оцінка.",
         reasoning="Irrelevant",
     )
     db.update_evaluation(job_id=job_id, eval_result=eval_res, notification_status="dismissed")
@@ -574,7 +597,7 @@ def test_update_evaluation_persists_eval_model(tmp_path: Path):
     job_id, _ = db.save_job(_mk_job("a"))
     db.update_evaluation(
         job_id,
-        JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r", eval_model="vendor/model-x"),
+        JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r", eval_model="vendor/model-x"),
     )
     assert db.get_job_by_id(job_id).eval_model == "vendor/model-x"
 
@@ -584,7 +607,7 @@ def test_update_evaluation_tolerates_non_string_eval_model(tmp_path: Path):
     db = Database(tmp_path / "mm.db")
     db.init_db()
     job_id, _ = db.save_job(_mk_job("b"))
-    result = JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r")
+    result = JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r")
     result.eval_model = MagicMock()
     db.update_evaluation(job_id, result, notification_status="pending")
     assert db.get_job_by_id(job_id).eval_model is None
@@ -629,7 +652,7 @@ def test_record_eval_attempt_ignores_non_unprocessed_jobs(tmp_path: Path):
     db.init_db()
     job_id, _ = db.save_job(_mk_job("g"))
     db.update_evaluation(
-        job_id, JobEvaluationResult(score=7.0, is_wow=False, summary_uk="s", reasoning="r")
+        job_id, JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r")
     )
 
     assert db.record_eval_attempt(job_id, "late failure", max_attempts=1) == 0
@@ -646,7 +669,7 @@ def test_get_stats_custom_pending_threshold(tmp_path: Path):
     for name, score in (("lo", 6.2), ("mid", 6.7), ("hi", 8.0)):
         job_id, _ = db.save_job(_mk_job(name))
         db.update_evaluation(
-            job_id, JobEvaluationResult(score=score, is_wow=False, summary_uk="s", reasoning="r")
+            job_id, JobEvaluationResult(score=score, is_wow=False, summary="s", reasoning="r")
         )
     assert db.get_stats()["pending_digest"] == 3  # default 6.0
     assert db.get_stats(pending_threshold=6.5)["pending_digest"] == 2
@@ -666,3 +689,172 @@ def test_save_job_round_trips_new_fields(tmp_path: Path):
     loaded = db.get_job_by_id(job_id)
     assert loaded.eval_model == "vendor/m"
     assert loaded.eval_attempts == 2
+
+
+def test_save_job_persists_source_query_and_remote_status(tmp_path: Path):
+    db = Database(tmp_path / "sq.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("g", source_query="Q1|linkedin", remote_status="verified"))
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.source_query == "Q1|linkedin"
+    assert loaded.remote_status == "verified"
+
+
+def test_new_job_fields_default_for_legacy_rows(tmp_path: Path):
+    db = Database(tmp_path / "lg.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("h"))
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.source_query is None
+    assert loaded.remote_status == "unverified"
+    assert loaded.eval_raw_score is None
+    assert loaded.eval_is_core_role is None
+    assert loaded.eval_bonus_flag is None
+    assert loaded.eval_hard_reject is None
+
+
+@pytest.mark.parametrize("notification_status", [None, "pending"])
+def test_update_evaluation_persists_raw_fields(tmp_path: Path, notification_status):
+    from src.evaluator.schemas import JobEvaluationResult as PydanticResult
+    db = Database(tmp_path / "raw.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("raw"))
+    result = PydanticResult(
+        score=7.0, summary="A valid summary text.", reasoning="r", raw_score=7.0,
+        is_core_role=True, matches_bonus_criteria=False, hard_reject=False,
+    )
+    db.update_evaluation(job_id, result, notification_status=notification_status)
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.eval_raw_score == 7.0
+    assert loaded.eval_is_core_role is True
+    assert loaded.eval_bonus_flag is False
+    assert loaded.eval_hard_reject is False
+    if notification_status:
+        assert loaded.notification_status == notification_status
+
+
+@pytest.mark.parametrize("notification_status", [None, "pending"])
+def test_update_evaluation_without_raw_fields_leaves_null(tmp_path: Path, notification_status):
+    db = Database(tmp_path / "noraw.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("noraw"))
+    db.update_evaluation(
+        job_id,
+        JobEvaluationResult(score=7.0, is_wow=False, summary="s", reasoning="r"),
+        notification_status=notification_status,
+    )
+    loaded = db.get_job_by_id(job_id)
+    assert loaded.eval_raw_score is None
+    assert loaded.eval_is_core_role is None
+    assert loaded.eval_bonus_flag is None
+    assert loaded.eval_hard_reject is None
+
+
+def test_update_evaluation_stores_is_core_role(tmp_path: Path):
+    from src.evaluator.schemas import JobEvaluationResult as PydanticResult
+    db = Database(tmp_path / "core.db")
+    db.init_db()
+    job_id, _ = db.save_job(_mk_job("core"))
+    # An old-key payload still lands in the non-NULL column (NULL would hide the row from re-bucketing).
+    result = PydanticResult.model_validate(
+        {"score": 7.0, "summary_uk": "A valid summary text.", "reasoning": "r", "role_is_direct_coaching": True}
+    )
+    db.update_evaluation(job_id, result)
+    assert db.get_job_by_id(job_id).eval_is_core_role is True
+
+
+def _prefiltered_job(n: int, rule=None, reason="EXCLUDED_TITLE_TRAP: 'x'", pre_filtered=True) -> JobPosting:
+    return JobPosting(
+        dedup_hash=f"pf-{n}",
+        site="linkedin",
+        job_url=f"https://example.test/{n}",
+        title=f"Title {n}",
+        company="Example Co",
+        location="Remote",
+        description="d",
+        pre_filtered=pre_filtered,
+        pre_filter_reason=reason if pre_filtered else None,
+        pre_filter_rule=rule,
+    )
+
+
+def test_get_recent_prefiltered_returns_last_20_with_rule(tmp_path: Path):
+    db = Database(tmp_path / "pf.db")
+    db.init_db()
+    db.save_job(_prefiltered_job(0, rule=None, reason="DESCRIPTION_TOO_SHORT: length=3 (min 150)"))  # legacy row
+    for n in range(1, 25):
+        db.save_job(_prefiltered_job(n, rule=f"block:exact:term{n}"))
+    db.save_job(_prefiltered_job(99, pre_filtered=False))  # not dropped: never listed
+
+    dropped = db.get_recent_prefiltered()
+
+    assert len(dropped) == 20
+    assert [d.title for d in dropped][:3] == ["Title 24", "Title 23", "Title 22"]
+    assert dropped[0].rule_key == "block:exact:term24" and dropped[0].reason == "EXCLUDED_TITLE_TRAP: 'x'"
+    assert (dropped[0].company, dropped[0].site) == ("Example Co", "linkedin")
+    assert dropped[0].created_at is not None and dropped[0].id > dropped[1].id
+    everything = db.get_recent_prefiltered(limit=100)
+    assert len(everything) == 25
+    legacy = everything[-1]
+    assert legacy.rule_key is None and legacy.reason.startswith("DESCRIPTION_TOO_SHORT")
+
+
+def test_pre_filter_rule_round_trips_on_the_job(tmp_path: Path):
+    db = Database(tmp_path / "pf2.db")
+    db.init_db()
+    job_id, _ = db.save_job(_prefiltered_job(1, rule="seed:block:EXCLUDED_TITLE_TRAP"))
+    assert db.get_job_by_id(job_id).pre_filter_rule == "seed:block:EXCLUDED_TITLE_TRAP"
+
+
+def test_stale_pending_days_default():
+    from src.storage.db import STALE_PENDING_DAYS
+
+    assert STALE_PENDING_DAYS == 7
+
+
+# ----- counts for the run report (no LIMIT) -----
+
+
+def _evaluated(db: Database, name: str, score: float, status=None) -> int:
+    job_id, _ = db.save_job(_mk_job(name))
+    db.update_evaluation(
+        job_id,
+        eval_result=JobEvaluationResult(score=score, is_wow=False, summary="s", reasoning="r"),
+        notification_status=status,
+    )
+    return job_id
+
+
+def test_count_pending_digest_jobs_counts_only_pending_rows_at_or_above_threshold(tmp_path: Path):
+    db = Database(tmp_path / "count_digest.db")
+    db.init_db()
+    _evaluated(db, "a", 6.5)  # at the threshold: counted
+    _evaluated(db, "b", 9.0)  # above: counted
+    _evaluated(db, "c", 6.4)  # below: not counted
+    _evaluated(db, "d", 8.0, status="dismissed")
+    sent = _evaluated(db, "e", 8.0)
+    db.mark_digest_sent([sent])
+    instant = _evaluated(db, "f", 9.5)
+    db.mark_instant_sent(instant)
+    db.save_job(_mk_job("g"))  # unprocessed, pending notification: not evaluated, not counted
+    for n in range(12):  # more rows than the digest's default limit: the count is not capped
+        _evaluated(db, f"many{n}", 7.0)
+
+    assert db.count_pending_digest_jobs(min_score=6.5) == 14
+    assert db.count_pending_digest_jobs(min_score=9.0) == 1
+    assert db.count_pending_digest_jobs(min_score=6.5) == len(db.get_pending_digest_jobs(min_score=6.5, limit=100))
+
+
+def test_count_unprocessed_jobs_matches_get_unprocessed_jobs_without_limit(tmp_path: Path):
+    db = Database(tmp_path / "count_unprocessed.db")
+    db.init_db()
+    assert db.count_unprocessed_jobs() == 0
+    for n in range(60):  # above get_unprocessed_jobs' default limit of 50
+        db.save_job(_mk_job(f"u{n}"))
+    db.save_job(_mk_job("pre", pre_filtered=True, notification_status="dismissed"))
+    _evaluated(db, "done", 7.0)
+    failed_id, _ = db.save_job(_mk_job("failed"))
+    db.update_eval_failure(failed_id, "boom")
+
+    assert db.count_unprocessed_jobs() == 60
+    assert db.count_unprocessed_jobs() == len(db.get_unprocessed_jobs(limit=1000))

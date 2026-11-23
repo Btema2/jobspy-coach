@@ -1,21 +1,125 @@
 import importlib.metadata
-from typing import Optional
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Generator, Optional
 import typer
+from typer.core import TyperGroup
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
+from src.bot.bootstrap import InitOptions, TyperPrompter, http_validators, run_init
+from src.bot.conversation_store import ConversationStore
+from src.bot.state import BotStateStore
 from src.config import get_settings
+from src.envfile import merge_env_file
 from src.evaluator.errors import ConfigurationError
+from src.i18n import t
 from src.logging_config import configure_logging
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.profile.backtest import backtest_snapshots, render_backtest
+from src.profile.compiler import compile_profile
+from src.profile.errors import (
+    LegacyImportError,
+    ProfileCompileError,
+    ProfileError,
+    ProfileValidationError,
+)
+from src.profile.importer import DEFAULT_EXPORT_PATH, auto_import, export_profile, load_profile_yaml
+from src.profile.ops import ReplaceProfile, apply_changes
+from src.profile.requeue import rebucket_evaluated, requeue_prefiltered
+from src.profile.store import ProfileStore
 from src.scheduler.daemon import DaemonService
 from src.scraper.version_checker import check_jobspy_update
 from src.storage.db import Database
+from src.storage.migrations import MIGRATIONS
 
-app = typer.Typer(help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
+_SUBCOMMAND_ARGS = "jobspy_coach.subcommand_args"
+
+
+class _RecordingGroup(TyperGroup):
+    """Remembers the arguments of the subcommand: Click only parses them after the group callback ran."""
+
+    def resolve_command(self, ctx, args):
+        ctx.meta[_SUBCOMMAND_ARGS] = list(args)
+        return super().resolve_command(ctx, args)
+
+
+app = typer.Typer(cls=_RecordingGroup, help="JobSpy Coach: Autonomous Coaching Job Monitor Daemon")
 console = Console()
 
 configure_logging()
+
+profile_app = typer.Typer(help="Inspect, export and import the stored search profile")
+app.add_typer(profile_app, name="profile")
+
+bot_app = typer.Typer(help="Manage the Telegram bot")
+app.add_typer(bot_app, name="bot")
+
+
+def _fail(message: str, *, hint: str = "") -> "typer.Exit":
+    """Print an error without Rich markup (messages contain brackets and backticks) and return Exit(1)."""
+    console.print(message, style="bold red", markup=False, highlight=False)
+    if hint:
+        console.print(hint, markup=False, highlight=False)
+    return typer.Exit(code=1)
+
+
+def _fail_profile_error(error: ProfileError, *, hint: str = "") -> "typer.Exit":
+    messages = error.messages if isinstance(error, ProfileValidationError) else [str(error)]
+    for message in messages:
+        console.print(f"- {message}", style="bold red", markup=False, highlight=False)
+    if hint:
+        console.print(hint, markup=False, highlight=False)
+    return typer.Exit(code=1)
+
+
+def _profile_store() -> ProfileStore:
+    db = Database(get_settings().db_path)
+    db.init_db()
+    return ProfileStore(db)
+
+
+_LEGACY_HINT = (
+    "Fix the file and entry named above (or move the file away), then run the command again. "
+    "Nothing was imported."
+)
+
+
+def _help_requested(ctx: typer.Context) -> bool:
+    """True when the remaining arguments ask for help (`<command> --help`): no database work for that."""
+    return ctx.resilient_parsing or "--help" in ctx.meta.get(_SUBCOMMAND_ARGS, [])
+
+
+def _read_only_requested(ctx: typer.Context) -> bool:
+    """True for `requeue ... --dry-run`: it must not initialise, migrate or import anything."""
+    args = ctx.meta.get(_SUBCOMMAND_ARGS, [])
+    return bool(args) and args[0] == "requeue" and "--dry-run" in args
+
+
+@app.callback()
+def main(ctx: typer.Context) -> None:
+    """Open the database and import the legacy queries.json / .candidate_profile.md once, before any command."""
+    if _help_requested(ctx) or _read_only_requested(ctx):
+        return
+    settings = get_settings()
+    store = _profile_store()
+    try:
+        result = auto_import(
+            store,
+            Path.cwd(),
+            wow_threshold=settings.wow_score_threshold,
+            digest_threshold=settings.digest_score_threshold,
+        )
+    except LegacyImportError as exc:
+        raise _fail_profile_error(exc, hint=_LEGACY_HINT) from None
+    except ProfileValidationError as exc:
+        raise _fail_profile_error(exc, hint=_LEGACY_HINT) from None
+    if result is not None:
+        console.print(f"Imported legacy profile (version {result.version})", style="bold green", markup=False)
+        for note in result.warnings:
+            console.print(f"- {note}", style="yellow", markup=False, highlight=False)
 
 
 def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
@@ -23,15 +127,236 @@ def _exit_on_missing_provider(error: ConfigurationError) -> "typer.Exit":
     return typer.Exit(code=1)
 
 
-@app.command()
-def run():
-    """Start the 24/7 background daemon scheduler."""
+def _run_daemon() -> None:
+    """Start the daemon in this process (blocks until it stops); shared by `run` and `init --start`."""
+    if not _profile_store().has_profile():
+        raise _fail("no profile, run `jobspy-coach init`")
     console.print("[bold green]Starting JobSpy Coach Daemon...[/bold green]")
     daemon = DaemonService()
     try:
         daemon.start()
     except ConfigurationError as e:
         raise _exit_on_missing_provider(e) from None
+
+
+@app.command()
+def run():
+    """Start the 24/7 background daemon scheduler."""
+    _run_daemon()
+
+
+def _start_daemon_after_init() -> None:
+    get_settings.cache_clear()  # init just wrote .env: the daemon must read the new values
+    _run_daemon()
+
+
+@app.command()
+def init(
+    skip_credentials: bool = typer.Option(
+        False, "--skip-credentials", help="Do not prompt for or write credentials"
+    ),
+    start: Optional[bool] = typer.Option(
+        None, "--start/--no-start", help="Start the daemon afterwards (default: ask)"
+    ),
+    language: str = typer.Option("en", "--language", help="Output language code of the starter profile"),
+) -> None:
+    """Set up credentials (hidden prompts), a paused starter profile and Telegram pairing; optionally start.
+
+    Secrets are never accepted as arguments.
+    """
+    settings = get_settings()
+    db = Database(settings.db_path)
+    db.init_db()
+    code = run_init(
+        env_path=Path(".env"),
+        store=ProfileStore(db),
+        state=BotStateStore(db),
+        settings=settings,
+        prompter=TyperPrompter(),
+        validators=http_validators(settings),
+        options=InitOptions(skip_credentials=skip_credentials, start=start, language=language),
+        out=lambda line: console.print(line, markup=False, highlight=False, soft_wrap=True),
+        start_daemon=_start_daemon_after_init,
+    )
+    if code:
+        raise typer.Exit(code=code)
+
+
+@bot_app.command("unpair")
+def bot_unpair() -> None:
+    """Forget the paired Telegram account (and blank TELEGRAM_CHAT_ID in .env)."""
+    settings = get_settings()
+    db = Database(settings.db_path)
+    db.init_db()
+    BotStateStore(db).clear_pairing()
+    ConversationStore(db).clear_all()  # the next account must not see (or inherit) proposals and consent
+    env_path = Path(".env")
+    if env_path.exists():
+        try:
+            merge_env_file(env_path, {"TELEGRAM_CHAT_ID": ""})
+        except OSError as exc:
+            raise _fail(f"cannot update .env ({type(exc).__name__}); the pairing was cleared") from None
+    console.print(
+        "Unpaired. Alerts stop until you pair again: run jobspy-coach init and send the new code. "
+        "Restart the daemon if it is running.",
+        markup=False,
+        soft_wrap=True,
+    )
+
+
+@profile_app.command("preview")
+def profile_preview() -> None:
+    """Show the search queries the stored profile compiles to, with the cost estimate."""
+    store = _profile_store()
+    snapshot = store.read_snapshot()
+    if snapshot is None:
+        raise _fail("no profile, run `jobspy-coach init`")
+    try:
+        compiled = compile_profile(snapshot, scrape_interval_hours=get_settings().scrape_interval_hours)
+    except ProfileCompileError as exc:
+        raise _fail(f"profile cannot be compiled: {exc}") from None
+
+    table = Table(title=f"Profile version {compiled.version}: search queries")
+    table.add_column("Query id", style="cyan", no_wrap=True)
+    table.add_column("Term")
+    table.add_column("Location")
+    table.add_column("Country")
+    table.add_column("Boards")
+    table.add_column("Remote")
+    for q in compiled.queries:
+        table.add_row(
+            escape(q.query_id),
+            escape(q.search_term),
+            escape(q.location),
+            escape(q.country_code or "-"),
+            escape(", ".join(q.site_names)),
+            "yes" if q.is_remote else "no",
+        )
+    console.print(table)
+    estimate = compiled.estimate
+    minutes = estimate.duration_seconds / 60
+    console.print(
+        f"Calls per cycle: {estimate.total_calls} (LinkedIn: {estimate.linkedin_calls}), "
+        f"cap: {snapshot.fields.max_calls_per_cycle}, estimated duration: ~{minutes:.0f} min",
+        markup=False,
+    )
+    console.print(f"Paused: {'yes' if compiled.paused else 'no'}", markup=False)
+    for warning in compiled.warnings:
+        console.print(f"Warning: {warning}", style="yellow", markup=False, highlight=False)
+
+
+@profile_app.command("export")
+def profile_export(
+    path: Path = typer.Option(DEFAULT_EXPORT_PATH, "--path", help="Where to write the YAML export"),
+    force: bool = typer.Option(False, "--force", help="Write even when the path is not git-ignored"),
+) -> None:
+    """Write the stored profile as YAML (private data: only to a git-ignored path)."""
+    store = _profile_store()
+    if not store.has_profile():
+        raise _fail("no profile, run `jobspy-coach init`")
+    try:
+        written = export_profile(store, path, force=force)
+    except ProfileError as exc:  # includes ExportRefused
+        raise _fail(str(exc)) from None
+    except OSError as exc:
+        raise _fail(f"cannot write {path} ({type(exc).__name__}: {exc.strerror or 'error'})") from None
+    console.print(f"Exported the profile to {written} (private data, file mode 0600).", markup=False)
+
+
+@profile_app.command("import")
+def profile_import(file: Path = typer.Argument(..., help="YAML file written by `profile export`")) -> None:
+    """Validate a YAML profile file and apply it as a new profile version."""
+    store = _profile_store()
+    try:
+        result = apply_changes(store, [ReplaceProfile(load_profile_yaml(file))], label=f"import {file.name}")
+    except ProfileError as exc:
+        raise _fail_profile_error(exc, hint="Nothing was changed.") from None
+    for line in result.diff:
+        console.print(line, markup=False, highlight=False)
+    try:  # the import is already applied: a backtest problem must not turn it into a failure
+        backtest = backtest_snapshots(Database(get_settings().db_path), result.old, result.new)
+    except (ProfileError, sqlite3.Error):
+        backtest = None
+    if backtest is not None:
+        for line in render_backtest(backtest):
+            console.print(line, markup=False, highlight=False)
+    for warning in result.warnings:
+        console.print(f"Warning: {warning}", style="yellow", markup=False, highlight=False)
+    console.print(f"Profile is now at version {result.version}.", markup=False)
+
+
+def _open_initialised(path: Path) -> Database:
+    db = Database(path)
+    db.init_db()
+    return db
+
+
+def _open_read_only(path: Path) -> Database:
+    """A database for a dry run: never created, initialised or migrated (a problem is a one-line message)."""
+    if not Path(path).exists():
+        raise _fail(f"no database at {path}; nothing to check")
+    latest = MIGRATIONS[-1][0]
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            current = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        raise _fail(
+            "the database has no schema_version table (not initialised); run `jobspy-coach init` or any "
+            "command without --dry-run once"
+        ) from None
+    if current is None or current < latest:
+        raise _fail(
+            f"the database is at schema version {current or 0}, this version needs {latest}; run any "
+            "command without --dry-run once to migrate it"
+        )
+    return Database(path)
+
+
+@app.command()
+def requeue(
+    thresholds: bool = typer.Option(
+        False, "--thresholds", help="Re-bucket evaluated rows under the profile's thresholds (no LLM call)"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would change without writing"),
+) -> None:
+    """Revive pre-filtered rows that the current rules pass, or (--thresholds) re-bucket evaluated rows.
+
+    Never run while the daemon is running. Re-bucketed rows never send instant alerts.
+    """
+    settings = get_settings()
+    db = _open_read_only(settings.db_path) if dry_run else _open_initialised(settings.db_path)
+    try:
+        snapshot = ProfileStore(db).read_snapshot()
+        if snapshot is None:
+            raise _fail("no profile, run `jobspy-coach init`")
+        compiled = compile_profile(snapshot, scrape_interval_hours=settings.scrape_interval_hours)
+    except (ProfileError, sqlite3.Error) as exc:  # an unreadable or uncompilable profile, a locked database
+        raise _fail(f"profile cannot be used: {exc}") from None
+    prefix = "dry run: " if dry_run else ""
+    if thresholds:
+        rebucket = rebucket_evaluated(db, compiled.scoring, dry_run=dry_run)
+        console.print(
+            f"{prefix}checked: {rebucket.checked}, changed: {rebucket.changed}, "
+            f"skipped (missing stored fields): {rebucket.skipped_missing}, to digest: {rebucket.to_digest}, "
+            f"to dismissed: {rebucket.to_dismissed}, too old: {rebucket.too_old}",
+            markup=False,
+            soft_wrap=True,
+        )
+        samples = rebucket.samples
+    else:
+        revived = requeue_prefiltered(db, compiled.rules, dry_run=dry_run)
+        console.print(
+            f"{prefix}checked: {revived.checked}, requeued: {revived.requeued}, "
+            f"still dropped: {revived.still_dropped}, too old: {revived.too_old}",
+            markup=False,
+            soft_wrap=True,
+        )
+        samples = revived.samples
+    for title in samples:
+        console.print(f"  - {title}", markup=False, highlight=False, soft_wrap=True)
 
 
 @app.command()
@@ -61,7 +386,7 @@ def evaluate(
     console.print(f"[bold blue]Evaluating up to {limit} unprocessed vacancies (dry_run={dry_run})...[/bold blue]")
     daemon = DaemonService()
     try:
-        evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run)
+        evaluated, wow_sent = daemon.evaluate_unprocessed(limit=limit, dry_run=dry_run).as_tuple()
     except ConfigurationError as e:
         raise _exit_on_missing_provider(e) from None
     console.print(f"[bold green]Evaluation completed. Evaluated: {evaluated}, Instant WOW alerts: {wow_sent}[/bold green]")
@@ -78,11 +403,34 @@ def digest(
     console.print(f"[bold green]Digest completed. Processed {count} jobs.[/bold green]")
 
 
+class _ReadOnlyDatabase(Database):
+    """Opens the file read-only: a lookup must never create, initialise or migrate the database."""
+
+    @contextmanager
+    def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+
+def _stored_output_language(settings) -> Optional[str]:
+    """The stored profile's ``output_language``; None when there is no profile or it cannot be read."""
+    try:
+        snapshot = ProfileStore(_ReadOnlyDatabase(settings.db_path)).read_snapshot()
+    except (ProfileError, sqlite3.Error):
+        return None
+    return snapshot.fields.output_language if snapshot is not None else None
+
+
 @app.command(name="test-telegram")
 def test_telegram():
     """Send an authentication and connectivity test message to Telegram."""
     settings = get_settings()
-    msg = "👋 <b>JobSpy Coach Daemon</b> | Підключення успішне! Тестове сповіщення доставлено."
+    msg = t("test_telegram", _stored_output_language(settings))
     with TelegramNotifier(token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id) as notifier:
         success = notifier.send_message(msg)
     if success:
@@ -133,7 +481,16 @@ def stats():
     settings = get_settings()
     db = Database(settings.db_path)
     db.init_db()
-    data = db.get_stats(pending_threshold=settings.digest_score_threshold)
+    digest_threshold = settings.digest_score_threshold  # .env only without a (compilable) profile
+    try:
+        snapshot = ProfileStore(db).read_snapshot()
+        if snapshot is not None:
+            digest_threshold = compile_profile(
+                snapshot, scrape_interval_hours=settings.scrape_interval_hours
+            ).scoring.digest_threshold
+    except ProfileError:
+        pass
+    data = db.get_stats(pending_threshold=digest_threshold)
 
     table = Table(title="JobSpy Coach: Repository Statistics")
     table.add_column("Metric", style="cyan", no_wrap=True)

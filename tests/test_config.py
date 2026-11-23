@@ -185,3 +185,9 @@ def test_legacy_openrouter_model_env_var_still_loads(monkeypatch, tmp_path):
     s = Settings(_env_file=str(env))
     assert s.wow_score_threshold == 9.1
     assert not hasattr(s, "openrouter_model")
+
+
+def test_telegram_bot_polling_defaults_on_and_can_be_disabled(monkeypatch):
+    assert Settings(_env_file=None).telegram_bot_polling is True
+    monkeypatch.setenv("TELEGRAM_BOT_POLLING", "false")
+    assert Settings(_env_file=None).telegram_bot_polling is False
