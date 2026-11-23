@@ -123,7 +123,8 @@ flowchart TD
 
 ## Prerequisites
 
-- **Python 3.10+** (tested on Python 3.10, 3.11, 3.12, 3.13, 3.14)
+- **Python 3.10+** (tested on Python 3.10, 3.11, 3.12, 3.13, 3.14, 3.15)
+- **uv** (recommended) or **pip**
 - **At least one LLM provider key**: an **NVIDIA NIM API key** (primary; from [build.nvidia.com](https://build.nvidia.com/)) and/or an **OpenRouter API key** plus `OPENROUTER_MODELS` (fallback; from [openrouter.ai](https://openrouter.ai/)). The app starts without keys, but evaluation raises a clear configuration error on first use until one provider is configured.
 - **Telegram bot token** (create a bot with [@BotFather](https://t.me/BotFather)). `jobspy-coach init` pairs your Telegram account with the bot, so you do not need to look up a chat ID (an existing `TELEGRAM_CHAT_ID` in `.env` is adopted as the paired chat).
 
@@ -138,16 +139,37 @@ git clone https://github.com/your-username/jobspy-coach.git
 cd jobspy-coach
 ```
 
-### 2. Create and Activate Virtual Environment
+### 2. Environment & Dependency Installation
+
+You can use **`uv`** (recommended for fast setup and virtual environment management) or standard **`python3 -m venv` + `pip`**.
+
+#### Option A: Using `uv` (Recommended)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+# Automatically create virtual environment and sync production dependencies:
+uv sync
+
+# Or include development tools (pytest, coverage, linters):
+uv sync --extra dev
 ```
 
-### 3. Install Package and Dependencies
+You can then run commands directly via `uv run` (without manual virtualenv activation):
+```bash
+uv run jobspy-coach init
+```
+Or activate the created virtual environment:
+```bash
+source .venv/bin/activate
+jobspy-coach init
+```
+
+#### Option B: Using standard Python `venv` & `pip`
 
 ```bash
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
 # Production installation
 pip install -e .
 
@@ -157,11 +179,15 @@ pip install -e ".[dev]"
 
 `python-jobspy` is capped at `>=1.4.0,<1.5`: the country and board tables were verified against 1.4.x, and 1.5.0 changes both (a new `seek` board, Glassdoor dropped for Malaysia and Vietnam). If your environment already has 1.5.0, run `pip install -e .` again to get 1.4.x.
 
-The dependencies include `pypdf` (`>=6.1`), which reads the text layer of a CV you send to the bot as a PDF (see [Setup interview and CV](#setup-interview-and-cv)). An existing install picks it up with `pip install -e .` after updating.
+The dependencies include `pypdf` (`>=6.1`), which reads the text layer of a CV you send to the bot as a PDF (see [Setup interview and CV](#setup-interview-and-cv)), and `packaging` (`>=21.0`), which checks for package updates. An existing install picks them up with `pip install -e .` (or `uv sync`) after updating.
 
-### 4. Run the Setup (`init`)
+### 3. Run the Setup (`init`)
 
 ```bash
+# If using uv directly:
+uv run jobspy-coach init
+
+# Or in an activated virtual environment:
 jobspy-coach init
 ```
 
@@ -174,7 +200,7 @@ jobspy-coach init
 
 Options: `--skip-credentials` (do not prompt for or write credentials), `--no-start` / `--start` (do not ask about starting the daemon), `--language CODE` (output language of the starter profile, default `en`). Other settings (schedule, boards, limits) keep their defaults; `.env.example` lists them if you want to change one.
 
-### 5. Create Your Search Profile
+### 4. Create Your Search Profile
 
 The search queries and the candidate persona live in a stored, versioned profile (in the SQLite database), not in `.env`.
 
