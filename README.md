@@ -155,6 +155,8 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
+`python-jobspy` is capped at `>=1.4.0,<1.5`: the country and board tables were verified against 1.4.x, and 1.5.0 changes both (a new `seek` board, Glassdoor dropped for Malaysia and Vietnam). If your environment already has 1.5.0, run `pip install -e .` again to get 1.4.x.
+
 The dependencies include `pypdf` (`>=6.1`), which reads the text layer of a CV you send to the bot as a PDF (see [Setup interview and CV](#setup-interview-and-cv)). An existing install picks it up with `pip install -e .` after updating.
 
 ### 4. Run the Setup (`init`)

@@ -124,6 +124,7 @@ docs/
 3. **Datacenter vs. Residential IPs**:
    - On residential IPs (local dev machine), LinkedIn scraping works smoothly.
    - On cloud VPS/datacenter IPs (AWS, DigitalOcean, Hetzner), LinkedIn blocks datacenter ASNs. For server deployment, configure residential or rotating proxies via `SCRAPER_PROXIES="http://user:pass@host:port"`.
+4. **Version cap (`python-jobspy>=1.4.0,<1.5`)**: the compiler's code tables (`KNOWN_COUNTRIES`, `SUPPORTED_BOARDS`, `GLASSDOOR_COUNTRIES`) and the live findings in this section were verified against 1.4.x, and `tests/test_profile_compiler.py::test_code_tables_match_jobspy` fails when the installed package disagrees. 1.5.0 adds a `seek` board and drops Glassdoor for Malaysia and Vietnam, so it is excluded until the tables are updated and the board behaviour re-verified live. To adopt a newer jobspy: update the tables, re-check the Indeed/Glassdoor/Google notes, then raise the cap. An environment resolved by `uv` without the cap can pull 1.5.0; reinstall with `uv pip install "python-jobspy>=1.4.0,<1.5"`.
 
 ### B. Job Board Quirks by Country
 1. **Glassdoor**:
